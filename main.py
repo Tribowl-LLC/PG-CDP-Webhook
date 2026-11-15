@@ -6,6 +6,7 @@ import json
 import hashlib
 import requests
 import psycopg2
+from datetime import date
 from psycopg2.extras import RealDictCursor
 from fastapi import FastAPI, Request, BackgroundTasks
 
@@ -42,6 +43,10 @@ PRIME_SUBURB_ZIPS = {
     "48324", "48301", "48302", "48304", "48009", "48025", "48170",
     "48187", "48188", "48382", "48390", "48393", "48178"
 }
+GENERIC_CARD_WORDS = {
+    "visa", "mastercard", "amex", "discover", "cardholder", "valued",
+    "customer", "guest", "user", "card", "debit", "credit"
+}
 
 
 def sha256_hash(val: str) -> str:
@@ -55,6 +60,26 @@ def clean_phone(phone: str) -> str:
     if len(digits) == 11 and digits.startswith("1"):
         digits = digits[1:]
     return digits if len(digits) == 10 else ""
+
+
+def parse_cardholder_name(raw_name: str) -> tuple[str, str]:
+    """Parses EMV chip cardholder_name (handles 'LAST/FIRST' and 'FIRST LAST' formats)."""
+    if not raw_name or not isinstance(raw_name, str):
+        return "", ""
+    cleaned = raw_name.strip()
+    if "/" in cleaned:
+        parts = [p.strip() for p in cleaned.split("/", 1)]
+        last_n = parts[0].title()
+        first_n = (parts[1].split()[0] if parts[1] else "").title()
+    else:
+        parts = cleaned.split()
+        first_n = parts[0].title() if parts else ""
+        last_n = parts[-1].title() if len(parts) > 1 else ""
+    if len(first_n) < 2 or len(last_n) < 2:
+        return "", ""
+    if first_n.lower() in GENERIC_CARD_WORDS or last_n.lower() in GENERIC_CARD_WORDS:
+        return "", ""
+    return first_n, last_n
 
 
 def haversine_miles(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -378,7 +403,7 @@ def fire_meta_capi_event(cur, cust: dict, event_name: str, value: float, thresho
 
 
 def upsert_and_enrich_customer(cur, data: dict) -> tuple[dict, bool]:
-    """Resolves identity across Square/WebRes/Tripleseat/Partywirks, enriches via Melissa+Versium if missing address, and updates master_customers."""
+    """Resolves identity across Square/WebRes/Tripleseat/Partywirks (including Same-Day Name+Date stitching), enriches via Melissa+Versium, and updates master_customers."""
     sq_id = (data.get("sq_id") or "").strip()
     if sq_id and not (data.get("email") or data.get("phone")):
         sq_profile = fetch_square_customer_profile(sq_id)
@@ -390,8 +415,9 @@ def upsert_and_enrich_customer(cur, data: dict) -> tuple[dict, bool]:
     phone = clean_phone(data.get("phone") or "")
     first_name = (data.get("first_name") or "").strip()
     last_name = (data.get("last_name") or "").strip()
+    full_name_clean = f"{first_name} {last_name}".strip()
 
-    # 1. Identity Lookup
+    # 1A. Primary Deterministic Identity Lookup (sq_id, email, phone)
     existing = None
     for id_type, id_val in [("sq_id", sq_id), ("email", email), ("phone", phone)]:
         if id_val:
@@ -406,6 +432,42 @@ def upsert_and_enrich_customer(cur, data: dict) -> tuple[dict, bool]:
             existing = cur.fetchone()
             if existing:
                 break
+
+    # 1B. Live Same-Day POS-to-WebRes/Partywirks/Tripleseat Name Stitch
+    # If an email-less Square card swipe has a valid First + Last Name, check if that person
+    # has an active online reservation/party within +/- 1 day of today (or is a unique known name in Neon).
+    if not existing and len(first_name) >= 2 and len(last_name) >= 2:
+        cur.execute(
+            """
+            SELECT * FROM master_customers
+            WHERE LOWER(TRIM(full_name)) = LOWER(%s)
+              AND source != 'Square_Instant_Profile'
+              AND (
+                  (pw_last_party_date IS NOT NULL AND ABS(pw_last_party_date - CURRENT_DATE) <= 1)
+                  OR (wr_last_reservation_date IS NOT NULL AND ABS(wr_last_reservation_date - CURRENT_DATE) <= 1)
+                  OR (ts_last_event_date IS NOT NULL AND ABS(ts_last_event_date::date - CURRENT_DATE) <= 1)
+                  OR (updated_at >= NOW() - INTERVAL '36 hours' AND (in_webres = 1 OR in_partywirks = 1 OR in_tripleseat = 1))
+              )
+            ORDER BY updated_at DESC NULLS LAST, true_lifetime_spend DESC NULLS LAST
+            LIMIT 1;
+            """,
+            (full_name_clean,),
+        )
+        existing = cur.fetchone()
+
+        # Fallback: If only 1 known profile in the entire database has that exact First + Last Name, link to them
+        if not existing:
+            cur.execute(
+                """
+                SELECT * FROM master_customers
+                WHERE LOWER(TRIM(full_name)) = LOWER(%s)
+                  AND source != 'Square_Instant_Profile'
+                """,
+                (full_name_clean,),
+            )
+            name_matches = cur.fetchall()
+            if len(name_matches) == 1:
+                existing = name_matches[0]
 
     # 2. Progressive Enrichment Trigger
     needs_enrichment = (existing is None) or (not existing.get("md_address1") and (email or phone or data.get("zip")))
@@ -445,6 +507,7 @@ def upsert_and_enrich_customer(cur, data: dict) -> tuple[dict, bool]:
     is_wr = 1 if data.get("in_webres") else 0
     is_pw = 1 if data.get("in_partywirks") else 0
     guest_count = int(data.get("ts_max_guests") or 0)
+    today_iso = date.today().isoformat()
 
     # 3. Upsert into master_customers
     cur.execute(
@@ -454,7 +517,7 @@ def upsert_and_enrich_customer(cur, data: dict) -> tuple[dict, bool]:
             in_tripleseat, in_square, in_webres, in_partywirks,
             sq_spend, wr_spend, true_lifetime_spend, webres_online_spend, instore_pos_spend,
             sq_visits, wr_bookings, ts_events, pw_bookings, ts_account, sq_id,
-            pw_last_package, pw_last_party_date,
+            pw_last_package, pw_last_party_date, wr_last_reservation_date, sq_last_visit_date,
             md_address1, md_city, md_state, zip5, md_plus4, md_carrier_route,
             distance_miles, md_latitude, md_longitude, md_household_income,
             md_presence_of_children, md_children_age_range, md_own_rent, md_marital_status,
@@ -468,7 +531,7 @@ def upsert_and_enrich_customer(cur, data: dict) -> tuple[dict, bool]:
             %s, %s, %s, %s,
             %s, %s, GREATEST(%s, %s), %s, GREATEST(0, %s - %s),
             %s, %s, %s, %s, %s, %s,
-            %s, %s,
+            %s, %s, %s, %s,
             %s, %s, %s, %s, %s, %s,
             %s, %s, %s, %s,
             %s, %s, %s, %s,
@@ -481,6 +544,7 @@ def upsert_and_enrich_customer(cur, data: dict) -> tuple[dict, bool]:
         ON CONFLICT (cluster_id) DO UPDATE SET
             first_name = COALESCE(NULLIF(EXCLUDED.first_name, ''), master_customers.first_name),
             last_name = COALESCE(NULLIF(EXCLUDED.last_name, ''), master_customers.last_name),
+            full_name = COALESCE(NULLIF(EXCLUDED.full_name, ''), master_customers.full_name),
             email = COALESCE(NULLIF(EXCLUDED.email, ''), master_customers.email),
             phone = COALESCE(NULLIF(EXCLUDED.phone, ''), master_customers.phone),
             in_tripleseat = GREATEST(COALESCE(master_customers.in_tripleseat, 0), EXCLUDED.in_tripleseat),
@@ -500,6 +564,8 @@ def upsert_and_enrich_customer(cur, data: dict) -> tuple[dict, bool]:
             sq_id = COALESCE(NULLIF(EXCLUDED.sq_id, ''), master_customers.sq_id),
             pw_last_package = COALESCE(EXCLUDED.pw_last_package, master_customers.pw_last_package),
             pw_last_party_date = COALESCE(EXCLUDED.pw_last_party_date, master_customers.pw_last_party_date),
+            wr_last_reservation_date = COALESCE(EXCLUDED.wr_last_reservation_date, master_customers.wr_last_reservation_date),
+            sq_last_visit_date = COALESCE(EXCLUDED.sq_last_visit_date, master_customers.sq_last_visit_date),
             md_address1 = COALESCE(EXCLUDED.md_address1, master_customers.md_address1),
             md_city = COALESCE(EXCLUDED.md_city, master_customers.md_city),
             md_state = COALESCE(EXCLUDED.md_state, master_customers.md_state),
@@ -524,11 +590,12 @@ def upsert_and_enrich_customer(cur, data: dict) -> tuple[dict, bool]:
         RETURNING *;
         """,
         (
-            cluster_id, first_name, last_name, f"{first_name} {last_name}".strip(), email, phone, data.get("source", "Webhook"),
+            cluster_id, first_name, last_name, full_name_clean, email, phone, data.get("source", "Webhook"),
             is_ts, is_sq, is_wr, is_pw,
             sq_delta, wr_delta, sq_delta, wr_delta, wr_delta, sq_delta, wr_delta,
             1 if is_sq else 0, 1 if is_wr else 0, 1 if is_ts else 0, 1 if is_pw else 0, data.get("ts_account"), sq_id,
             data.get("pw_last_package"), data.get("pw_last_party_date"),
+            data.get("wr_last_reservation_date"), today_iso if is_sq else None,
             enriched.get("md_address1"), enriched.get("md_city"), enriched.get("md_state"), enriched.get("zip5"),
             enriched.get("md_plus4"), enriched.get("md_carrier_route"), enriched.get("distance_miles"),
             enriched.get("md_latitude"), enriched.get("md_longitude"), enriched.get("md_household_income"),
@@ -742,12 +809,18 @@ async def square_webhook(request: Request, background_tasks: BackgroundTasks):
                     amount_dollars = float(payment.get("amount_money", {}).get("amount", 0)) / 100.0
                     sq_id = payment.get("customer_id") or ""
                     buyer_email = payment.get("buyer_email_address") or ""
+                    card_obj = (payment.get("card_details") or {}).get("card") or {}
                     card_zip = (
-                        ((payment.get("card_details") or {}).get("card") or {}).get("billing_address") or {}
-                    ).get("postal_code") or (payment.get("billing_address") or {}).get("postal_code") or ""
+                        (card_obj.get("billing_address") or {}).get("postal_code")
+                        or (payment.get("billing_address") or {}).get("postal_code")
+                        or ""
+                    )
+                    chip_fn, chip_ln = parse_cardholder_name(card_obj.get("cardholder_name") or "")
 
                     cust, newly_enriched = upsert_and_enrich_customer(cur, {
                         "sq_id": sq_id,
+                        "first_name": chip_fn,
+                        "last_name": chip_ln,
                         "email": buyer_email,
                         "zip": card_zip[:5] if card_zip else "",
                         "sq_spend_delta": amount_dollars,
@@ -793,10 +866,18 @@ async def square_webhook(request: Request, background_tasks: BackgroundTasks):
 
 @app.post("/webhooks/webres")
 async def webres_webhook(request: Request, background_tasks: BackgroundTasks):
-    """Receives online lane reservations (WebRes/BowlNow), enriches contact data, updates audiences, and fires Purchase CAPI."""
+    """Receives online lane reservations (WebRes/BowlNow), records reservation date for same-day POS stitching, enriches contact data, and fires Purchase CAPI."""
     data = await request.json()
     amount = float(data.get("total_amount") or data.get("amount") or 0.0)
     booking_id = data.get("reservation_id") or data.get("id") or str(int(time.time()))
+    res_date = (
+        data.get("reservation_date")
+        or data.get("event_date")
+        or data.get("date")
+        or date.today().isoformat()
+    )
+    if isinstance(res_date, str) and "T" in res_date:
+        res_date = res_date.split("T")[0]
 
     conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
     try:
@@ -808,6 +889,7 @@ async def webres_webhook(request: Request, background_tasks: BackgroundTasks):
                     "email": data.get("email"),
                     "phone": data.get("phone"),
                     "wr_spend_delta": amount,
+                    "wr_last_reservation_date": res_date,
                     "in_webres": 1,
                     "source": "WebRes",
                 })
@@ -1121,7 +1203,6 @@ async def recover_square_avs_zips(limit: int = 150, scan_payment_pages: int = 15
     headers = {"Authorization": f"Bearer {SQUARE_ACCESS_TOKEN}", "Accept": "application/json"}
     customer_zip_map = {}
 
-    # 1. Scan recent Square Payments pages for card_details.card.billing_address.postal_code
     cursor = None
     for _ in range(scan_payment_pages):
         try:

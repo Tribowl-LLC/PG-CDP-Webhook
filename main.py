@@ -777,108 +777,133 @@ async def sync_square_catalog():
     if not SQUARE_ACCESS_TOKEN:
         return {"status": "error", "message": "Missing SQUARE_ACCESS_TOKEN"}
 
-    headers = {
-        "Authorization": f"Bearer {SQUARE_ACCESS_TOKEN}",
-        "Accept": "application/json",
-    }
-
-    all_objects = []
-    cursor = None
-    while True:
-        params = {"types": "ITEM,CATEGORY"}
-        if cursor:
-            params["cursor"] = cursor
-        resp = requests.get(
-            "https://connect.squareup.com/v2/catalog/list",
-            headers=headers,
-            params=params,
-            timeout=15,
-        ).json()
-        objs = resp.get("objects", [])
-        all_objects.extend(objs)
-        cursor = resp.get("cursor")
-        if not cursor:
-            break
-
-    categories = {}
-    for obj in all_objects:
-        if obj.get("type") == "CATEGORY":
-            cat_name = obj.get("category_data", {}).get("name", "")
-            categories[obj["id"]] = cat_name
-
-    rows_to_upsert = []
-    for obj in all_objects:
-        if obj.get("type") != "ITEM":
-            continue
-        item_id = obj.get("id")
-        is_deleted = bool(obj.get("is_deleted", False))
-        item_data = obj.get("item_data", {})
-        item_name = item_data.get("name", "")
-
-        cat_id = item_data.get("category_id") or ""
-        if not cat_id and isinstance(item_data.get("categories"), list) and item_data["categories"]:
-            cat_id = item_data["categories"][0].get("id", "")
-        if not cat_id and item_data.get("reporting_category", {}).get("id"):
-            cat_id = item_data["reporting_category"]["id"]
-        cat_name = categories.get(cat_id, "")
-
-        for var in item_data.get("variations", []):
-            var_id = var.get("id")
-            var_data = var.get("item_variation_data", {})
-            var_name = var_data.get("name", "")
-            sku = var_data.get("sku", "")
-            price_cents = var_data.get("price_money", {}).get("amount", 0)
-            price_dollars = round(float(price_cents or 0) / 100.0, 2)
-
-            combined = f"{cat_name} {item_name} {var_name}".lower()
-            if any(k in combined for k in ["party", "birthday", "package", "event", "corporate", "banquet", "deposit"]):
-                dept = "Parties & Events"
-            elif any(k in combined for k in ["shoe", "sock"]):
-                dept = "Shoes & Socks"
-            elif any(k in combined for k in ["bowl", "lane", "game", "league", "cosmic"]):
-                dept = "Bowling & Lanes"
-            elif any(k in combined for k in ["laser", "arcade", "card", "play", "vr", "token"]):
-                dept = "Laser Tag & Arcade"
-            elif any(k in combined for k in ["beer", "wine", "liquor", "cocktail", "drink", "bar", "seltzer", "shot", "draft", "pitcher"]):
-                dept = "Bar & Alcohol"
-            elif any(k in combined for k in ["pizza", "wing", "burger", "fries", "pretzel", "food", "kitchen", "soda", "pop", "appetizer", "salad", "nacho", "tender"]):
-                dept = "Food & Kitchen"
-            else:
-                dept = "General / Other"
-
-            rows_to_upsert.append((
-                var_id, item_id, item_name, var_name, cat_id, cat_name,
-                price_dollars, sku, dept, is_deleted
-            ))
-
-    conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
     try:
-        with conn:
-            with conn.cursor() as cur:
-                for r in rows_to_upsert:
+        headers = {
+            "Authorization": f"Bearer {SQUARE_ACCESS_TOKEN}",
+            "Accept": "application/json",
+        }
+
+        all_objects = []
+        cursor = None
+        while True:
+            params = {"types": "ITEM,CATEGORY"}
+            if cursor:
+                params["cursor"] = cursor
+            resp = requests.get(
+                "https://connect.squareup.com/v2/catalog/list",
+                headers=headers,
+                params=params,
+                timeout=15,
+            ).json()
+            if "errors" in resp:
+                return {"status": "square_api_error", "errors": resp["errors"]}
+            objs = resp.get("objects") or []
+            all_objects.extend(objs)
+            cursor = resp.get("cursor")
+            if not cursor:
+                break
+
+        categories = {}
+        for obj in all_objects:
+            if obj.get("type") == "CATEGORY":
+                cat_data = obj.get("category_data") or {}
+                categories[obj["id"]] = cat_data.get("name") or ""
+
+        rows_to_upsert = []
+        for obj in all_objects:
+            if obj.get("type") != "ITEM":
+                continue
+            item_id = obj.get("id")
+            is_deleted = bool(obj.get("is_deleted", False))
+            item_data = obj.get("item_data") or {}
+            item_name = item_data.get("name") or ""
+
+            cat_id = item_data.get("category_id") or ""
+            if not cat_id and isinstance(item_data.get("categories"), list) and item_data["categories"]:
+                cat_id = (item_data["categories"][0] or {}).get("id") or ""
+            if not cat_id and (item_data.get("reporting_category") or {}).get("id"):
+                cat_id = item_data["reporting_category"]["id"]
+            cat_name = categories.get(cat_id, "")
+
+            for var in (item_data.get("variations") or []):
+                var_id = var.get("id")
+                if not var_id:
+                    continue
+                var_data = var.get("item_variation_data") or {}
+                var_name = var_data.get("name") or ""
+                sku = var_data.get("sku") or ""
+                price_money = var_data.get("price_money") or {}
+                price_cents = price_money.get("amount") or 0
+                price_dollars = round(float(price_cents) / 100.0, 2)
+
+                combined = f"{cat_name} {item_name} {var_name}".lower()
+                if any(k in combined for k in ["party", "birthday", "package", "event", "corporate", "banquet", "deposit"]):
+                    dept = "Parties & Events"
+                elif any(k in combined for k in ["shoe", "sock"]):
+                    dept = "Shoes & Socks"
+                elif any(k in combined for k in ["bowl", "lane", "game", "league", "cosmic"]):
+                    dept = "Bowling & Lanes"
+                elif any(k in combined for k in ["laser", "arcade", "card", "play", "vr", "token"]):
+                    dept = "Laser Tag & Arcade"
+                elif any(k in combined for k in ["beer", "wine", "liquor", "cocktail", "drink", "bar", "seltzer", "shot", "draft", "pitcher"]):
+                    dept = "Bar & Alcohol"
+                elif any(k in combined for k in ["pizza", "wing", "burger", "fries", "pretzel", "food", "kitchen", "soda", "pop", "appetizer", "salad", "nacho", "tender"]):
+                    dept = "Food & Kitchen"
+                else:
+                    dept = "General / Other"
+
+                rows_to_upsert.append((
+                    var_id, item_id, item_name, var_name, cat_id, cat_name,
+                    price_dollars, sku, dept, is_deleted
+                ))
+
+        conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+        try:
+            with conn:
+                with conn.cursor() as cur:
                     cur.execute(
                         """
-                        INSERT INTO square_catalog_items (
-                            variation_id, item_id, item_name, variation_name,
-                            category_id, category_name, price_dollars, sku, pg_department, is_deleted, updated_at
-                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
-                        ON CONFLICT (variation_id) DO UPDATE SET
-                            item_name = EXCLUDED.item_name,
-                            variation_name = EXCLUDED.variation_name,
-                            category_id = EXCLUDED.category_id,
-                            category_name = EXCLUDED.category_name,
-                            price_dollars = EXCLUDED.price_dollars,
-                            sku = EXCLUDED.sku,
-                            pg_department = EXCLUDED.pg_department,
-                            is_deleted = EXCLUDED.is_deleted,
-                            updated_at = NOW();
-                        """,
-                        r,
+                        CREATE TABLE IF NOT EXISTS square_catalog_items (
+                            variation_id TEXT PRIMARY KEY,
+                            item_id TEXT,
+                            item_name TEXT,
+                            variation_name TEXT,
+                            category_id TEXT,
+                            category_name TEXT,
+                            price_dollars NUMERIC(10,2),
+                            sku TEXT,
+                            pg_department TEXT,
+                            is_deleted BOOLEAN DEFAULT FALSE,
+                            updated_at TIMESTAMPTZ DEFAULT NOW()
+                        );
+                        """
                     )
-        return {
-            "status": "catalog_synced",
-            "total_variations_synced": len(rows_to_upsert),
-            "total_categories_found": len(categories),
-        }
-    finally:
-        conn.close()
+                    for r in rows_to_upsert:
+                        cur.execute(
+                            """
+                            INSERT INTO square_catalog_items (
+                                variation_id, item_id, item_name, variation_name,
+                                category_id, category_name, price_dollars, sku, pg_department, is_deleted, updated_at
+                            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                            ON CONFLICT (variation_id) DO UPDATE SET
+                                item_name = EXCLUDED.item_name,
+                                variation_name = EXCLUDED.variation_name,
+                                category_id = EXCLUDED.category_id,
+                                category_name = EXCLUDED.category_name,
+                                price_dollars = EXCLUDED.price_dollars,
+                                sku = EXCLUDED.sku,
+                                pg_department = EXCLUDED.pg_department,
+                                is_deleted = EXCLUDED.is_deleted,
+                                updated_at = NOW();
+                            """,
+                            r,
+                        )
+            return {
+                "status": "catalog_synced",
+                "total_variations_synced": len(rows_to_upsert),
+                "total_categories_found": len(categories),
+            }
+        finally:
+            conn.close()
+    except Exception as e:
+        return {"status": "exception", "detail": str(e)}

@@ -27,10 +27,15 @@ AUDIENCE_ALL_NONDETROIT = os.getenv("AUDIENCE_ALL_NONDETROIT", "1202465550271303
 
 ALLEY_LAT, ALLEY_LON = 42.4705, -83.3932
 EXCLUDED_CITIES = {
-    "detroit", "pontiac", "redford", "inkster",
-    "highland park", "hamtramck", "southfield", "lathrup village"
+    "detroit", "pontiac", "redford", "redford charter township", "redford twp",
+    "inkster", "highland park", "hamtramck", "southfield", "lathrup village",
+    "oak park", "ferndale", "hazel park", "eastpointe", "harper woods",
+    "ecorse", "river rouge"
 }
-EXCLUDED_ZIPS = {"48033", "48034", "48037", "48075", "48076"}
+EXCLUDED_ZIPS = {
+    "48033", "48034", "48037", "48075", "48076",
+    "48340", "48341", "48342", "48141"
+}
 PRIME_SUBURB_ZIPS = {
     "48331", "48334", "48335", "48336", "48374", "48375", "48377",
     "48150", "48152", "48154", "48167", "48168", "48322", "48323",

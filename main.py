@@ -629,41 +629,113 @@ async def webres_webhook(request: Request, background_tasks: BackgroundTasks):
 
 @app.post("/webhooks/tripleseat")
 async def tripleseat_webhook(request: Request, background_tasks: BackgroundTasks):
-    """Receives Tripleseat party/corporate inquiries & events, enriches via Melissa+Versium, and fires Qualified_Bowler CAPI."""
-    data = await request.json()
+    """Unwraps native Tripleseat Lead, Event, Booking, and Contact webhooks, enriches via Melissa+Versium, and fires Qualified_Bowler CAPI."""
+    raw = await request.json()
+
+    # Unwrap Tripleseat's top-level object wrapper (lead, event, booking, or contact)
+    obj = (
+        raw.get("lead")
+        or raw.get("event")
+        or raw.get("booking")
+        or raw.get("contact")
+        or raw
+    )
+    contact = obj.get("contact") or obj
+    account = obj.get("account") or contact.get("account") or {}
+
+    # Extract email from direct field or Tripleseat's email_addresses array
+    email = contact.get("email_address") or obj.get("email_address") or obj.get("email") or ""
+    if not email and isinstance(contact.get("email_addresses"), list) and contact["email_addresses"]:
+        email = contact["email_addresses"][0].get("address", "")
+
+    # Extract phone from direct field or Tripleseat's phone_numbers array
+    phone = contact.get("phone_number") or obj.get("phone_number") or obj.get("phone") or ""
+    if not phone and isinstance(contact.get("phone_numbers"), list) and contact["phone_numbers"]:
+        phone = contact["phone_numbers"][0].get("number", "")
+
+    # Extract address if provided inside Tripleseat
+    addr_obj = {}
+    if isinstance(contact.get("addresses"), list) and contact["addresses"]:
+        addr_obj = contact["addresses"][0]
+    elif isinstance(obj.get("addresses"), list) and obj["addresses"]:
+        addr_obj = obj["addresses"][0]
+
+    first_name = contact.get("first_name") or obj.get("first_name") or ""
+    last_name = contact.get("last_name") or obj.get("last_name") or ""
+    company = (
+        account.get("name")
+        or obj.get("company")
+        or obj.get("account_name")
+        or contact.get("company")
+        or ""
+    )
+    status = (obj.get("status") or obj.get("lead_status") or "PROSPECT").upper()
+    guest_count = int(
+        obj.get("guest_count")
+        or obj.get("guaranteed_guest_count")
+        or obj.get("expected_guest_count")
+        or 0
+    )
+    event_date = (
+        obj.get("event_date")
+        or obj.get("event_start_iso8601")
+        or obj.get("desired_date")
+        or None
+    )
+    if event_date and isinstance(event_date, str) and "T" in event_date:
+        event_date = event_date.split("T")[0]
+
+    turned_down_reason = (
+        obj.get("turned_down_reason")
+        or obj.get("lost_reason")
+        or None
+    )
+
+    if not any([email, phone, first_name, last_name]):
+        return {"status": "ignored_empty_tripleseat_payload"}
+
     conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
     try:
         with conn:
             with conn.cursor() as cur:
                 cust, _ = upsert_and_enrich_customer(cur, {
-                    "first_name": data.get("first_name"),
-                    "last_name": data.get("last_name"),
-                    "email": data.get("email"),
-                    "phone": data.get("phone"),
-                    "address": data.get("address"),
-                    "city": data.get("city"),
-                    "state": data.get("state"),
-                    "zip": data.get("zip"),
-                    "ts_account": data.get("company") or data.get("account_name"),
-                    "ts_lead_status": data.get("status", "PROSPECT"),
-                    "ts_max_guests": data.get("guest_count", 0),
-                    "ts_last_event_date": data.get("event_date"),
-                    "ts_turned_down_reason": data.get("turned_down_reason"),
+                    "first_name": first_name,
+                    "last_name": last_name,
+                    "email": email,
+                    "phone": phone,
+                    "address": addr_obj.get("address1") or obj.get("address"),
+                    "city": addr_obj.get("city") or obj.get("city"),
+                    "state": addr_obj.get("state") or obj.get("state"),
+                    "zip": addr_obj.get("zip_code") or obj.get("zip"),
+                    "ts_account": company or None,
+                    "ts_lead_status": status,
+                    "ts_max_guests": guest_count,
+                    "ts_last_event_date": event_date,
+                    "ts_turned_down_reason": turned_down_reason,
                     "in_tripleseat": 1,
                     "source": "Tripleseat",
                 })
                 cur.execute("SELECT current_score_threshold FROM cdp_thermostat_config WHERE id = 1;")
                 thresh = cur.fetchone()["current_score_threshold"]
 
-                if not is_detroit_excluded(cust.get("md_city"), cust.get("zip5")) and cust["bowler_value_score"] >= thresh:
-                    synthetic_val = 1000.0 if cust["pg_mosaic_persona"].startswith("PG-1") else 450.0
+                # Only fire positive CAPI signal if Non-Detroit, meets threshold, and wasn't turned down/lost
+                if (
+                    not is_detroit_excluded(cust.get("md_city"), cust.get("zip5"))
+                    and cust["bowler_value_score"] >= thresh
+                    and status not in ("LOST", "TURNED_DOWN")
+                ):
+                    synthetic_val = 1000.0 if (cust.get("pg_mosaic_persona") or "").startswith("PG-1") else 450.0
                     fire_meta_capi_event(cur, cust, "Qualified_Bowler", synthetic_val, thresh)
                     background_tasks.add_task(sync_customer_to_meta_custom_audiences, dict(cust))
 
-        return {"status": "tripleseat_synced", "cluster_id": cust["cluster_id"], "score": cust["bowler_value_score"]}
+        return {
+            "status": "tripleseat_synced",
+            "cluster_id": cust["cluster_id"],
+            "lead_status": status,
+            "score": cust["bowler_value_score"],
+        }
     finally:
         conn.close()
-
 
 @app.post("/cron/adjust-thermostat")
 async def adjust_thermostat():

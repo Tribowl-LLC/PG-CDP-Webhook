@@ -73,7 +73,7 @@ def is_detroit_excluded(city: str, zip5: str) -> bool:
 
 
 def fetch_square_customer_profile(sq_id: str) -> dict:
-    """Pulls full Name, Email, Phone, and Address from Square API when a POS swipe only passes customer_id."""
+    """Pulls full Name, Email, Phone, Address, and any Card-on-File AVS Billing ZIP from Square API."""
     if not SQUARE_ACCESS_TOKEN or not sq_id:
         return {}
     try:
@@ -84,6 +84,13 @@ def fetch_square_customer_profile(sq_id: str) -> dict:
         ).json()
         cust = resp.get("customer", {})
         addr = cust.get("address", {})
+        postal = addr.get("postal_code", "")
+        if not postal and isinstance(cust.get("cards"), list):
+            for card in cust["cards"]:
+                c_zip = (card.get("billing_address") or {}).get("postal_code") or ""
+                if c_zip:
+                    postal = c_zip
+                    break
         return {
             "first_name": cust.get("given_name", ""),
             "last_name": cust.get("family_name", ""),
@@ -92,7 +99,7 @@ def fetch_square_customer_profile(sq_id: str) -> dict:
             "address": addr.get("address_line_1", ""),
             "city": addr.get("locality", ""),
             "state": addr.get("administrative_district_level_1", ""),
-            "zip": addr.get("postal_code", ""),
+            "zip": postal[:5] if postal else "",
         }
     except Exception:
         return {}
@@ -105,7 +112,7 @@ def run_melissa_and_versium_waterfall(first_name: str, last_name: str, email: st
         "alt_phones": [],
         "lifestyle_flags": {},
     }
-    if not any([email, phone, address]):
+    if not any([email, phone, address, (first_name and last_name and zip_code)]):
         return result
 
     # --- STEP 1: MELISSA PERSONATOR ---
@@ -401,9 +408,9 @@ def upsert_and_enrich_customer(cur, data: dict) -> tuple[dict, bool]:
                 break
 
     # 2. Progressive Enrichment Trigger
-    needs_enrichment = (existing is None) or (not existing.get("md_address1") and (email or phone))
+    needs_enrichment = (existing is None) or (not existing.get("md_address1") and (email or phone or data.get("zip")))
     enriched = {}
-    if needs_enrichment and (email or phone or data.get("address")):
+    if needs_enrichment and (email or phone or data.get("address") or data.get("zip")):
         enriched = run_melissa_and_versium_waterfall(
             first_name or (existing or {}).get("first_name", ""),
             last_name or (existing or {}).get("last_name", ""),
@@ -735,10 +742,14 @@ async def square_webhook(request: Request, background_tasks: BackgroundTasks):
                     amount_dollars = float(payment.get("amount_money", {}).get("amount", 0)) / 100.0
                     sq_id = payment.get("customer_id") or ""
                     buyer_email = payment.get("buyer_email_address") or ""
+                    card_zip = (
+                        ((payment.get("card_details") or {}).get("card") or {}).get("billing_address") or {}
+                    ).get("postal_code") or (payment.get("billing_address") or {}).get("postal_code") or ""
 
                     cust, newly_enriched = upsert_and_enrich_customer(cur, {
                         "sq_id": sq_id,
                         "email": buyer_email,
+                        "zip": card_zip[:5] if card_zip else "",
                         "sq_spend_delta": amount_dollars,
                         "in_square": 1,
                         "source": "Square_POS",
@@ -1096,6 +1107,145 @@ async def enrich_partywirks_customers():
             "records_processed": enriched_count,
             "street_addresses_found": address_matched,
             "upgraded_to_pg2_affluent_families": pg2_count,
+        }
+    finally:
+        conn.close()
+
+
+@app.post("/cron/recover-square-avs-zips")
+async def recover_square_avs_zips(limit: int = 150, scan_payment_pages: int = 15):
+    """Scans Square Payments API & Customer Cards API for hidden AVS Billing ZIPs on email-less Instant Profiles, then enriches via Melissa."""
+    if not SQUARE_ACCESS_TOKEN:
+        return {"status": "error", "message": "Missing SQUARE_ACCESS_TOKEN"}
+
+    headers = {"Authorization": f"Bearer {SQUARE_ACCESS_TOKEN}", "Accept": "application/json"}
+    customer_zip_map = {}
+
+    # 1. Scan recent Square Payments pages for card_details.card.billing_address.postal_code
+    cursor = None
+    for _ in range(scan_payment_pages):
+        try:
+            params = {"limit": 100}
+            if cursor:
+                params["cursor"] = cursor
+            p_resp = requests.get("https://connect.squareup.com/v2/payments", headers=headers, params=params, timeout=10).json()
+            for pay in (p_resp.get("payments") or []):
+                cid = pay.get("customer_id")
+                if not cid:
+                    continue
+                p_zip = (
+                    (((pay.get("card_details") or {}).get("card") or {}).get("billing_address") or {}).get("postal_code")
+                    or (pay.get("billing_address") or {}).get("postal_code")
+                    or ""
+                ).strip()[:5]
+                if len(p_zip) == 5 and p_zip.isdigit():
+                    customer_zip_map[cid] = p_zip
+            cursor = p_resp.get("cursor")
+            if not cursor:
+                break
+        except Exception:
+            break
+
+    conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT * FROM master_customers
+                    WHERE md_address1 IS NULL
+                      AND md_results IS NULL
+                      AND sq_id IS NOT NULL
+                    ORDER BY CASE WHEN phone IS NOT NULL AND phone != '' THEN 0 ELSE 1 END,
+                             true_lifetime_spend DESC
+                    LIMIT %s;
+                    """,
+                    (limit,),
+                )
+                rows = cur.fetchall()
+
+        checked = 0
+        zips_found = 0
+        addresses_unlocked = 0
+
+        for r in rows:
+            checked += 1
+            sq_id = r["sq_id"]
+            phone = clean_phone(r.get("phone") or "")
+            avs_zip = customer_zip_map.get(sq_id, "")
+
+            if not avs_zip:
+                prof = fetch_square_customer_profile(sq_id)
+                avs_zip = prof.get("zip") or ""
+                if not phone and prof.get("phone"):
+                    phone = clean_phone(prof["phone"])
+
+            if avs_zip:
+                zips_found += 1
+
+            if phone or avs_zip:
+                enr = run_melissa_and_versium_waterfall(
+                    r.get("first_name") or "",
+                    r.get("last_name") or "",
+                    r.get("email") or "",
+                    phone,
+                    zip_code=avs_zip,
+                )
+                if enr.get("md_address1"):
+                    addresses_unlocked += 1
+
+                combined = dict(r)
+                for k, v in enr.items():
+                    if v is not None and k not in ("alt_emails", "alt_phones", "lifestyle_flags"):
+                        combined[k] = v
+                persona, score = score_and_assign_persona(combined)
+
+                with conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """
+                            UPDATE master_customers
+                            SET phone = COALESCE(NULLIF(%s, ''), phone),
+                                avs_postal_code = COALESCE(NULLIF(%s, ''), avs_postal_code),
+                                md_address1 = COALESCE(%s, md_address1),
+                                md_city = COALESCE(%s, md_city),
+                                md_state = COALESCE(%s, md_state),
+                                zip5 = COALESCE(%s, zip5),
+                                distance_miles = COALESCE(%s, distance_miles),
+                                md_household_income = COALESCE(%s, md_household_income),
+                                md_presence_of_children = COALESCE(%s, md_presence_of_children),
+                                md_own_rent = COALESCE(%s, md_own_rent),
+                                md_mik = COALESCE(%s, md_mik),
+                                md_mak = COALESCE(%s, md_mak),
+                                md_results = COALESCE(%s, 'AVS_CHECKED'),
+                                pg_mosaic_persona = %s,
+                                bowler_value_score = %s,
+                                updated_at = NOW()
+                            WHERE cluster_id = %s;
+                            """,
+                            (
+                                phone, avs_zip,
+                                enr.get("md_address1"), enr.get("md_city"), enr.get("md_state"), enr.get("zip5"),
+                                enr.get("distance_miles"), enr.get("md_household_income"),
+                                enr.get("md_presence_of_children"), enr.get("md_own_rent"),
+                                enr.get("md_mik"), enr.get("md_mak"), enr.get("md_results"),
+                                persona, score, r["cluster_id"],
+                            ),
+                        )
+            else:
+                with conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "UPDATE master_customers SET md_results = 'NO_AVS_ZIP_ON_CARD' WHERE cluster_id = %s;",
+                            (r["cluster_id"],),
+                        )
+
+        return {
+            "status": "square_avs_recovery_complete",
+            "profiles_checked": checked,
+            "payment_zips_cached": len(customer_zip_map),
+            "avs_zips_found_for_batch": zips_found,
+            "street_addresses_unlocked_via_melissa": addresses_unlocked,
         }
     finally:
         conn.close()

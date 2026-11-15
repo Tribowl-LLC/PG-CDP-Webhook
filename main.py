@@ -1,4 +1,5 @@
 import os
+import re
 import math
 import time
 import json
@@ -200,7 +201,11 @@ def run_melissa_and_versium_waterfall(first_name: str, last_name: str, email: st
 
 def score_and_assign_persona(cust: dict) -> tuple[str, int]:
     kids_raw = str(cust.get("md_presence_of_children") or "").strip().upper()
-    has_kids = kids_raw.startswith("Y") or (kids_raw.startswith("CHILDREN") and "NO" not in kids_raw)
+    has_kids = (
+        kids_raw.startswith("Y")
+        or (kids_raw.startswith("CHILDREN") and "NO" not in kids_raw)
+        or int(cust.get("in_partywirks") or 0) == 1
+    )
 
     income_str = str(cust.get("md_household_income") or "")
     high_income = any(k in income_str for k in ["100,", "125,", "150,", "200,", "250,"])
@@ -282,12 +287,15 @@ def sync_customer_to_meta_custom_audiences(cust: dict):
         return
 
     persona = cust.get("pg_mosaic_persona") or ""
-    ltv = max(float(cust.get("true_lifetime_spend") or 0), 450.0 if cust.get("in_tripleseat") else 0.0)
+    ltv = max(
+        float(cust.get("true_lifetime_spend") or 0),
+        450.0 if (cust.get("in_tripleseat") or cust.get("in_partywirks")) else 0.0,
+    )
     target_audiences = [AUDIENCE_ALL_NONDETROIT]
 
     if persona.startswith("PG-1") or cust.get("in_tripleseat") == 1 or ltv >= 600:
         target_audiences.append(AUDIENCE_PG1_CORP)
-    if persona.startswith("PG-2"):
+    if persona.startswith("PG-2") or cust.get("in_partywirks") == 1:
         target_audiences.append(AUDIENCE_PG2_FAMILIES)
     if (cust.get("zip5") or "") in PRIME_SUBURB_ZIPS:
         target_audiences.append(AUDIENCE_PRIME_SUBURBS)
@@ -358,7 +366,7 @@ def fire_meta_capi_event(cur, cust: dict, event_name: str, value: float, thresho
 
 
 def upsert_and_enrich_customer(cur, data: dict) -> tuple[dict, bool]:
-    """Resolves identity across Square/WebRes/Tripleseat, progressively enriches via Melissa+Versium if missing address, and updates master_customers."""
+    """Resolves identity across Square/WebRes/Tripleseat/Partywirks, enriches via Melissa+Versium if missing address, and updates master_customers."""
     sq_id = (data.get("sq_id") or "").strip()
     if sq_id and not (data.get("email") or data.get("phone")):
         sq_profile = fetch_square_customer_profile(sq_id)
@@ -387,7 +395,7 @@ def upsert_and_enrich_customer(cur, data: dict) -> tuple[dict, bool]:
             if existing:
                 break
 
-    # 2. Progressive Enrichment Trigger:
+    # 2. Progressive Enrichment Trigger
     needs_enrichment = (existing is None) or (not existing.get("md_address1") and (email or phone))
     enriched = {}
     if needs_enrichment and (email or phone or data.get("address")):
@@ -423,6 +431,7 @@ def upsert_and_enrich_customer(cur, data: dict) -> tuple[dict, bool]:
     is_ts = 1 if data.get("in_tripleseat") else 0
     is_sq = 1 if data.get("in_square") else 0
     is_wr = 1 if data.get("in_webres") else 0
+    is_pw = 1 if data.get("in_partywirks") else 0
     guest_count = int(data.get("ts_max_guests") or 0)
 
     # 3. Upsert into master_customers
@@ -430,9 +439,10 @@ def upsert_and_enrich_customer(cur, data: dict) -> tuple[dict, bool]:
         """
         INSERT INTO master_customers (
             cluster_id, first_name, last_name, full_name, email, phone, source,
-            in_tripleseat, in_square, in_webres,
+            in_tripleseat, in_square, in_webres, in_partywirks,
             sq_spend, wr_spend, true_lifetime_spend, webres_online_spend, instore_pos_spend,
-            sq_visits, wr_bookings, ts_events, ts_account, sq_id,
+            sq_visits, wr_bookings, ts_events, pw_bookings, ts_account, sq_id,
+            pw_last_package, pw_last_party_date,
             md_address1, md_city, md_state, zip5, md_plus4, md_carrier_route,
             distance_miles, md_latitude, md_longitude, md_household_income,
             md_presence_of_children, md_children_age_range, md_own_rent, md_marital_status,
@@ -443,9 +453,10 @@ def upsert_and_enrich_customer(cur, data: dict) -> tuple[dict, bool]:
             ts_lead_status, ts_max_guests, ts_last_event_date, ts_turned_down_reason, updated_at
         ) VALUES (
             %s, %s, %s, %s, %s, %s, %s,
-            %s, %s, %s,
+            %s, %s, %s, %s,
             %s, %s, GREATEST(%s, %s), %s, GREATEST(0, %s - %s),
-            %s, %s, %s, %s, %s,
+            %s, %s, %s, %s, %s, %s,
+            %s, %s,
             %s, %s, %s, %s, %s, %s,
             %s, %s, %s, %s,
             %s, %s, %s, %s,
@@ -460,9 +471,10 @@ def upsert_and_enrich_customer(cur, data: dict) -> tuple[dict, bool]:
             last_name = COALESCE(NULLIF(EXCLUDED.last_name, ''), master_customers.last_name),
             email = COALESCE(NULLIF(EXCLUDED.email, ''), master_customers.email),
             phone = COALESCE(NULLIF(EXCLUDED.phone, ''), master_customers.phone),
-            in_tripleseat = GREATEST(master_customers.in_tripleseat, EXCLUDED.in_tripleseat),
-            in_square = GREATEST(master_customers.in_square, EXCLUDED.in_square),
-            in_webres = GREATEST(master_customers.in_webres, EXCLUDED.in_webres),
+            in_tripleseat = GREATEST(COALESCE(master_customers.in_tripleseat, 0), EXCLUDED.in_tripleseat),
+            in_square = GREATEST(COALESCE(master_customers.in_square, 0), EXCLUDED.in_square),
+            in_webres = GREATEST(COALESCE(master_customers.in_webres, 0), EXCLUDED.in_webres),
+            in_partywirks = GREATEST(COALESCE(master_customers.in_partywirks, 0), EXCLUDED.in_partywirks),
             sq_spend = master_customers.sq_spend + EXCLUDED.sq_spend,
             wr_spend = master_customers.wr_spend + EXCLUDED.wr_spend,
             true_lifetime_spend = GREATEST(master_customers.sq_spend + EXCLUDED.sq_spend, master_customers.wr_spend + EXCLUDED.wr_spend),
@@ -471,8 +483,11 @@ def upsert_and_enrich_customer(cur, data: dict) -> tuple[dict, bool]:
             sq_visits = master_customers.sq_visits + EXCLUDED.sq_visits,
             wr_bookings = master_customers.wr_bookings + EXCLUDED.wr_bookings,
             ts_events = master_customers.ts_events + EXCLUDED.ts_events,
+            pw_bookings = COALESCE(master_customers.pw_bookings, 0) + EXCLUDED.pw_bookings,
             ts_account = COALESCE(EXCLUDED.ts_account, master_customers.ts_account),
             sq_id = COALESCE(NULLIF(EXCLUDED.sq_id, ''), master_customers.sq_id),
+            pw_last_package = COALESCE(EXCLUDED.pw_last_package, master_customers.pw_last_package),
+            pw_last_party_date = COALESCE(EXCLUDED.pw_last_party_date, master_customers.pw_last_party_date),
             md_address1 = COALESCE(EXCLUDED.md_address1, master_customers.md_address1),
             md_city = COALESCE(EXCLUDED.md_city, master_customers.md_city),
             md_state = COALESCE(EXCLUDED.md_state, master_customers.md_state),
@@ -498,13 +513,15 @@ def upsert_and_enrich_customer(cur, data: dict) -> tuple[dict, bool]:
         """,
         (
             cluster_id, first_name, last_name, f"{first_name} {last_name}".strip(), email, phone, data.get("source", "Webhook"),
-            is_ts, is_sq, is_wr,
+            is_ts, is_sq, is_wr, is_pw,
             sq_delta, wr_delta, sq_delta, wr_delta, wr_delta, sq_delta, wr_delta,
-            1 if is_sq else 0, 1 if is_wr else 0, 1 if is_ts else 0, data.get("ts_account"), sq_id,
+            1 if is_sq else 0, 1 if is_wr else 0, 1 if is_ts else 0, 1 if is_pw else 0, data.get("ts_account"), sq_id,
+            data.get("pw_last_package"), data.get("pw_last_party_date"),
             enriched.get("md_address1"), enriched.get("md_city"), enriched.get("md_state"), enriched.get("zip5"),
             enriched.get("md_plus4"), enriched.get("md_carrier_route"), enriched.get("distance_miles"),
             enriched.get("md_latitude"), enriched.get("md_longitude"), enriched.get("md_household_income"),
-            enriched.get("md_presence_of_children"), enriched.get("md_children_age_range"), enriched.get("md_own_rent"),
+            "Children Present" if is_pw else enriched.get("md_presence_of_children"),
+            enriched.get("md_children_age_range"), enriched.get("md_own_rent"),
             enriched.get("md_marital_status"), enriched.get("md_household_size"), enriched.get("md_length_of_residence"),
             enriched.get("md_education"), enriched.get("md_occupation"), enriched.get("md_date_of_birth"),
             enriched.get("md_gender"), enriched.get("md_delivery_indicator"), enriched.get("md_mik"),
@@ -894,6 +911,186 @@ async def tripleseat_webhook(request: Request, background_tasks: BackgroundTasks
             "cluster_id": cust["cluster_id"],
             "lead_status": status,
             "score": cust["bowler_value_score"],
+        }
+    finally:
+        conn.close()
+
+
+@app.post("/webhooks/partywirks")
+async def partywirks_webhook(request: Request, background_tasks: BackgroundTasks):
+    """Receives live Partywirks birthday bookings, stitches to Square without double-counting spend, enriches via Melissa, and fires Qualified_Bowler CAPI."""
+    raw = await request.json()
+    obj = raw.get("reservation") or raw.get("order") or raw.get("data") or raw
+    cust_obj = obj.get("customer") or raw.get("customer") or {}
+
+    email = (
+        cust_obj.get("email")
+        or obj.get("email")
+        or obj.get("customer_email")
+        or ""
+    ).strip().lower()
+    phone = clean_phone(
+        cust_obj.get("phone")
+        or obj.get("phone")
+        or obj.get("customer_phone")
+        or ""
+    )
+    first_name = cust_obj.get("first_name") or obj.get("first_name") or ""
+    last_name = cust_obj.get("last_name") or obj.get("last_name") or ""
+    full_name = cust_obj.get("name") or obj.get("customer_name") or obj.get("customer") or ""
+    if full_name and not (first_name or last_name) and isinstance(full_name, str):
+        parts = full_name.strip().split(None, 1)
+        first_name = parts[0] if parts else ""
+        last_name = parts[1] if len(parts) > 1 else ""
+
+    package = obj.get("package_name") or obj.get("package") or obj.get("reservation") or "BIRTHDAY PARTY"
+    party_date = obj.get("event_date") or obj.get("party_date") or obj.get("date") or None
+    if isinstance(package, str) and "-" in package and not party_date:
+        m = re.match(r"^(.*?)\s*-\s*(\d{4}-\d{2}-\d{2})", package)
+        if m:
+            package = m.group(1).strip()
+            party_date = m.group(2).strip()
+
+    if not any([email, phone, first_name]):
+        return {"status": "ignored_empty_partywirks_payload"}
+
+    conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cust, _ = upsert_and_enrich_customer(cur, {
+                    "first_name": first_name,
+                    "last_name": last_name,
+                    "email": email,
+                    "phone": phone,
+                    "address": cust_obj.get("address") or obj.get("address"),
+                    "city": cust_obj.get("city") or obj.get("city"),
+                    "state": cust_obj.get("state") or obj.get("state"),
+                    "zip": cust_obj.get("zip") or obj.get("zip"),
+                    "in_partywirks": 1,
+                    "pw_last_package": str(package)[:100],
+                    "pw_last_party_date": party_date,
+                    "source": "Partywirks",
+                })
+                cur.execute("SELECT current_score_threshold FROM cdp_thermostat_config WHERE id = 1;")
+                thresh = cur.fetchone()["current_score_threshold"]
+
+                if not is_detroit_excluded(cust.get("md_city"), cust.get("zip5")) and cust["bowler_value_score"] >= thresh:
+                    fire_meta_capi_event(cur, cust, "Qualified_Bowler", 450.0, thresh)
+                    background_tasks.add_task(sync_customer_to_meta_custom_audiences, dict(cust))
+
+        return {
+            "status": "partywirks_synced",
+            "cluster_id": cust["cluster_id"],
+            "package": package,
+            "score": cust["bowler_value_score"],
+        }
+    finally:
+        conn.close()
+
+
+@app.post("/cron/enrich-partywirks")
+async def enrich_partywirks_customers():
+    """Runs all un-enriched Partywirks parents through Melissa Personator, updates addresses/incomes, and recalculates persona & score."""
+    if not MELISSA_API_KEY:
+        return {"status": "error", "message": "Missing MELISSA_API_KEY"}
+
+    conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT * FROM master_customers
+                    WHERE in_partywirks = 1 AND md_address1 IS NULL AND md_results IS NULL
+                    ORDER BY cluster_id;
+                    """
+                )
+                rows = cur.fetchall()
+
+        enriched_count = 0
+        address_matched = 0
+        pg2_count = 0
+
+        for r in rows:
+            enr = run_melissa_and_versium_waterfall(
+                r.get("first_name") or "",
+                r.get("last_name") or "",
+                r.get("email") or "",
+                r.get("phone") or "",
+            )
+            enriched_count += 1
+            if enr.get("md_address1"):
+                address_matched += 1
+
+            combined = dict(r)
+            for k, v in enr.items():
+                if v is not None and k not in ("alt_emails", "alt_phones", "lifestyle_flags"):
+                    combined[k] = v
+            combined["md_presence_of_children"] = "Children Present"
+            persona, score = score_and_assign_persona(combined)
+            if persona.startswith("PG-2"):
+                pg2_count += 1
+
+            with conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        UPDATE master_customers
+                        SET md_address1 = COALESCE(%s, md_address1),
+                            md_city = COALESCE(%s, md_city),
+                            md_state = COALESCE(%s, md_state),
+                            zip5 = COALESCE(%s, zip5),
+                            md_plus4 = COALESCE(%s, md_plus4),
+                            md_carrier_route = COALESCE(%s, md_carrier_route),
+                            md_latitude = COALESCE(%s, md_latitude),
+                            md_longitude = COALESCE(%s, md_longitude),
+                            distance_miles = COALESCE(%s, distance_miles),
+                            md_household_income = COALESCE(%s, md_household_income),
+                            md_presence_of_children = 'Children Present',
+                            md_children_age_range = COALESCE(%s, md_children_age_range),
+                            md_own_rent = COALESCE(%s, md_own_rent),
+                            md_marital_status = COALESCE(%s, md_marital_status),
+                            md_household_size = COALESCE(%s, md_household_size),
+                            md_length_of_residence = COALESCE(%s, md_length_of_residence),
+                            md_education = COALESCE(%s, md_education),
+                            md_occupation = COALESCE(%s, md_occupation),
+                            md_date_of_birth = COALESCE(%s, md_date_of_birth),
+                            md_gender = COALESCE(%s, md_gender),
+                            md_delivery_indicator = COALESCE(%s, md_delivery_indicator),
+                            md_mik = COALESCE(%s, md_mik),
+                            md_mak = COALESCE(%s, md_mak),
+                            md_results = COALESCE(%s, 'ENRICHED_ATTEMPT'),
+                            pg_mosaic_persona = %s,
+                            bowler_value_score = %s,
+                            updated_at = NOW()
+                        WHERE cluster_id = %s;
+                        """,
+                        (
+                            enr.get("md_address1"), enr.get("md_city"), enr.get("md_state"), enr.get("zip5"),
+                            enr.get("md_plus4"), enr.get("md_carrier_route"), enr.get("md_latitude"), enr.get("md_longitude"),
+                            enr.get("distance_miles"), enr.get("md_household_income"), enr.get("md_children_age_range"),
+                            enr.get("md_own_rent"), enr.get("md_marital_status"), enr.get("md_household_size"),
+                            enr.get("md_length_of_residence"), enr.get("md_education"), enr.get("md_occupation"),
+                            enr.get("md_date_of_birth"), enr.get("md_gender"), enr.get("md_delivery_indicator"),
+                            enr.get("md_mik"), enr.get("md_mak"), enr.get("md_results"),
+                            persona, score, r["cluster_id"],
+                        ),
+                    )
+                    if enr.get("md_mik"):
+                        cur.execute(
+                            """
+                            INSERT INTO customer_identities (cluster_id, id_type, id_value, source_system)
+                            VALUES (%s, 'md_mik', %s, 'Partywirks') ON CONFLICT DO NOTHING;
+                            """,
+                            (r["cluster_id"], enr["md_mik"]),
+                        )
+
+        return {
+            "status": "partywirks_melissa_enriched",
+            "records_processed": enriched_count,
+            "street_addresses_found": address_matched,
+            "upgraded_to_pg2_affluent_families": pg2_count,
         }
     finally:
         conn.close()

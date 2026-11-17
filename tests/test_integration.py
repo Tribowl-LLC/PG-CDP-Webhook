@@ -595,6 +595,48 @@ def test_credit_window_survives_a_run_that_stops_part_way(client, db, fake, uid,
     assert float(c["sq_spend"]) == 60.0 and c["sq_visits"] == 3      # page 2 credited, page 1 not twice
 
 
+def _history_rows(db, sq, *rows):
+    for pid, amount, when in rows:
+        db.execute("INSERT INTO unified_transactions (transaction_id, source_system, total_amount, transaction_date, "
+                   "square_customer_id) VALUES (%s, 'square', %s, %s, %s)", (f"sq_pay_{pid}", amount, when, sq))
+
+
+def test_new_customer_gets_their_earlier_square_history(client, db, fake, uid):
+    sq = f"SQN{uid}"
+    _history_rows(db, sq, (f"N1{uid}", 30.0, "2025-02-01"), (f"N2{uid}", 12.5, "2025-08-15"))
+    r = square_post(client, {"type": "customer.updated", "data": {"object": {"customer": {
+        "id": sq, "given_name": "Back", "family_name": f"Again{uid}", "email_address": f"back-{uid}@example.test"}}}}).json()
+    c = customer_row(db, r["cluster_id"])
+    assert float(c["sq_spend"]) == 42.5 and c["sq_visits"] == 2
+    assert str(c["sq_first_visit_date"]) == "2025-02-01"
+    db.execute("SELECT count(*) AS n FROM unified_transactions WHERE square_customer_id = %s AND cluster_id = %s",
+               (sq, r["cluster_id"]))
+    assert db.fetchone()["n"] == 2
+
+
+def test_returning_name_only_guest_payment_counts_once_plus_history(client, db, fake, uid):
+    sq = f"SQR{uid}"
+    _history_rows(db, sq, (f"R1{uid}", 40.0, "2025-03-01"))
+    fake.square_customers[sq] = {"id": sq, "given_name": "Card", "family_name": f"Name{uid}"}
+    r = square_post(client, payment(f"R2{uid}", 2500, sq_id=sq)).json()      # their next visit
+    assert r["status"] == "payment_attributed"
+    c = customer_row(db, r["cluster_id"])
+    assert float(c["sq_spend"]) == 65.0 and c["sq_visits"] == 2               # $25 today + $40 history, once each
+
+
+def test_existing_customer_gaining_a_square_id_gets_no_history_credit(client, db, fake, uid):
+    email = f"merge-{uid}@example.test"
+    first = square_post(client, payment(f"M1{uid}", 1000, email=email)).json()
+    sq = f"SQM{uid}"
+    _history_rows(db, sq, (f"M0{uid}", 99.0, "2025-01-01"))                  # may already be in their import total
+    square_post(client, {"type": "customer.updated", "data": {"object": {"customer": {
+        "id": sq, "given_name": "Merged", "family_name": f"Profile{uid}", "email_address": email}}}})
+    c = customer_row(db, first["cluster_id"])
+    assert float(c["sq_spend"]) == 10.0 and c["sq_visits"] == 1
+    db.execute("SELECT cluster_id FROM unified_transactions WHERE transaction_id = %s", (f"sq_pay_M0{uid}",))
+    assert db.fetchone()["cluster_id"] is None
+
+
 def test_docs_shows_key_box_on_cron_endpoints(client):
     spec = client.get("/openapi.json").json()
     for path in ("/cron/adjust-thermostat", "/cron/sync-square-catalog", "/cron/enrich-partywirks",

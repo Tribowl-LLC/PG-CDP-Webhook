@@ -51,6 +51,13 @@ CRON_SECRET = os.getenv("CRON_SECRET")
 # Partywirks REST API (read-only use): reservations + customers.
 PARTYWIRKS_API_KEY = os.getenv("PARTYWIRKS_API_KEY")
 PARTYWIRKS_API = os.getenv("PARTYWIRKS_API", "https://app.partywirks.com/api/v1")
+# Signature key from the Partywirks webhook settings. Partywirks signs every event with HMAC-SHA256 in
+# the X-Partywirks-Signature header. Checked and logged when set; only enforced (401) once
+# PARTYWIRKS_SIGNATURE_ENFORCE=true, after a real delivery has been seen to match.
+PARTYWIRKS_WEBHOOK_SECRET = os.getenv("PARTYWIRKS_WEBHOOK_SECRET")
+PARTYWIRKS_SIGNATURE_ENFORCE = os.getenv("PARTYWIRKS_SIGNATURE_ENFORCE", "").strip().lower() in ("1", "true", "yes")
+# Real Partywirks order IDs are 13-14 digits; their sample/test payload uses "PW-YYYYMM-NNNN".
+REAL_PARTYWIRKS_ORDER_ID = re.compile(r"^\d{10,20}$")
 
 # Your 4 Live Non-Detroit Meta Custom Audience IDs
 AUDIENCE_PG1_CORP = os.getenv("AUDIENCE_PG1_CORP", "120246555016470358")
@@ -1583,8 +1590,14 @@ def partywirks_record(res: dict, customer: dict = None) -> dict:
     res = res or {}
     brief = res.get("customer") if isinstance(res.get("customer"), dict) else {}
     full = customer or {}
-    addr = full.get("address") if isinstance(full.get("address"), dict) else {}
-    first, last = (full.get("first_name") or "").strip(), (full.get("last_name") or "").strip()
+    if isinstance(full.get("address"), dict):        # API customer record: nested address
+        a = full["address"]
+        addr = {"street": a.get("street_1"), "city": a.get("city"), "state": a.get("state"), "zip": a.get("zip_code")}
+    else:                                              # webhook body: flat fields on the customer
+        addr = {"street": brief.get("address") if isinstance(brief.get("address"), str) else None,
+                "city": brief.get("city"), "state": brief.get("state"), "zip": brief.get("zip_code")}
+    first = (full.get("first_name") or brief.get("first_name") or "").strip()
+    last = (full.get("last_name") or brief.get("last_name") or "").strip()
     if not (first or last):
         name = (brief.get("name") or full.get("full_name") or "").strip()
         parts = name.split(None, 1)
@@ -1599,10 +1612,10 @@ def partywirks_record(res: dict, customer: dict = None) -> dict:
         "phone": phone,
         "first_name": first,
         "last_name": last,
-        "address": addr.get("street_1") or "",
+        "address": addr.get("street") or "",
         "city": addr.get("city") or "",
         "state": addr.get("state") or "",
-        "zip": (addr.get("zip_code") or "")[:5],
+        "zip": str(addr.get("zip") or "")[:5],
         "package": (activity.get("name") or "BIRTHDAY PARTY")[:100],
         "party_date": date_only(res.get("event_date")),
         "created_at": res.get("created_at"),
@@ -1681,7 +1694,12 @@ def handle_partywirks(raw: dict, background_tasks: BackgroundTasks) -> dict:
             # Partywirks has no such reservation: not a real booking, so don't store anything.
             return {"status": "ignored_unknown_partywirks_reservation"}
     if not rec:
-        rec = payload_rec  # no API key, no order ID, or the API is down: use the webhook body
+        # No API key, or the API is down: use the webhook body, but only for a real order ID, so a
+        # Partywirks test/sample delivery ("John Doe", example.com) is never saved.
+        if not REAL_PARTYWIRKS_ORDER_ID.match(payload_rec["order_id"]):
+            log.warning("Partywirks webhook with non-standard order ID ignored (test delivery?)")
+            return {"status": "ignored_partywirks_test_or_unknown_order"}
+        rec = payload_rec
 
     conn = get_conn()
     try:
@@ -1696,8 +1714,36 @@ def handle_partywirks(raw: dict, background_tasks: BackgroundTasks) -> dict:
 async def partywirks_webhook(request: Request, background_tasks: BackgroundTasks):
     """Partywirks reservation webhooks."""
     require_webhook_key(request)
-    _, raw = await read_json(request)
+    body, raw = await read_json(request)
+    check_partywirks_signature(request, body)
     return await run_in_threadpool(handle_partywirks, raw, background_tasks)
+
+
+def partywirks_signature_matches(body: bytes, provided: str, secret: str) -> bool:
+    """HMAC-SHA256 of the raw body with the signature key. Partywirks documents the algorithm and
+    header but not the encoding, so hex or base64 (optionally prefixed 'sha256=') are accepted."""
+    provided = (provided or "").strip()
+    if provided.lower().startswith("sha256="):
+        provided = provided[7:]
+    digest = hmac.new(secret.encode("utf-8"), body, hashlib.sha256).digest()
+    for expected in (digest.hex(), base64.b64encode(digest).decode()):
+        if hmac.compare_digest(provided.encode(), expected.encode()):
+            return True
+    return hmac.compare_digest(provided.lower().encode(), digest.hex().encode())
+
+
+def check_partywirks_signature(request: Request, body: bytes):
+    if not PARTYWIRKS_WEBHOOK_SECRET:
+        return
+    provided = request.headers.get("x-partywirks-signature", "")
+    ok = bool(provided) and partywirks_signature_matches(body, provided, PARTYWIRKS_WEBHOOK_SECRET)
+    if ok:
+        log.info("Partywirks signature verified")
+        return
+    log.warning("Partywirks signature %s (header %s, %s)", "MISMATCH" if provided else "MISSING",
+                "present" if provided else "absent", "rejected" if PARTYWIRKS_SIGNATURE_ENFORCE else "not enforced yet")
+    if PARTYWIRKS_SIGNATURE_ENFORCE:
+        raise HTTPException(status_code=401, detail="Invalid Partywirks signature")
 
 
 def run_partywirks_sync(days_back: int = 3, count_bookings_created_since: str = None, apply: bool = True,
@@ -1964,6 +2010,8 @@ def health():
         "square_signature_check": bool(SQUARE_WEBHOOK_SIGNATURE_KEY),
         "webhook_key_check": bool(WEBHOOK_SECRET),
         "cron_key_check": bool(CRON_SECRET),
+        "partywirks_signature_check": ("enforced" if PARTYWIRKS_SIGNATURE_ENFORCE else "logging only")
+                                      if PARTYWIRKS_WEBHOOK_SECRET else False,
     }
 
 

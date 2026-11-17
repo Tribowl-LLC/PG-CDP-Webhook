@@ -233,7 +233,7 @@ def test_tripleseat_resends_give_one_qualified_bowler(client, db, fake, uid):
 
 
 def test_partywirks_webhook_uses_api_and_counts_once(client, db, fake, uid):
-    oid = f"26{uid}"
+    oid = f"26{int(uid, 16)}"
     body = fake.add_partywirks(uid, oid, package="BIRTHDAY EXTRAVAGANZA", event_date="2026-12-05")
     body["data"] = {"order_id": oid}  # even a bare notification works: details come from the API
     for _ in range(3):
@@ -259,7 +259,7 @@ def test_partywirks_unknown_order_is_ignored(client, db, fake, uid):
 
 
 def test_partywirks_api_down_falls_back_to_webhook_body(client, db, fake, uid):
-    oid = f"27{uid}"
+    oid = f"27{int(uid, 16)}"
     body = fake.add_partywirks(uid, oid, package="TEEN PARTY")
     fake.pw_down = True
     r = client.post("/webhooks/partywirks", headers=WH, json=body).json()
@@ -268,7 +268,7 @@ def test_partywirks_api_down_falls_back_to_webhook_body(client, db, fake, uid):
 
 
 def test_partywirks_cancelled_is_not_counted(client, db, fake, uid):
-    oid = f"28{uid}"
+    oid = f"28{int(uid, 16)}"
     body = fake.add_partywirks(uid, oid, status="cancelled")
     r = client.post("/webhooks/partywirks", headers=WH, json=body).json()
     assert r["status"] == "partywirks_cancelled_reservation"
@@ -278,21 +278,21 @@ def test_partywirks_cancelled_is_not_counted(client, db, fake, uid):
 
 def test_partywirks_catch_up_sync(db, fake, uid, monkeypatch):
     monkeypatch.setattr(main.time, "sleep", lambda s: None)
-    fake.add_partywirks(uid, f"30{uid}", created_at="2026-11-01 09:00:00", event_date="2099-01-01")       # old: imported
-    fake.add_partywirks(uid[::-1], f"31{uid}", created_at="2026-11-16 09:00:00", event_date="2099-01-02")  # missed webhook
+    fake.add_partywirks(uid, f"30{int(uid, 16)}", created_at="2026-11-01 09:00:00", event_date="2099-01-01")       # old: imported
+    fake.add_partywirks(uid[::-1], f"31{int(uid, 16)}", created_at="2026-11-16 09:00:00", event_date="2099-01-02")  # missed webhook
     first = main.run_partywirks_sync(days_back=1, count_bookings_created_since="2026-11-15 00:00:00")
     assert first["new_recorded_without_counting"] >= 1 and first["new_counted"] >= 1
     db.execute("SELECT pw_bookings FROM master_customers WHERE email = %s", (f"party-{uid}@example.test",))
     assert db.fetchone()["pw_bookings"] in (0, None)   # old booking recorded but not counted again
     db.execute("SELECT pw_bookings FROM master_customers WHERE email = %s", (f"party-{uid[::-1]}@example.test",))
     assert db.fetchone()["pw_bookings"] == 1
-    assert capi_rows(db, f"qb_pw_30{uid}") == []         # no conversion for an old booking
+    assert capi_rows(db, f"qb_pw_30{int(uid, 16)}") == []         # no conversion for an old booking
     again = main.run_partywirks_sync(days_back=1, count_bookings_created_since="2026-11-15 00:00:00")
     assert again.get("new_counted", 0) == 0 and again.get("new_recorded_without_counting", 0) == 0
 
 
 def test_partywirks_sync_dry_run_writes_nothing(db, fake, uid):
-    fake.add_partywirks(uid, f"32{uid}", event_date="2099-02-01")
+    fake.add_partywirks(uid, f"32{int(uid, 16)}", event_date="2099-02-01")
     before = len(fake.calls)
     out = main.run_partywirks_sync(days_back=1, apply=False)
     assert out["status"] == "partywirks_sync_dry_run" and out["new_counted"] >= 1
@@ -365,9 +365,9 @@ def test_webres_without_id_keeps_different_people_apart(client, db, fake, uid):
 
 
 def test_older_partywirks_booking_does_not_replace_newer(client, db, fake, uid):
-    newer = fake.add_partywirks(uid, f"40{uid}", event_date="2026-12-20", package="TEEN PARTY")
+    newer = fake.add_partywirks(uid, f"40{int(uid, 16)}", event_date="2026-12-20", package="TEEN PARTY")
     r = client.post("/webhooks/partywirks", headers=WH, json=newer).json()
-    older = fake.add_partywirks(uid, f"41{uid}", event_date="2025-06-01", package="BOWLING PARTY")
+    older = fake.add_partywirks(uid, f"41{int(uid, 16)}", event_date="2025-06-01", package="BOWLING PARTY")
     client.post("/webhooks/partywirks", headers=WH, json=older)
     c = customer_row(db, r["cluster_id"])
     assert str(c["pw_last_party_date"]) == "2026-12-20" and c["pw_last_package"] == "TEEN PARTY"
@@ -376,7 +376,7 @@ def test_older_partywirks_booking_does_not_replace_newer(client, db, fake, uid):
 
 def test_catch_up_retries_when_customer_lookup_fails(db, fake, uid, monkeypatch):
     monkeypatch.setattr(main.time, "sleep", lambda s: None)
-    fake.add_partywirks(uid, f"50{uid}", event_date="2099-03-01", created_at="2026-11-16 09:00:00")
+    fake.add_partywirks(uid, f"50{int(uid, 16)}", event_date="2099-03-01", created_at="2026-11-16 09:00:00")
     real_get = fake.get
 
     def customers_down(url, **kw):
@@ -396,10 +396,69 @@ def test_catch_up_retries_when_customer_lookup_fails(db, fake, uid, monkeypatch)
 
 def test_catch_up_pushes_recovered_customers_to_audiences(db, fake, uid, monkeypatch):
     monkeypatch.setattr(main.time, "sleep", lambda s: None)
-    fake.add_partywirks(uid, f"60{uid}", event_date="2099-04-01", created_at="2026-11-16 09:00:00")
+    fake.add_partywirks(uid, f"60{int(uid, 16)}", event_date="2099-04-01", created_at="2026-11-16 09:00:00")
     main.run_partywirks_sync(days_back=1, count_bookings_created_since="2026-11-15 00:00:00")
-    assert len(capi_rows(db, f"qb_pw_60{uid}")) == 1
+    assert len(capi_rows(db, f"qb_pw_60{int(uid, 16)}")) == 1
     assert fake.count("/users") >= 1
+
+
+# --- Partywirks webhook hardening -------------------------------------------------------------
+
+PW_SAMPLE = {"event": "reservation.create", "vendor_id": 618, "data": {
+    "id": "PW-202610-8472", "order_id": "PW-202610-8472", "status": "Confirmed", "event_date": "2026-10-15",
+    "total_amount": 250, "activity": {"id": 14, "name": "Laser Tag Birthday Party"},
+    "customer_responses": [{"question": "Celebrant Name?", "answer": "Alex Doe"}],
+    "customer": {"name": "John Doe", "first_name": "John", "last_name": "Doe", "email": "john.doe@example.com",
+                 "phone": "+1 (555) 234-5678", "address": "742 Evergreen Terrace", "city": "Springfield",
+                 "state": "OR", "zip_code": "97477"}}}
+
+
+def test_partywirks_sample_payload_is_never_saved(client, db, fake):
+    for down in (False, True):
+        fake.pw_down = down
+        r = client.post("/webhooks/partywirks", headers=WH, json=PW_SAMPLE).json()
+        assert r["status"].startswith("ignored"), r
+    db.execute("SELECT 1 FROM customer_identities WHERE id_value = 'john.doe@example.com'")
+    assert db.fetchone() is None
+
+
+def test_partywirks_api_down_uses_flat_webhook_address(client, db, fake, uid):
+    oid = f"70{int(uid, 16)}"
+    body = json.loads(json.dumps(PW_SAMPLE))
+    body["data"].update({"id": oid, "order_id": oid, "event_date": "2026-12-12"})
+    body["data"]["customer"].update({"email": f"flat-{uid}@example.test", "phone": "",
+                                     "address": "300 Flat St", "city": "Novi", "state": "MI", "zip_code": "48375"})
+    fake.pw_down = True
+    r = client.post("/webhooks/partywirks", headers=WH, json=body).json()
+    assert r["status"] == "partywirks_synced"
+    c = customer_row(db, r["cluster_id"])
+    assert c["pw_last_package"] == "Laser Tag Birthday Party" and str(c["pw_last_party_date"]) == "2026-12-12"
+    melissa = [kw["params"] for m, url, kw in fake.calls if "melissadata" in url][-1]
+    assert melissa["a1"] == "300 Flat St" and melissa["postal"] == "48375" and melissa["city"] == "Novi"
+    assert "Alex Doe" not in json.dumps(c, default=str)
+
+
+def _pw_signed(body: bytes, secret: str, style: str) -> str:
+    import base64, hashlib, hmac
+    d = hmac.new(secret.encode(), body, hashlib.sha256).digest()
+    return {"hex": d.hex(), "HEX": d.hex().upper(), "prefixed": "sha256=" + d.hex(), "b64": base64.b64encode(d).decode()}[style]
+
+
+def test_partywirks_signature_logging_then_enforced(client, db, fake, monkeypatch, caplog):
+    raw = json.dumps(PW_SAMPLE).encode()
+    headers = {**WH, "content-type": "application/json"}
+    monkeypatch.setattr(main, "PARTYWIRKS_WEBHOOK_SECRET", "pw-sig-key")
+    monkeypatch.setattr(main, "PARTYWIRKS_SIGNATURE_ENFORCE", False)
+    with caplog.at_level("WARNING", logger="pg_cdp"):
+        r = client.post("/webhooks/partywirks", content=raw, headers={**headers, "X-Partywirks-Signature": "bad"})
+    assert r.status_code == 200 and "MISMATCH" in caplog.text          # logging only: not rejected
+    monkeypatch.setattr(main, "PARTYWIRKS_SIGNATURE_ENFORCE", True)
+    assert client.post("/webhooks/partywirks", content=raw, headers={**headers, "X-Partywirks-Signature": "bad"}).status_code == 401
+    assert client.post("/webhooks/partywirks", content=raw, headers=headers).status_code == 401
+    for style in ("hex", "HEX", "prefixed", "b64"):
+        sig = _pw_signed(raw, "pw-sig-key", style)
+        assert client.post("/webhooks/partywirks", content=raw,
+                           headers={**headers, "X-Partywirks-Signature": sig}).status_code == 200, style
 
 
 # --- Authentication ----------------------------------------------------------------------------

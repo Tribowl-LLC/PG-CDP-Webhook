@@ -174,6 +174,7 @@ def run(since: str, apply: bool):
         ids = identity_maps(cur)
         history, parked, linked_spend, custs = ledger_maps(cur)
     conn.commit()
+    conn.close()                              # the Square scan takes ~40 min; an idle connection gets dropped
 
     # ---------- Plan (read-only) ----------
     fp_clusters, unknown = scan_payments(since, ids["sq_id"])
@@ -260,6 +261,7 @@ def run(since: str, apply: bool):
 
     # ---------- Apply ----------
     if apply:
+        conn = main.get_conn()
         with conn, conn.cursor() as cur:
             for fp, cid in new_fps:
                 add_identity(cur, cid, "card_fingerprint", fp, "Square")

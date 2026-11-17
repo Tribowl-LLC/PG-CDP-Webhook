@@ -822,6 +822,39 @@ def reprice_transaction(cur, transaction_id: str, new_amount: float, kind: str, 
     return {"status": "amount_adjusted", "transaction_id": transaction_id, "delta": diff}
 
 
+def attach_square_history(cur, cust: dict, sq_id: str, exclude_txn: str = None) -> dict:
+    """A brand-new customer just got linked to a Square customer ID: credit the payments that Square
+    ID made before we knew who they were (recorded by the history backfill, never counted by anyone).
+
+    Only called for customers created in this request. Existing customers' imported totals may already
+    include payments made under other Square IDs (Square merges profiles), so crediting those could
+    double-count."""
+    if not sq_id:
+        return cust
+    cur.execute(
+        """
+        UPDATE unified_transactions SET cluster_id = %s
+        WHERE source_system = 'square' AND square_customer_id = %s
+          AND cluster_id IS NULL AND external_customer_id IS NULL
+          AND transaction_id <> COALESCE(%s, '')
+        RETURNING total_amount, transaction_date;
+        """,
+        (cust["cluster_id"], sq_id, exclude_txn),
+    )
+    rows = cur.fetchall()
+    if not rows:
+        return cust
+    total = round(sum(float(r["total_amount"] or 0) for r in rows), 2)
+    first = min((r["transaction_date"] for r in rows if r["transaction_date"]), default=None)
+    cust = adjust_spend(cur, cust["cluster_id"], sq_diff=total, sq_visits=len(rows))
+    if first:
+        cur.execute("UPDATE master_customers SET sq_first_visit_date = LEAST(COALESCE(sq_first_visit_date, %s::date), %s::date) "
+                    "WHERE cluster_id = %s RETURNING *;", (first, first, cust["cluster_id"]))
+        cust = cur.fetchone()
+    log.info("Attached %s earlier Square payments to a newly identified customer", len(rows))
+    return cust
+
+
 def claim_pending_square_payments(cur, cust: dict, sq_id: str) -> dict:
     """Payments from a Square customer we couldn't identify yet are parked with no customer.
     Once that Square customer ID is linked to someone, their spend and visits are credited."""
@@ -1127,6 +1160,8 @@ def upsert_and_enrich_customer(cur, data: dict) -> tuple:
 
     # 4. Credit any parked Square payments from this Square customer, then rescore
     cust = claim_pending_square_payments(cur, cust, sq_id)
+    if not existing:
+        cust = attach_square_history(cur, cust, sq_id, exclude_txn=data.get("_txn_id"))
     cust = rescore_customer(cur, cust)
     return cust, needs_enrichment
 
@@ -1349,7 +1384,7 @@ def handle_square_payment(cur, payment: dict, background_tasks: BackgroundTasks)
     data = {
         "sq_id": sq_id, "first_name": chip_fn, "last_name": chip_ln, "email": email,
         "zip": card_zip, "avs_postal_code": card_zip,
-        "sq_spend_delta": net, "sq_visit_delta": 1, "in_square": 1, "source": "Square_POS",
+        "sq_spend_delta": net, "sq_visit_delta": 1, "in_square": 1, "source": "Square_POS", "_txn_id": txn_id,
     }
 
     if sq_id and not _identified_sq_customer(cur, sq_id):

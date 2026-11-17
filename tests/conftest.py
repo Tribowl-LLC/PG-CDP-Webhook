@@ -21,6 +21,7 @@ os.environ.update({
     "SQUARE_WEBHOOK_URL": "https://example.test/webhooks/square",
     "WEBHOOK_SECRET": "test-webhook-secret",
     "CRON_SECRET": "test-cron-secret",
+    "PARTYWIRKS_API_KEY": "test-partywirks-key",
 })
 os.environ.pop("VERSIUM_API_KEY", None)
 
@@ -48,6 +49,9 @@ class FakeHTTP:
         self.calls = []
         self.square_customers = {}   # sq_id -> profile dict | "error" | "missing"
         self.meta_mode = "ok"        # "ok" | "500" | "timeout"
+        self.pw_reservations = {}    # order_id -> reservation (Partywirks API shape)
+        self.pw_customers = {}       # customer id -> customer (Partywirks API shape)
+        self.pw_down = False
 
     def count(self, fragment):
         return sum(1 for method, url, _ in self.calls if fragment in url)
@@ -59,6 +63,8 @@ class FakeHTTP:
         self.calls.append(("GET", url, kw))
         if "personator.melissadata.net" in url:
             return self._melissa(kw["params"])
+        if "app.partywirks.com/api/v1" in url:
+            return self._partywirks(url, kw)
         if "connect.squareup.com/v2/customers/" in url:
             sq_id = url.rsplit("/", 1)[1]
             prof = self.square_customers.get(sq_id, "missing")
@@ -78,6 +84,47 @@ class FakeHTTP:
                 return FakeResponse(500, {"error": "boom"})
             return FakeResponse(200, {"events_received": 1})
         raise AssertionError(f"unexpected POST {url}")
+
+    def _partywirks(self, url, kw):
+        assert kw["headers"]["Authorization"] == "Bearer test-partywirks-key"
+        if self.pw_down:
+            raise requests.ConnectionError("partywirks down")
+        path = url.split("/api/v1", 1)[1]
+        if path.startswith("/reservations/"):
+            r = self.pw_reservations.get(path.rsplit("/", 1)[1])
+            return FakeResponse(200, {"success": True, "data": r}) if r else FakeResponse(404, {"message": "Not found"})
+        if path.startswith("/customers/"):
+            c = self.pw_customers.get(path.rsplit("/", 1)[1])
+            return FakeResponse(200, {"success": True, "data": c}) if c else FakeResponse(404, {"message": "Not found"})
+        if path == "/reservations":
+            params = kw.get("params") or {}
+            rows = [r for r in self.pw_reservations.values() if r["event_date"] >= params.get("date_from", "")]
+            per, page = params.get("per_page", 25), params.get("page", 1)
+            chunk = rows[(page - 1) * per: page * per]
+            return FakeResponse(200, {"success": True, "data": chunk,
+                                      "pagination": {"has_more": page * per < len(rows), "total": len(rows)}})
+        raise AssertionError(f"unexpected Partywirks call {url}")
+
+    def add_partywirks(self, uid, order_id, status="confirmed", event_date="2026-12-05",
+                       created_at="2026-11-16 10:00:00", package="BOWLING PARTY", with_address=True):
+        cid = f"9{uid[:6]}"
+        phone = "248" + str(int(uid[:8], 16) % 10_000_000).zfill(7)  # unique per test parent
+        self.pw_customers[cid] = {
+            "id": cid, "first_name": "Party", "last_name": f"Parent{uid}", "full_name": f"Party Parent{uid}",
+            "email": f"party-{uid}@example.test", "phone": phone, "alternate_phone": None,
+            "address": {"street_1": "200 Party Ln", "street_2": None, "city": "Farmington Hills",
+                        "state": "MI", "zip_code": "48335"} if with_address else
+                       {"street_1": None, "street_2": None, "city": None, "state": None, "zip_code": None},
+        }
+        self.pw_reservations[order_id] = {
+            "order_id": order_id, "status": status, "event_date": event_date, "event_time_start": "12:30:00",
+            "event_name": "Child's 8th Birthday", "guests_count": 14, "customer_id": cid, "activity_id": 1,
+            "customer_responses": [{"question": "Child's name", "answer": "Kid"}],
+            "totals": {"total": 728.7}, "customer": {"id": cid, "name": f"Party Parent{uid}",
+                                                    "email": f"party-{uid}@example.test", "phone": phone},
+            "activity": {"id": 1, "name": package}, "created_at": created_at, "updated_at": created_at,
+        }
+        return {"event": "reservation.created", "data": self.pw_reservations[order_id]}
 
     @staticmethod
     def _melissa(params):

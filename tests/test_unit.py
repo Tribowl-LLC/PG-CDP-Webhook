@@ -56,3 +56,27 @@ def test_scoring_unchanged_for_known_case():
         "md_city": "Novi", "zip5": "48375", "true_lifetime_spend": 500,
     })
     assert persona.startswith("PG-2") and score == 100
+
+
+def test_audience_targets():
+    t, ltv = main.audience_targets({"pg_mosaic_persona": "PG-2: x", "zip5": "48335", "md_city": "Farmington Hills",
+                                    "in_partywirks": 1, "true_lifetime_spend": 100})
+    assert t == [main.AUDIENCE_ALL_NONDETROIT, main.AUDIENCE_PG2_FAMILIES, main.AUDIENCE_PRIME_SUBURBS]
+    assert ltv == 450.0
+    assert main.audience_targets({"md_city": "Detroit", "zip5": "48226", "pg_mosaic_persona": "PG-1"}) == ([], 0.0)
+    assert main.audience_targets({"zip5": "48230", "md_city": "Grosse Pointe"})[0] == [main.AUDIENCE_ALL_NONDETROIT]
+
+
+def test_rejected_audience_upload_is_logged(fake, caplog):
+    fake.meta_mode = "500"
+    with caplog.at_level("ERROR", logger="pg_cdp"):
+        res = main.upload_audience_rows(main.AUDIENCE_PG1_CORP, [["x"] * 9])
+    assert res["ok"] is False
+    assert "PG-1 Corporate rejected (HTTP 500)" in caplog.text
+
+
+def test_accepted_audience_upload_reports_counts(fake, monkeypatch):
+    from conftest import FakeResponse
+    monkeypatch.setattr(main.requests, "post",
+                        lambda url, **kw: FakeResponse(200, {"num_received": 2, "num_invalid_entries": 0}))
+    assert main.upload_audience_rows(main.AUDIENCE_PG1_CORP, [[], []]) == {"ok": True, "received": 2, "invalid": 0}

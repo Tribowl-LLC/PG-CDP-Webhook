@@ -5,8 +5,12 @@ threshold, not in an excluded area, and with an email or phone Meta can match on
 customer who is already in an audience is harmless (Meta de-duplicates).
 
 Run it where META_ACCESS_TOKEN is available (e.g. `render ssh <service> --ephemeral`):
-    python scripts/backfill_audiences.py            # dry run: counts per audience, uploads nothing
-    python scripts/backfill_audiences.py --apply    # uploads
+    python scripts/backfill_audiences.py --webhook-customers-only            # dry run: counts, uploads nothing
+    python scripts/backfill_audiences.py --webhook-customers-only --apply    # uploads
+
+--webhook-customers-only limits it to customers a webhook has touched (they have a Meta event or a
+recorded payment/booking). Those are the customers the app itself tries to push; imported customers
+reach the audiences through the seed uploads instead. Without it, every qualifying customer is pushed.
 
 Only aggregate counts are printed.
 """
@@ -21,7 +25,7 @@ import main  # noqa: E402
 BATCH = 5000  # Meta allows up to 10,000 rows per request
 
 
-def run(apply: bool):
+def run(apply: bool, webhook_only: bool = False):
     conn = main.get_conn()
     try:
         with conn, conn.cursor() as cur:
@@ -30,9 +34,12 @@ def run(apply: bool):
                 """
                 SELECT * FROM master_customers
                 WHERE bowler_value_score >= %s
-                  AND (COALESCE(email, '') <> '' OR COALESCE(phone, '') <> '');
+                  AND (COALESCE(email, '') <> '' OR COALESCE(phone, '') <> '')
+                  AND (NOT %s
+                       OR cluster_id IN (SELECT cluster_id FROM capi_events_log WHERE cluster_id IS NOT NULL)
+                       OR cluster_id IN (SELECT cluster_id FROM unified_transactions WHERE cluster_id IS NOT NULL));
                 """,
-                (thresh,),
+                (thresh, webhook_only),
             )
             customers = cur.fetchall()
     finally:
@@ -50,7 +57,8 @@ def run(apply: bool):
             rows_by_audience[aud].append(row)
 
     names = main.audience_names()
-    print(f"Threshold {thresh}: {len(customers)} customers at or above it with an email/phone "
+    scope = "touched by a webhook" if webhook_only else "in total"
+    print(f"Threshold {thresh}: {len(customers)} customers {scope} at or above it with an email/phone "
           f"({excluded} skipped as excluded area)")
     for aud, rows in rows_by_audience.items():
         print(f"  {names.get(aud, aud)}: {len(rows)} customers")
@@ -81,4 +89,7 @@ def run(apply: bool):
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--apply", action="store_true")
-    run(p.parse_args().apply)
+    p.add_argument("--webhook-customers-only", action="store_true",
+                   help="only customers with a Meta event or recorded payment/booking")
+    a = p.parse_args()
+    run(a.apply, a.webhook_customers_only)

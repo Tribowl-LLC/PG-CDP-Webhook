@@ -54,6 +54,7 @@ class FakeHTTP:
         self.pw_down = False
         self.square_orders = {}      # order_id -> order (Square shape)
         self.square_payments = []    # payments returned by GET /v2/payments (one page)
+        self.square_directory = []   # profiles returned by GET /v2/customers (one page)
         self.square_orders_down = False
 
     def count(self, fragment):
@@ -91,6 +92,8 @@ class FakeHTTP:
             return FakeResponse(200, {"order": o}) if o else FakeResponse(404, {})
         if url.endswith("connect.squareup.com/v2/payments"):
             return FakeResponse(200, {"payments": self.square_payments})
+        if url.endswith("connect.squareup.com/v2/customers"):
+            return FakeResponse(200, {"customers": self.square_directory})
         raise AssertionError(f"unexpected {method} {url}")
 
     def post(self, url, **kw):

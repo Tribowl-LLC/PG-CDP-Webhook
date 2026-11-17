@@ -36,6 +36,7 @@ Variable	Purpose
 `SQUARE_WEBHOOK_URL`	The exact notification URL registered with Square (default `https://pg-cdp-webhook.onrender.com/webhooks/square`). Square signs this URL + the body.
 `WEBHOOK_SECRET`	Shared key for `/webhooks/webres`, `/webhooks/tripleseat`, `/webhooks/partywirks`. Senders pass it as header `X-CDP-Key` or query `?key=`.
 `CRON_SECRET`	Separate key for every `/cron/*` endpoint (header `X-CDP-Key` or query `?key=`).
+`PARTYWIRKS_API_KEY`	Partywirks REST API key (`reservations` and `customers` scopes). When set, every Partywirks webhook is verified and completed by reading the reservation back from the API.
 Each authentication check switches on as soon as its variable is set. `GET /health` shows which are on.
 ---
 3. PostgreSQL Database Schema (Neon)
@@ -138,6 +139,8 @@ Batch-enriches any `in_partywirks = 1` rows missing `md_address1` via Melissa Pe
 `POST /cron/recover-square-avs-zips`
 Finds card billing ZIPs for Square profiles with no address and enriches them via Melissa.
 All `/cron/*` endpoints require `CRON_SECRET` (when set). The cron-job.org jobs must send it.
+`POST /cron/sync-partywirks?days_back=3`
+Nightly catch-up: saves Partywirks reservations (party date from `days_back` days ago onward) that no webhook delivered. Runs in the background and logs its totals.
 `GET /health`
 Liveness check; reports which authentication checks are switched on.
 ---
@@ -170,3 +173,7 @@ Webhook routes read the body asynchronously and run all blocking work in a worke
 
 7.2 Tests
 `pip install -r requirements-dev.txt`, then `pytest tests/test_unit.py`. Integration tests also need `TEST_DATABASE_URL` set to a disposable Neon branch with migration 001 applied (they write test customers into it); all outside services are faked.
+
+7.3 Partywirks
+With `PARTYWIRKS_API_KEY` set, a Partywirks webhook is treated as a notification: the reservation (`GET /reservations/{order_id}`) and the parent (`GET /customers/{id}`, including street address) are read from the API. An order ID Partywirks doesn't know is ignored, and if the API is down the webhook body (same structure) is used. Package = `activity.name`; party date = `event_date`. Cancelled reservations update contact details only: no booking count and no `Qualified_Bowler`. Children's details (`event_name`, `customer_responses`, waivers) are never stored.
+`scripts/backfill_partywirks.py --count-since "<YYYY-MM-DD HH:MM:SS>"` records every reservation; bookings created before the cutoff (already counted by the original import) aren't counted again or sent to Meta.

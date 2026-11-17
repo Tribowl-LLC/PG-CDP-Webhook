@@ -98,7 +98,7 @@ def run(since: str, apply: bool, credit_between=None):
     to_credit = []                   # (txn_id, cluster_id or None, sq_id, net)
 
     for page in iter_payment_pages(since):
-        rows, need_orders = [], []
+        rows, need_orders, page_credit = [], [], []
         for p in page:
             st["payments_listed"] += 1
             if p.get("status") != "COMPLETED":
@@ -126,6 +126,7 @@ def run(since: str, apply: bool, credit_between=None):
                 gap_money[created[:13]] += net
             if credit_between and not in_ledger and created and credit_between[0] <= parse_ts(created) < credit_between[1]:
                 to_credit.append((txn, cid, sq, net))
+                page_credit.append((txn, cid, sq, net))
             if not in_ledger or not ledger.get(txn):
                 if p.get("order_id"):
                     need_orders.append(p["order_id"])
@@ -152,24 +153,22 @@ def run(since: str, apply: bool, credit_between=None):
                     square_customer_id = COALESCE(unified_transactions.square_customer_id, EXCLUDED.square_customer_id),
                     source_updated_at = COALESCE(unified_transactions.source_updated_at, EXCLUDED.source_updated_at)
             """, values, template="(%s, %s, %s, %s::timestamptz, %s, %s::timestamptz, %s, %s::jsonb, %s)")
-        for txn, *_ in rows:
-            ledger[txn] = True
-        st["ledger_rows_written"] += len(values)
-        time.sleep(0.05)
-
-    # Credit the chosen window: known customers get spend + a visit; unknown Square IDs are parked.
-    if apply and to_credit:
-        with conn, conn.cursor() as cur:
-            for txn, cid, sq, net in to_credit:
+            # Credit the window in the SAME transaction that first records these payments, so a run that
+            # stops part-way never leaves a payment recorded but uncredited (a re-run would skip it).
+            for txn, cid, sq, net in page_credit:
                 if cid:
-                    cur.execute("UPDATE unified_transactions SET cluster_id = %s WHERE transaction_id = %s;", (cid, txn))
                     main.adjust_spend(cur, cid, sq_diff=net, sq_visits=1)
                     st["credited_to_known_customers"] += 1
                 elif sq:
                     cur.execute("UPDATE unified_transactions SET external_customer_id = %s WHERE transaction_id = %s "
                                 "AND cluster_id IS NULL;", (sq, txn))
                     st["parked_for_later_identification"] += 1
-    elif to_credit:
+        for txn, *_ in rows:
+            ledger[txn] = True
+        st["ledger_rows_written"] += len(values)
+        time.sleep(0.05)
+
+    if not apply and to_credit:
         st["would_credit_or_park"] = len(to_credit)
         money["would_credit_net"] = round(sum(x[3] for x in to_credit), 2)
     conn.close()

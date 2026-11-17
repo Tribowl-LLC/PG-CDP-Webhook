@@ -426,7 +426,8 @@ def test_partywirks_api_down_uses_flat_webhook_address(client, db, fake, uid):
     oid = f"70{int(uid, 16)}"
     body = json.loads(json.dumps(PW_SAMPLE))
     body["data"].update({"id": oid, "order_id": oid, "event_date": "2026-12-12"})
-    body["data"]["customer"].update({"email": f"flat-{uid}@example.test", "phone": "",
+    body["data"]["customer"].update({"email": f"flat-{uid}@example.test", "phone": "", "name": f"Flat Parent{uid}",
+                                     "first_name": "Flat", "last_name": f"Parent{uid}",
                                      "address": "300 Flat St", "city": "Novi", "state": "MI", "zip_code": "48375"})
     fake.pw_down = True
     r = client.post("/webhooks/partywirks", headers=WH, json=body).json()
@@ -564,6 +565,34 @@ def test_square_history_credit_window(client, db, fake, uid, monkeypatch):
     assert float(c["sq_spend"]) == 40.0 and c["sq_visits"] == 2
     db.execute("SELECT external_customer_id FROM unified_transactions WHERE transaction_id = %s", (f"sq_pay_W3{uid}",))
     assert db.fetchone()["external_customer_id"] == f"NEW{uid}"
+
+
+def test_credit_window_survives_a_run_that_stops_part_way(client, db, fake, uid, monkeypatch):
+    bf = _load_backfill()
+    monkeypatch.setattr(bf.time, "sleep", lambda s: None)
+    sq = f"SQX{uid}"
+    fake.square_customers[sq] = {"id": sq, "email_address": f"crash-{uid}@example.test"}
+    cid = square_post(client, payment(f"X0{uid}", 1000, sq_id=sq)).json()["cluster_id"]
+    page1 = [_history_payment(f"X1{uid}", 3000, sq=sq, created="2026-11-14T22:30:00Z")]
+    page2 = [_history_payment(f"X2{uid}", 2000, sq=sq, created="2026-11-14T23:30:00Z")]
+    window = (bf.parse_ts("2026-11-14T18:00:00Z"), bf.parse_ts("2026-11-15T02:12:00Z"))
+
+    def crashing_pages(since):
+        yield page1
+        raise RuntimeError("Square payments list unavailable")
+
+    monkeypatch.setattr(bf, "iter_payment_pages", crashing_pages)
+    try:
+        bf.run("2026-11-01", apply=True, credit_between=window)
+    except RuntimeError:
+        pass
+    c = customer_row(db, cid)
+    assert float(c["sq_spend"]) == 40.0 and c["sq_visits"] == 2      # page 1 recorded AND credited together
+
+    monkeypatch.setattr(bf, "iter_payment_pages", lambda since: iter([page1, page2]))
+    bf.run("2026-11-01", apply=True, credit_between=window)          # re-run after the failure
+    c = customer_row(db, cid)
+    assert float(c["sq_spend"]) == 60.0 and c["sq_visits"] == 3      # page 2 credited, page 1 not twice
 
 
 def test_docs_shows_key_box_on_cron_endpoints(client):

@@ -178,6 +178,13 @@ def run(since: str, apply: bool):
     # ---------- Plan (read-only) ----------
     fp_clusters, unknown = scan_payments(since, ids["sq_id"])
     st["unknown_square_ids_with_payments"] = len(unknown)
+    # A Square ID whose receipt email names one known customer shows that customer also used its cards,
+    # so those cards count as theirs when judging whether a card is shared.
+    for u in unknown.values():
+        owners = {ids["email"][e] for e in u["emails"] if e in ids["email"]}
+        if len(owners) == 1:
+            for fp in u["fps"]:
+                fp_clusters[fp].add(next(iter(owners)))
     new_fps = [(fp, next(iter(c))) for fp, c in fp_clusters.items()
                if len(c) == 1 and fp not in ids["card_fingerprint"]]
 
@@ -229,6 +236,28 @@ def run(since: str, apply: bool):
              if amt > 0 and custs.get(cid, (0, None))[1] and str(custs[cid][1]) >= since[:10]]
     exact_flagged = [cid for cid in exact if cid in held_back]
 
+    run_credit = collections.Counter(planned_credit)
+
+    def hold(cid, sq):
+        """Hold back history credit for a customer who already existed before this run when their
+        imported Square total could already include it, including customers the plan didn't expect
+        (a "new" person who resolved to an existing customer by name or Melissa key)."""
+        if cid in held_back:
+            return True
+        if cid not in custs or cid in planned_credit:
+            return False                       # created by this run, or already checked in the plan
+        amt = history.get(sq, (0, 0.0))[1]
+        if amt <= 0:
+            return False
+        run_credit[cid] += amt
+        spend, _ = custs[cid]
+        if spend - linked_spend.get(cid, 0.0) >= run_credit[cid] - 1:
+            run_credit[cid] -= amt
+            st["held_back_unplanned_existing"] += 1
+            money["held_back"] += amt
+            return True
+        return False
+
     # ---------- Apply ----------
     if apply:
         with conn, conn.cursor() as cur:
@@ -262,8 +291,6 @@ def run(since: str, apply: bool):
                         email = u["emails"].most_common(1)[0][0]
                         fn, ln = u["names"].most_common(1)[0][0] if u["names"] else ("", "")
                         zip5 = u["zips"].most_common(1)[0][0] if u["zips"] else ""
-                        cur.execute("SELECT * FROM master_customers WHERE FALSE;")
-                        before = None
                         cust, _ = main.upsert_and_enrich_customer(cur, {
                             "sq_id": sq, "email": email, "first_name": fn, "last_name": ln,
                             "zip": zip5, "avs_postal_code": zip5, "in_square": 1, "source": "Square_Recovery",
@@ -278,7 +305,7 @@ def run(since: str, apply: bool):
                         cur.execute("SELECT COALESCE(sum(total_amount),0) AS a FROM unified_transactions "
                                     "WHERE cluster_id = %s AND square_customer_id = %s;", (cid, sq))
                         spend0 = float(before.get("sq_spend") or 0) - float(cur.fetchone()["a"])
-                    cust = finish(cur, before, sq, cid not in held_back, touched)
+                    cust = finish(cur, before, sq, not hold(cid, sq), touched)
                     actual[how] += float(cust.get("sq_spend") or 0) - spend0
             except Exception as e:
                 st["errors"] += 1
@@ -309,7 +336,8 @@ def run(since: str, apply: bool):
           f"{st['held_back_ids']:,} Square IDs, ${money['held_back']:,.2f} (linked, not credited)")
     print(f"Tighter check (first Square visit on/after {since[:10]}): {len(exact):,} customers, "
           f"{len(exact_flagged):,} look already counted")
-    for k in ("skipped_already_linked_meanwhile", "pushed_to_meta_audiences", "errors"):
+    for k in ("held_back_unplanned_existing", "skipped_already_linked_meanwhile", "pushed_to_meta_audiences",
+              "errors"):
         if st[k]:
             print(f"{k}: {st[k]:,}")
     if apply:

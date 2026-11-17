@@ -122,3 +122,43 @@ def test_recovery_directory_links_and_creates(client, db, fake, uid):
     assert float(n["sq_spend"]) == 15.0
     db.execute("SELECT 1 FROM customer_identities WHERE id_value = %s", (f"DB{uid}",))
     assert db.fetchone() is None
+
+
+def test_new_person_resolving_to_existing_customer_is_held_back(client, db, fake, uid):
+    ri = _load()
+    r = square_post(client, {"type": "customer.updated", "data": {"object": {"customer": {
+        "id": f"KN{uid}", "given_name": "Uniq", "family_name": f"Match{uid}",
+        "email_address": f"orig-{uid}@example.test"}}}}).json()
+    cid = r["cluster_id"]
+    db.execute("UPDATE master_customers SET sq_spend = 500 WHERE cluster_id = %s", (cid,))   # imported total
+    sq = f"UN{uid}"
+    _history_rows(db, sq, (f"UN1{uid}", 40.0, "2025-02-01"))
+    fake.square_payments = [_pay(f"q1{uid}", sq, email=f"other-{uid}@example.test", name=f"Uniq Match{uid}")]
+    fake.square_directory = []
+    ri.run("2023-12-01T00:00:00Z", apply=True)
+    assert sq in _identity(db, cid, "sq_id")                    # resolved by name to the existing customer
+    assert float(customer_row(db, cid)["sq_spend"]) == 500.0     # ...but the history may already be in $500
+    db.execute("SELECT cluster_id FROM unified_transactions WHERE transaction_id = %s", (f"sq_pay_UN1{uid}",))
+    assert db.fetchone()["cluster_id"] is None
+
+
+def test_card_used_by_receipt_identified_customer_counts_as_shared(client, db, fake, uid):
+    ri = _load()
+    ids = {}
+    for tag in ("a", "b"):
+        sq = f"KS{tag}{uid}"
+        fake.square_customers[sq] = {"id": sq, "email_address": f"s{tag}-{uid}@example.test"}
+        ids[tag] = (sq, square_post(client, payment(f"LS{tag}{uid}", 1000, sq_id=sq)).json()["cluster_id"])
+    fp = f"FPX{uid}"
+    u1, u2 = f"US1{uid}", f"US2{uid}"
+    fake.square_payments = [
+        _pay(f"s1{uid}", ids["a"][0], fp=fp),                                   # A's card...
+        _pay(f"s2{uid}", u1, fp=fp, email=f"sb-{uid}@example.test"),            # ...also used by B (receipt)
+        _pay(f"s3{uid}", u2, fp=fp),                                            # card only: can't tell who
+    ]
+    fake.square_directory = []
+    ri.run("2023-12-01T00:00:00Z", apply=True)
+    a, b = ids["a"][1], ids["b"][1]
+    assert u1 in _identity(db, b, "sq_id")
+    assert u2 not in _identity(db, a, "sq_id") and u2 not in _identity(db, b, "sq_id")
+    assert fp not in _identity(db, a, "card_fingerprint")

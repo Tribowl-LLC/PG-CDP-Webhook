@@ -52,6 +52,9 @@ class FakeHTTP:
         self.pw_reservations = {}    # order_id -> reservation (Partywirks API shape)
         self.pw_customers = {}       # customer id -> customer (Partywirks API shape)
         self.pw_down = False
+        self.square_orders = {}      # order_id -> order (Square shape)
+        self.square_payments = []    # payments returned by GET /v2/payments (one page)
+        self.square_orders_down = False
 
     def count(self, fragment):
         return sum(1 for method, url, _ in self.calls if fragment in url)
@@ -74,6 +77,21 @@ class FakeHTTP:
                 return FakeResponse(404, {})
             return FakeResponse(200, {"customer": prof})
         raise AssertionError(f"unexpected GET {url}")
+
+    def request(self, method, url, **kw):
+        self.calls.append((method, url, kw))
+        if "connect.squareup.com/v2/orders" in url:
+            if self.square_orders_down:
+                raise requests.ConnectionError("square orders down")
+            if url.endswith("/batch-retrieve"):
+                ids = (kw.get("json") or {}).get("order_ids") or []
+                return FakeResponse(200, {"orders": [self.square_orders[i] for i in ids if i in self.square_orders]})
+            oid = url.rsplit("/", 1)[1]
+            o = self.square_orders.get(oid)
+            return FakeResponse(200, {"order": o}) if o else FakeResponse(404, {})
+        if url.endswith("connect.squareup.com/v2/payments"):
+            return FakeResponse(200, {"payments": self.square_payments})
+        raise AssertionError(f"unexpected {method} {url}")
 
     def post(self, url, **kw):
         self.calls.append(("POST", url, kw))
@@ -151,6 +169,7 @@ def fake(monkeypatch):
     f = FakeHTTP()
     monkeypatch.setattr(main.requests, "get", f.get)
     monkeypatch.setattr(main.requests, "post", f.post)
+    monkeypatch.setattr(main.requests, "request", f.request)
     return f
 
 

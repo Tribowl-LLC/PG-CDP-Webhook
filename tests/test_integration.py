@@ -426,7 +426,8 @@ def test_partywirks_api_down_uses_flat_webhook_address(client, db, fake, uid):
     oid = f"70{int(uid, 16)}"
     body = json.loads(json.dumps(PW_SAMPLE))
     body["data"].update({"id": oid, "order_id": oid, "event_date": "2026-12-12"})
-    body["data"]["customer"].update({"email": f"flat-{uid}@example.test", "phone": "",
+    body["data"]["customer"].update({"email": f"flat-{uid}@example.test", "phone": "", "name": f"Flat Parent{uid}",
+                                     "first_name": "Flat", "last_name": f"Parent{uid}",
                                      "address": "300 Flat St", "city": "Novi", "state": "MI", "zip_code": "48375"})
     fake.pw_down = True
     r = client.post("/webhooks/partywirks", headers=WH, json=body).json()
@@ -459,6 +460,147 @@ def test_partywirks_signature_logging_then_enforced(client, db, fake, monkeypatc
         sig = _pw_signed(raw, "pw-sig-key", style)
         assert client.post("/webhooks/partywirks", content=raw,
                            headers={**headers, "X-Partywirks-Signature": sig}).status_code == 200, style
+
+
+# --- Square line items & history backfill ------------------------------------------------------
+
+def _order(oid, *items):
+    return {"id": oid, "line_items": [
+        {"catalog_object_id": vid, "name": name, "variation_name": "Regular", "quantity": str(q),
+         "gross_sales_money": {"amount": cents}, "total_money": {"amount": cents}} for vid, name, q, cents in items]}
+
+
+def test_live_payment_records_what_was_bought(client, db, fake, uid):
+    fake.square_orders[f"O{uid}"] = _order(f"O{uid}", ("VAR_PIZZA", "Large Pizza", 1, 2400), ("VAR_SHOES", "Kids Shoes", 3, 1500))
+    body = payment(f"LI{uid}", 3900, email=f"items-{uid}@example.test")
+    body["data"]["object"]["payment"]["order_id"] = f"O{uid}"
+    r = square_post(client, body).json()
+    assert r["status"] == "payment_attributed"
+    db.execute("SELECT line_items, variation_ids FROM unified_transactions WHERE transaction_id = %s", (f"sq_pay_LI{uid}",))
+    row = db.fetchone()
+    assert row["variation_ids"] == ["VAR_PIZZA", "VAR_SHOES"]
+    assert row["line_items"][1] == {"variation_id": "VAR_SHOES", "item": "Kids Shoes", "variation": "Regular",
+                                    "qty": 3.0, "gross": 15.0, "total": 15.0}
+
+
+def test_order_lookup_failure_does_not_block_payment(client, db, fake, uid):
+    fake.square_orders_down = True
+    body = payment(f"OF{uid}", 1000, email=f"ordfail-{uid}@example.test", sq_id=f"SQOF{uid}")
+    body["data"]["object"]["payment"]["order_id"] = f"OX{uid}"
+    fake.square_customers[f"SQOF{uid}"] = {"id": f"SQOF{uid}", "email_address": f"ordfail-{uid}@example.test"}
+    assert square_post(client, body).json()["status"] == "payment_attributed"
+    db.execute("SELECT square_customer_id, line_items FROM unified_transactions WHERE transaction_id = %s", (f"sq_pay_OF{uid}",))
+    row = db.fetchone()
+    assert row["square_customer_id"] == f"SQOF{uid}" and row["line_items"] is None
+
+
+def _history_payment(pid, cents, sq=None, created="2025-06-01T18:00:00Z", order=None):
+    p = {"id": pid, "status": "COMPLETED", "total_money": {"amount": cents}, "created_at": created,
+         "updated_at": created}
+    if sq:
+        p["customer_id"] = sq
+    if order:
+        p["order_id"] = order
+    return p
+
+
+def _load_backfill():
+    import importlib.util, pathlib
+    path = pathlib.Path(__file__).resolve().parents[1] / "scripts" / "backfill_square_history.py"
+    spec = importlib.util.spec_from_file_location("backfill_square_history", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_square_history_backfill_records_without_changing_spend(client, db, fake, uid, monkeypatch, capsys):
+    bf = _load_backfill()
+    monkeypatch.setattr(bf.time, "sleep", lambda s: None)
+    sq = f"SQH{uid}"
+    fake.square_customers[sq] = {"id": sq, "email_address": f"hist-{uid}@example.test"}
+    live = square_post(client, payment(f"H0{uid}", 2000, sq_id=sq)).json()      # counted live: $20
+    cid = live["cluster_id"]
+    fake.square_orders[f"HO1{uid}"] = _order(f"HO1{uid}", ("VAR_LANE", "Lane Hour", 1, 4000))
+    fake.square_payments = [
+        _history_payment(f"H1{uid}", 4000, sq=sq, order=f"HO1{uid}"),            # older, from the import era
+        _history_payment(f"H0{uid}", 2000, sq=sq),                                # already in the ledger
+        _history_payment(f"H2{uid}", 1500, sq=f"UNKNOWN{uid}"),                   # Square customer we don't have
+        _history_payment(f"H3{uid}", 900),                                        # anonymous
+    ]
+    bf.run("2025-01-01T00:00:00Z", apply=False)
+    db.execute("SELECT 1 FROM unified_transactions WHERE transaction_id = %s", (f"sq_pay_H1{uid}",))
+    assert db.fetchone() is None                                                  # dry run wrote nothing
+    assert "Dry run" in capsys.readouterr().out
+
+    bf.run("2025-01-01T00:00:00Z", apply=True)
+    bf.run("2025-01-01T00:00:00Z", apply=True)                                     # idempotent
+    c = customer_row(db, cid)
+    assert float(c["sq_spend"]) == 20.0 and c["sq_visits"] == 1                   # spend untouched
+    db.execute("SELECT transaction_id, cluster_id, square_customer_id, external_customer_id, total_amount, variation_ids "
+               "FROM unified_transactions WHERE transaction_id = ANY(%s) ORDER BY transaction_id",
+               ([f"sq_pay_H0{uid}", f"sq_pay_H1{uid}", f"sq_pay_H2{uid}", f"sq_pay_H3{uid}"],))
+    rows = {r["transaction_id"]: r for r in db.fetchall()}
+    assert rows[f"sq_pay_H1{uid}"]["cluster_id"] == cid and rows[f"sq_pay_H1{uid}"]["variation_ids"] == ["VAR_LANE"]
+    assert rows[f"sq_pay_H2{uid}"]["cluster_id"] is None
+    assert rows[f"sq_pay_H2{uid}"]["square_customer_id"] == f"UNKNOWN{uid}"
+    assert rows[f"sq_pay_H2{uid}"]["external_customer_id"] is None                 # never auto-credited later
+    assert rows[f"sq_pay_H3{uid}"]["cluster_id"] is None
+    assert float(rows[f"sq_pay_H0{uid}"]["total_amount"]) == 20.0
+
+
+def test_square_history_credit_window(client, db, fake, uid, monkeypatch):
+    bf = _load_backfill()
+    monkeypatch.setattr(bf.time, "sleep", lambda s: None)
+    sq = f"SQW{uid}"
+    fake.square_customers[sq] = {"id": sq, "email_address": f"window-{uid}@example.test"}
+    cid = square_post(client, payment(f"W0{uid}", 1000, sq_id=sq)).json()["cluster_id"]
+    fake.square_payments = [
+        _history_payment(f"W1{uid}", 3000, sq=sq, created="2026-11-14T22:30:00Z"),         # in the gap: credit
+        _history_payment(f"W2{uid}", 5000, sq=sq, created="2026-11-13T22:30:00Z"),         # before: import had it
+        _history_payment(f"W3{uid}", 700, sq=f"NEW{uid}", created="2026-11-14T23:00:00Z"),  # gap, unknown: park
+    ]
+    window = (bf.parse_ts("2026-11-14T18:00:00Z"), bf.parse_ts("2026-11-15T02:12:00Z"))
+    bf.run("2026-11-01", apply=True, credit_between=window)
+    c = customer_row(db, cid)
+    assert float(c["sq_spend"]) == 40.0 and c["sq_visits"] == 2
+    db.execute("SELECT external_customer_id FROM unified_transactions WHERE transaction_id = %s", (f"sq_pay_W3{uid}",))
+    assert db.fetchone()["external_customer_id"] == f"NEW{uid}"
+
+
+def test_credit_window_survives_a_run_that_stops_part_way(client, db, fake, uid, monkeypatch):
+    bf = _load_backfill()
+    monkeypatch.setattr(bf.time, "sleep", lambda s: None)
+    sq = f"SQX{uid}"
+    fake.square_customers[sq] = {"id": sq, "email_address": f"crash-{uid}@example.test"}
+    cid = square_post(client, payment(f"X0{uid}", 1000, sq_id=sq)).json()["cluster_id"]
+    page1 = [_history_payment(f"X1{uid}", 3000, sq=sq, created="2026-11-14T22:30:00Z")]
+    page2 = [_history_payment(f"X2{uid}", 2000, sq=sq, created="2026-11-14T23:30:00Z")]
+    window = (bf.parse_ts("2026-11-14T18:00:00Z"), bf.parse_ts("2026-11-15T02:12:00Z"))
+
+    def crashing_pages(since):
+        yield page1
+        raise RuntimeError("Square payments list unavailable")
+
+    monkeypatch.setattr(bf, "iter_payment_pages", crashing_pages)
+    try:
+        bf.run("2026-11-01", apply=True, credit_between=window)
+    except RuntimeError:
+        pass
+    c = customer_row(db, cid)
+    assert float(c["sq_spend"]) == 40.0 and c["sq_visits"] == 2      # page 1 recorded AND credited together
+
+    monkeypatch.setattr(bf, "iter_payment_pages", lambda since: iter([page1, page2]))
+    bf.run("2026-11-01", apply=True, credit_between=window)          # re-run after the failure
+    c = customer_row(db, cid)
+    assert float(c["sq_spend"]) == 60.0 and c["sq_visits"] == 3      # page 2 credited, page 1 not twice
+
+
+def test_docs_shows_key_box_on_cron_endpoints(client):
+    spec = client.get("/openapi.json").json()
+    for path in ("/cron/adjust-thermostat", "/cron/sync-square-catalog", "/cron/enrich-partywirks",
+                 "/cron/recover-square-avs-zips", "/cron/sync-partywirks"):
+        params = spec["paths"][path]["post"].get("parameters", [])
+        assert any(p["name"] == "key" and p["in"] == "query" for p in params), path
 
 
 # --- Authentication ----------------------------------------------------------------------------

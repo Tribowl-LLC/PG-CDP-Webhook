@@ -14,7 +14,7 @@ from typing import Optional
 import requests
 import psycopg2
 from psycopg2.extras import RealDictCursor
-from fastapi import FastAPI, Request, BackgroundTasks, HTTPException
+from fastapi import FastAPI, Request, BackgroundTasks, HTTPException, Query
 from fastapi.concurrency import run_in_threadpool
 from contextlib import asynccontextmanager
 
@@ -222,6 +222,11 @@ def require_cron_key(request: Request):
     _require_key(request, CRON_SECRET, "CRON_SECRET")
 
 
+# Declared on every /cron/* route so the /docs page shows a "key" box for "Try it out".
+# The value itself is read from the request by require_cron_key (header X-CDP-Key or ?key=).
+CRON_KEY_PARAM = Query(None, description="Your CRON_SECRET (needed when it is set in Render)")
+
+
 def square_signature(body: bytes, key: str, url: str) -> str:
     digest = hmac.new(key.encode("utf-8"), url.encode("utf-8") + body, hashlib.sha256).digest()
     return base64.b64encode(digest).decode("utf-8")
@@ -288,6 +293,61 @@ def fetch_square_customer_profile(sq_id: str) -> Optional[dict]:
         "state": addr.get("administrative_district_level_1") or "",
         "zip": postal[:5] if postal else "",
     }
+
+
+def square_api(method: str, path: str, params: dict = None, json_body: dict = None, timeout: int = 15):
+    """JSON from the Square API, or None if it can't be reached. Waits out rate limits."""
+    if not SQUARE_ACCESS_TOKEN:
+        return None
+    for attempt in range(4):
+        try:
+            r = requests.request(method, f"https://connect.squareup.com{path}", params=params, json=json_body,
+                                 timeout=timeout, headers={"Authorization": f"Bearer {SQUARE_ACCESS_TOKEN}",
+                                                           "Accept": "application/json"})
+        except Exception as e:
+            log.warning("Square API %s unreachable: %s", path, type(e).__name__)
+            return None
+        if r.status_code == 429 or r.status_code >= 500:
+            time.sleep(min(2 ** attempt, 10))
+            continue
+        if r.status_code != 200:
+            log.warning("Square API %s returned HTTP %s", path, r.status_code)
+            return None
+        try:
+            return r.json()
+        except ValueError:
+            return None
+    return None
+
+
+def order_line_items(order: dict) -> list:
+    """Compact, storable line items: price key (variation id), names, quantity and dollar amounts."""
+    items = []
+    for li in (order or {}).get("line_items") or []:
+        items.append({
+            "variation_id": li.get("catalog_object_id"),
+            "item": li.get("name"),
+            "variation": li.get("variation_name"),
+            "qty": to_float(li.get("quantity"), 0.0),
+            "gross": round(to_int((li.get("gross_sales_money") or {}).get("amount")) / 100.0, 2),
+            "total": round(to_int((li.get("total_money") or {}).get("amount")) / 100.0, 2),
+        })
+    return items
+
+
+def save_order_items(cur, txn_id: str, order: dict, square_customer_id: str = None):
+    items = order_line_items(order)
+    cur.execute(
+        """
+        UPDATE unified_transactions
+        SET line_items = COALESCE(line_items, %s::jsonb),
+            variation_ids = COALESCE(variation_ids, %s),
+            square_customer_id = COALESCE(square_customer_id, NULLIF(%s, ''))
+        WHERE transaction_id = %s;
+        """,
+        (json.dumps(items), [i["variation_id"] for i in items if i["variation_id"]] or None,
+         square_customer_id or "", txn_id),
+    )
 
 
 def run_melissa_and_versium_waterfall(first_name: str, last_name: str, email: str, phone: str,
@@ -1271,6 +1331,14 @@ def handle_square_payment(cur, payment: dict, background_tasks: BackgroundTasks)
         return result
 
     sq_id = (payment.get("customer_id") or "").strip()
+    # What was bought: read the payment's order so every payment carries its price keys.
+    if payment.get("order_id"):
+        order = (square_api("GET", f"/v2/orders/{payment['order_id']}", timeout=5) or {}).get("order")
+        if order:
+            save_order_items(cur, txn_id, order, sq_id)
+        else:
+            cur.execute("UPDATE unified_transactions SET square_customer_id = NULLIF(%s, '') WHERE transaction_id = %s;",
+                        (sq_id, txn_id))
     email = (payment.get("buyer_email_address") or "").strip().lower()
     card = (payment.get("card_details") or {}).get("card") or {}
     card_zip = ((card.get("billing_address") or {}).get("postal_code")
@@ -1807,7 +1875,7 @@ def run_partywirks_sync(days_back: int = 3, count_bookings_created_since: str = 
 # ---------------------------------------------------------------------------
 
 @app.post("/cron/enrich-partywirks")
-def enrich_partywirks_customers(request: Request):
+def enrich_partywirks_customers(request: Request, key: Optional[str] = CRON_KEY_PARAM):
     """Runs un-enriched Partywirks parents through Melissa (+Versium) and recalculates persona & score."""
     require_cron_key(request)
     if not MELISSA_API_KEY:
@@ -1858,7 +1926,8 @@ def enrich_partywirks_customers(request: Request):
 
 
 @app.post("/cron/recover-square-avs-zips")
-def recover_square_avs_zips(request: Request, limit: int = 150, scan_payment_pages: int = 15):
+def recover_square_avs_zips(request: Request, limit: int = 150, scan_payment_pages: int = 15,
+                            key: Optional[str] = CRON_KEY_PARAM):
     """Finds card billing ZIPs for email-less Square profiles, then enriches via Melissa."""
     require_cron_key(request)
     if not SQUARE_ACCESS_TOKEN:
@@ -1969,7 +2038,7 @@ def recover_square_avs_zips(request: Request, limit: int = 150, scan_payment_pag
 
 
 @app.post("/cron/adjust-thermostat")
-def adjust_thermostat(request: Request):
+def adjust_thermostat(request: Request, key: Optional[str] = CRON_KEY_PARAM):
     require_cron_key(request)
     conn = get_conn()
     try:
@@ -1985,7 +2054,8 @@ def adjust_thermostat(request: Request):
 
 
 @app.post("/cron/sync-partywirks")
-def sync_partywirks(request: Request, background_tasks: BackgroundTasks, days_back: int = 3):
+def sync_partywirks(request: Request, background_tasks: BackgroundTasks, days_back: int = 3,
+                    key: Optional[str] = CRON_KEY_PARAM):
     """Nightly catch-up for Partywirks reservations a webhook missed. Runs in the background
     (it paces itself under the API rate limit) and logs its totals."""
     require_cron_key(request)
@@ -1996,7 +2066,7 @@ def sync_partywirks(request: Request, background_tasks: BackgroundTasks, days_ba
 
 
 @app.post("/cron/sync-square-catalog")
-def sync_square_catalog(request: Request):
+def sync_square_catalog(request: Request, key: Optional[str] = CRON_KEY_PARAM):
     """Manual or scheduled trigger to sync Square Catalog into Neon."""
     require_cron_key(request)
     return run_square_catalog_sync()

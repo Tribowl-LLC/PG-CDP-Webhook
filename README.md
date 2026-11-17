@@ -1,7 +1,7 @@
 **Perfect Game CDP, Identity Graph & Meta CAPI Engine**
 > **AI & Agent Context Prompt:** This repository powers the centralized Customer Data Platform (CDP), real-time identity resolution graph, demographic enrichment waterfall, and server-side Meta Conversions API (CAPI) engine for **Perfect Game** (`35000 Grand River Ave, Farmington Hills, MI 48335`, Coordinates: `42.4705, -83.3932`). Read this specification carefully before modifying database schemas, scoring logic, geographic exclusion rules, or webhook handlers.
 ---
-**1. Executive Summary & Core Objectives**
+**1. Executive Summary & Core Objectives:**
 Perfect Game is a single-location family entertainment center (bowling, two-story laser tag, arcade, bar/kitchen, kids' birthday parties, leagues and corporate events) in Farmington Hills, MI. This system has two jobs. The first one drives everything else:
 1. **An online ads engine.** Teach Meta (and later Google) to find more of Perfect Game's best customers, meaning affluent suburban families and corporate event planners close to the venue, and to measure what those ads actually earn, online and in person. It is a legal, local version of the "predictive signal" playbook: track first-party behavior, enrich it, score every household, and send the ad platform only the signals worth learning from.
 2. **The foundation of a Perfect Game CRM.** One record per household that unifies every system's data and what each customer buys (Square price keys). It grows into a CRM tied directly to Square: quotes, payments and segments.

@@ -73,8 +73,16 @@ def run(since: str, apply: bool, credit_between=None):
     with conn.cursor() as cur:
         cur.execute("SELECT id_value, cluster_id FROM customer_identities WHERE id_type = 'sq_id';")
         sq_to_cluster = {r["id_value"]: r["cluster_id"] for r in cur.fetchall()}
-        cur.execute("SELECT transaction_id, (line_items IS NOT NULL) AS has_items FROM unified_transactions "
-                    "WHERE source_system = 'square';")
+        cur.execute("SELECT 1 FROM information_schema.columns WHERE table_name = 'unified_transactions' "
+                    "AND column_name = 'line_items';")
+        if not cur.fetchone():
+            if apply:
+                sys.exit("Run migrations/003_square_line_items.sql first")
+            print("(migration 003 not applied yet: dry run treats every payment as lacking items)")
+            cur.execute("SELECT transaction_id, FALSE AS has_items FROM unified_transactions WHERE source_system = 'square';")
+        else:
+            cur.execute("SELECT transaction_id, (line_items IS NOT NULL) AS has_items FROM unified_transactions "
+                        "WHERE source_system = 'square';")
         ledger = {r["transaction_id"]: r["has_items"] for r in cur.fetchall()}
         cur.execute("SELECT cluster_id, COALESCE(sq_spend, 0) AS sq_spend, COALESCE(sq_visits, 0) AS sq_visits, "
                     "source FROM master_customers WHERE COALESCE(sq_spend, 0) > 0 OR COALESCE(sq_visits, 0) > 0;")

@@ -1,16 +1,34 @@
 import os
 import re
+import hmac
 import math
 import time
 import json
+import base64
 import hashlib
+import logging
+from datetime import date
+from typing import Optional
+
 import requests
 import psycopg2
-from datetime import date
 from psycopg2.extras import RealDictCursor
-from fastapi import FastAPI, Request, BackgroundTasks
+from fastapi import FastAPI, Request, BackgroundTasks, HTTPException
+from fastapi.concurrency import run_in_threadpool
+from contextlib import asynccontextmanager
 
-app = FastAPI(title="Perfect Game CDP, Enrichment & Meta CAPI Engine")
+log = logging.getLogger("pg_cdp")
+logging.basicConfig(level=logging.INFO)
+
+
+
+@asynccontextmanager
+async def lifespan(_app):
+    await run_in_threadpool(sync_cluster_sequence)
+    yield
+
+
+app = FastAPI(title="Perfect Game CDP, Enrichment & Meta CAPI Engine", lifespan=lifespan)
 
 # Environment Variables (Configure in Render Dashboard)
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -19,6 +37,16 @@ MELISSA_API_KEY = os.getenv("MELISSA_API_KEY")
 VERSIUM_API_KEY = os.getenv("VERSIUM_API_KEY")
 META_PIXEL_ID = os.getenv("META_PIXEL_ID")
 META_ACCESS_TOKEN = os.getenv("META_ACCESS_TOKEN")
+
+# Webhook / cron authentication. Each check is enforced as soon as its variable is set.
+# Square: signature key from the Square Developer Dashboard webhook subscription.
+SQUARE_WEBHOOK_SIGNATURE_KEY = os.getenv("SQUARE_WEBHOOK_SIGNATURE_KEY")
+# Must exactly match the notification URL registered with Square (Square signs URL + body).
+SQUARE_WEBHOOK_URL = os.getenv("SQUARE_WEBHOOK_URL", "https://pg-cdp-webhook.onrender.com/webhooks/square")
+# WebRes / Tripleseat / Partywirks: send as header `X-CDP-Key` or query param `?key=`.
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
+# /cron/* endpoints: send as header `X-CDP-Key` or query param `?key=`.
+CRON_SECRET = os.getenv("CRON_SECRET")
 
 # Your 4 Live Non-Detroit Meta Custom Audience IDs
 AUDIENCE_PG1_CORP = os.getenv("AUDIENCE_PG1_CORP", "120246555016470358")
@@ -37,6 +65,11 @@ EXCLUDED_ZIPS = {
     "48033", "48034", "48037", "48075", "48076",
     "48340", "48341", "48342", "48141"
 }
+# Every 482xx ZIP is excluded (Detroit and its enclaves) EXCEPT these, which are the Grosse Pointes:
+#   48230 = Grosse Pointe, Grosse Pointe Farms, Grosse Pointe Park
+#   48236 = Grosse Pointe Woods, Grosse Pointe Shores
+# The city check still runs first, so a 48236 address whose city is Harper Woods or Detroit stays excluded.
+ALLOWED_482_ZIPS = {"48230", "48236"}
 PRIME_SUBURB_ZIPS = {
     "48331", "48334", "48335", "48336", "48374", "48375", "48377",
     "48150", "48152", "48154", "48167", "48168", "48322", "48323",
@@ -49,20 +82,68 @@ GENERIC_CARD_WORDS = {
 }
 
 
-def sha256_hash(val: str) -> str:
+# ---------------------------------------------------------------------------
+# Small helpers
+# ---------------------------------------------------------------------------
+
+def get_conn():
+    return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+
+
+def sha256_hash(val) -> str:
     if not val:
         return ""
     return hashlib.sha256(str(val).strip().lower().encode("utf-8")).hexdigest()
 
 
-def clean_phone(phone: str) -> str:
+def clean_phone(phone) -> str:
+    """10-digit US phone used for matching inside Neon."""
     digits = "".join(c for c in str(phone or "") if c.isdigit())
     if len(digits) == 11 and digits.startswith("1"):
         digits = digits[1:]
     return digits if len(digits) == 10 else ""
 
 
-def parse_cardholder_name(raw_name: str) -> tuple[str, str]:
+def meta_phone(phone) -> str:
+    """Meta requires the country code: 1XXXXXXXXXX."""
+    p10 = clean_phone(phone)
+    return f"1{p10}" if p10 else ""
+
+
+def meta_city(city) -> str:
+    """Meta wants lowercase letters only: 'Farmington Hills' -> 'farmingtonhills'."""
+    return re.sub(r"[^a-z]", "", str(city or "").lower())
+
+
+def meta_state(state) -> str:
+    """Meta wants the 2-letter state code, lowercase. Defaults to Michigan when unknown."""
+    s = re.sub(r"[^a-z]", "", str(state or "").lower())
+    if s == "michigan" or not s:
+        return "mi"
+    return s if len(s) == 2 else ""
+
+
+def to_int(val, default: int = 0) -> int:
+    try:
+        return int(float(val))
+    except (TypeError, ValueError):
+        return default
+
+
+def to_float(val, default: float = 0.0) -> float:
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return default
+
+
+def date_only(val):
+    if isinstance(val, str) and "T" in val:
+        return val.split("T")[0]
+    return val or None
+
+
+def parse_cardholder_name(raw_name: str) -> tuple:
     """Parses EMV chip cardholder_name (handles 'LAST/FIRST' and 'FIRST LAST' formats)."""
     if not raw_name or not isinstance(raw_name, str):
         return "", ""
@@ -91,51 +172,130 @@ def haversine_miles(lat1: float, lon1: float, lat2: float, lon2: float) -> float
     return round(2 * R * math.atan2(math.sqrt(a), math.sqrt(1 - a)), 2)
 
 
-def is_detroit_excluded(city: str, zip5: str) -> bool:
-    c = (city or "").strip().lower()
-    z = (zip5 or "").strip()[:5]
-    return c in EXCLUDED_CITIES or z.startswith("482") or z in EXCLUDED_ZIPS
+def is_detroit_excluded(city, zip5) -> bool:
+    c = " ".join(str(city or "").strip().lower().split())
+    z = str(zip5 or "").strip()[:5]
+    if c in EXCLUDED_CITIES or z in EXCLUDED_ZIPS:
+        return True
+    if z in ALLOWED_482_ZIPS:
+        return False
+    return z.startswith("482")
 
 
-def fetch_square_customer_profile(sq_id: str) -> dict:
-    """Pulls full Name, Email, Phone, Address, and any Card-on-File AVS Billing ZIP from Square API."""
-    if not SQUARE_ACCESS_TOKEN or not sq_id:
-        return {}
+def get_threshold(cur) -> int:
+    cur.execute("SELECT current_score_threshold FROM cdp_thermostat_config WHERE id = 1;")
+    return int(cur.fetchone()["current_score_threshold"])
+
+
+# ---------------------------------------------------------------------------
+# Authentication
+# ---------------------------------------------------------------------------
+
+def _provided_key(request: Request) -> str:
+    return request.headers.get("x-cdp-key") or request.query_params.get("key") or ""
+
+
+def _require_key(request: Request, expected: Optional[str], name: str):
+    if not expected:
+        log.warning("%s is not set; %s is accepting unauthenticated requests", name, request.url.path)
+        return
+    if not hmac.compare_digest(_provided_key(request).encode(), expected.encode()):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+def require_webhook_key(request: Request):
+    _require_key(request, WEBHOOK_SECRET, "WEBHOOK_SECRET")
+
+
+def require_cron_key(request: Request):
+    _require_key(request, CRON_SECRET, "CRON_SECRET")
+
+
+def square_signature(body: bytes, key: str, url: str) -> str:
+    digest = hmac.new(key.encode("utf-8"), url.encode("utf-8") + body, hashlib.sha256).digest()
+    return base64.b64encode(digest).decode("utf-8")
+
+
+def verify_square_signature(request: Request, body: bytes):
+    if not SQUARE_WEBHOOK_SIGNATURE_KEY:
+        log.warning("SQUARE_WEBHOOK_SIGNATURE_KEY is not set; Square webhooks are not verified")
+        return
+    provided = request.headers.get("x-square-hmacsha256-signature", "")
+    expected = square_signature(body, SQUARE_WEBHOOK_SIGNATURE_KEY, SQUARE_WEBHOOK_URL)
+    if not hmac.compare_digest(provided.encode(), expected.encode()):
+        raise HTTPException(status_code=401, detail="Invalid Square signature")
+
+
+async def read_json(request: Request):
+    body = await request.body()
     try:
-        resp = requests.get(
+        return body, (json.loads(body) if body else {})
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Body is not valid JSON")
+
+
+# ---------------------------------------------------------------------------
+# External lookups
+# ---------------------------------------------------------------------------
+
+def fetch_square_customer_profile(sq_id: str) -> Optional[dict]:
+    """Name, email, phone, address and any card-on-file billing ZIP from Square.
+
+    Returns None when Square could not be reached (caller may retry later),
+    and {} when Square answered but has no such customer.
+    """
+    if not SQUARE_ACCESS_TOKEN or not sq_id:
+        return None
+    try:
+        r = requests.get(
             f"https://connect.squareup.com/v2/customers/{sq_id}",
             headers={"Authorization": f"Bearer {SQUARE_ACCESS_TOKEN}", "Accept": "application/json"},
             timeout=4,
-        ).json()
-        cust = resp.get("customer", {})
-        addr = cust.get("address", {})
-        postal = addr.get("postal_code", "")
-        if not postal and isinstance(cust.get("cards"), list):
-            for card in cust["cards"]:
-                c_zip = (card.get("billing_address") or {}).get("postal_code") or ""
-                if c_zip:
-                    postal = c_zip
-                    break
-        return {
-            "first_name": cust.get("given_name", ""),
-            "last_name": cust.get("family_name", ""),
-            "email": cust.get("email_address", ""),
-            "phone": cust.get("phone_number", ""),
-            "address": addr.get("address_line_1", ""),
-            "city": addr.get("locality", ""),
-            "state": addr.get("administrative_district_level_1", ""),
-            "zip": postal[:5] if postal else "",
-        }
+        )
+        if r.status_code == 404:
+            return {}
+        if r.status_code != 200:
+            return None
+        cust = r.json().get("customer") or {}
     except Exception:
-        return {}
+        return None
+    addr = cust.get("address") or {}
+    postal = addr.get("postal_code") or ""
+    if not postal and isinstance(cust.get("cards"), list):
+        for card in cust["cards"]:
+            c_zip = (card.get("billing_address") or {}).get("postal_code") or ""
+            if c_zip:
+                postal = c_zip
+                break
+    return {
+        "first_name": cust.get("given_name") or "",
+        "last_name": cust.get("family_name") or "",
+        "email": cust.get("email_address") or "",
+        "phone": cust.get("phone_number") or "",
+        "address": addr.get("address_line_1") or "",
+        "city": addr.get("locality") or "",
+        "state": addr.get("administrative_district_level_1") or "",
+        "zip": postal[:5] if postal else "",
+    }
 
 
-def run_melissa_and_versium_waterfall(first_name: str, last_name: str, email: str, phone: str, address: str = "", city: str = "", state: str = "", zip_code: str = "") -> dict:
-    """Step 1: Melissa Personator (Address, Lat/Long, Demographics). Step 2: Versium REACH (Alt Emails/Phones, Wealth, B2B)."""
+def run_melissa_and_versium_waterfall(first_name: str, last_name: str, email: str, phone: str,
+                                      address: str = "", city: str = "", state: str = "", zip_code: str = "") -> dict:
+    """Step 1: Melissa Personator (Address, Lat/Long, Demographics). Step 2: Versium REACH (Alt Emails/Phones, Wealth).
+
+    `md_results` is only set when Melissa actually answered. It stays None when Melissa is not
+    configured or the call failed, so the customer is tried again later instead of being written off.
+    """
+    zip_code = (zip_code or "")[:5]
     result = {
         "alt_emails": [],
         "alt_phones": [],
         "lifestyle_flags": {},
+        # What we were given, so the geo gate still works if Melissa is unavailable.
+        "md_city": city or None,
+        "md_state": state or None,
+        "zip5": zip_code or None,
+        "md_results": None,
     }
     if not any([email, phone, address, (first_name and last_name and zip_code)]):
         return result
@@ -159,40 +319,41 @@ def run_melissa_and_versium_waterfall(first_name: str, last_name: str, email: st
                     "postal": zip_code,
                 },
                 timeout=5,
-            ).json()
-            rec = m_resp.get("Records", [{}])[0]
+            )
+            m_resp.raise_for_status()
+            rec = (m_resp.json().get("Records") or [{}])[0]
             has_street = bool((rec.get("AddressLine1") or address or "").strip())
-            lat = float(rec.get("Latitude") or 0) if has_street else 0.0
-            lon = float(rec.get("Longitude") or 0) if has_street else 0.0
+            lat = to_float(rec.get("Latitude")) if has_street else 0.0
+            lon = to_float(rec.get("Longitude")) if has_street else 0.0
             dist = haversine_miles(ALLEY_LAT, ALLEY_LON, lat, lon) if (lat and lon) else None
             result.update({
                 "md_address1": rec.get("AddressLine1") or address or None,
                 "md_city": (rec.get("City") if has_street else None) or city or None,
                 "md_state": (rec.get("State") if has_street else None) or state or None,
-                "zip5": ((rec.get("PostalCode") or zip_code)[:5] if has_street else None) or (zip_code[:5] if zip_code else None),
+                "zip5": ((rec.get("PostalCode") or zip_code)[:5] if has_street else None) or zip_code or None,
                 "md_plus4": rec.get("Plus4") if has_street else None,
                 "md_carrier_route": rec.get("CarrierRoute") if has_street else None,
-                "md_latitude": lat if lat else None,
-                "md_longitude": lon if lon else None,
+                "md_latitude": lat or None,
+                "md_longitude": lon or None,
                 "distance_miles": dist,
-                "md_household_income": rec.get("HouseholdIncome"),
-                "md_presence_of_children": rec.get("PresenceOfChildren"),
-                "md_children_age_range": rec.get("ChildrenAgeRange"),
-                "md_own_rent": rec.get("HomeOwnerStatus"),
-                "md_marital_status": rec.get("MaritalStatus"),
-                "md_household_size": rec.get("HouseholdSize"),
-                "md_length_of_residence": rec.get("LengthOfResidence"),
-                "md_education": rec.get("Education"),
-                "md_occupation": rec.get("Occupation"),
-                "md_date_of_birth": rec.get("DateOfBirth"),
-                "md_gender": rec.get("Gender"),
-                "md_delivery_indicator": rec.get("DeliveryIndicator"),
-                "md_mik": rec.get("MelissaIdentityKey"),
-                "md_mak": rec.get("MelissaAddressKey"),
-                "md_results": rec.get("Results"),
+                "md_household_income": rec.get("HouseholdIncome") or None,
+                "md_presence_of_children": rec.get("PresenceOfChildren") or None,
+                "md_children_age_range": rec.get("ChildrenAgeRange") or None,
+                "md_own_rent": rec.get("HomeOwnerStatus") or None,
+                "md_marital_status": rec.get("MaritalStatus") or None,
+                "md_household_size": rec.get("HouseholdSize") or None,
+                "md_length_of_residence": rec.get("LengthOfResidence") or None,
+                "md_education": rec.get("Education") or None,
+                "md_occupation": rec.get("Occupation") or None,
+                "md_date_of_birth": rec.get("DateOfBirth") or None,
+                "md_gender": rec.get("Gender") or None,
+                "md_delivery_indicator": rec.get("DeliveryIndicator") or None,
+                "md_mik": rec.get("MelissaIdentityKey") or None,
+                "md_mak": rec.get("MelissaAddressKey") or None,
+                "md_results": rec.get("Results") or "NO_RESULT_CODES",
             })
-        except Exception:
-            pass
+        except Exception as e:
+            log.warning("Melissa lookup failed: %s", type(e).__name__)
 
     # --- STEP 2: VERSIUM REACH (When API Key is active) ---
     if VERSIUM_API_KEY and not is_detroit_excluded(result.get("md_city"), result.get("zip5")):
@@ -215,8 +376,8 @@ def run_melissa_and_versium_waterfall(first_name: str, last_name: str, email: st
                 params={**v_input, "output[]": ["email_multiple", "phone_multiple"], "rcfg_max_emails": 5},
                 timeout=5,
             ).json()
-            v_res = vc.get("versium", {}).get("results", [{}])[0]
-            result["alt_emails"] = [e for e in [v_res.get(f"email_{i}") for i in range(1, 6)] if e]
+            v_res = (vc.get("versium", {}).get("results") or [{}])[0]
+            result["alt_emails"] = [e.strip().lower() for e in [v_res.get(f"email_{i}") for i in range(1, 6)] if e]
             result["alt_phones"] = [clean_phone(p) for p in [v_res.get(f"phone_{i}") for i in range(1, 6)] if clean_phone(p)]
 
             vd = requests.get(
@@ -225,18 +386,22 @@ def run_melissa_and_versium_waterfall(first_name: str, last_name: str, email: st
                 params={**v_input, "output[]": ["basic_demographic", "financial_household_auto", "lifestyle_interests"]},
                 timeout=5,
             ).json()
-            vd_res = vd.get("versium", {}).get("results", [{}])[0]
-            result["versium_net_worth"] = vd_res.get("net_worth")
-            result["versium_home_market_value"] = vd_res.get("home_market_value")
-            result["versium_auto_make_model"] = f"{vd_res.get('auto_make', '')} {vd_res.get('auto_model', '')}".strip()
-            result["lifestyle_flags"] = vd_res
-        except Exception:
-            pass
+            vd_res = (vd.get("versium", {}).get("results") or [{}])[0]
+            result["versium_net_worth"] = vd_res.get("net_worth") or None
+            result["versium_home_market_value"] = vd_res.get("home_market_value") or None
+            result["versium_auto_make_model"] = f"{vd_res.get('auto_make', '')} {vd_res.get('auto_model', '')}".strip() or None
+            result["lifestyle_flags"] = vd_res or {}
+        except Exception as e:
+            log.warning("Versium lookup failed: %s", type(e).__name__)
 
     return result
 
 
-def score_and_assign_persona(cust: dict) -> tuple[str, int]:
+# ---------------------------------------------------------------------------
+# Scoring
+# ---------------------------------------------------------------------------
+
+def score_and_assign_persona(cust: dict) -> tuple:
     kids_raw = str(cust.get("md_presence_of_children") or "").strip().upper()
     has_kids = (
         kids_raw.startswith("Y")
@@ -297,20 +462,45 @@ def score_and_assign_persona(cust: dict) -> tuple[str, int]:
     return persona, min(100, score)
 
 
+def rescore_customer(cur, cust: dict, exact: bool = False) -> dict:
+    """Recalculates persona & score. Scores only ratchet upward unless `exact` (used by repairs)
+    or the customer is in an excluded area (always pinned to 25)."""
+    persona, score = score_and_assign_persona(cust)
+    cur.execute(
+        """
+        UPDATE master_customers
+        SET pg_mosaic_persona = %(persona)s,
+            bowler_value_score = CASE
+                WHEN %(exact)s OR %(score)s = 25 THEN %(score)s
+                ELSE GREATEST(COALESCE(bowler_value_score, 0), %(score)s)
+            END
+        WHERE cluster_id = %(cid)s RETURNING *;
+        """,
+        {"persona": persona, "score": score, "exact": exact, "cid": cust["cluster_id"]},
+    )
+    return cur.fetchone()
+
+
+# ---------------------------------------------------------------------------
+# Meta
+# ---------------------------------------------------------------------------
+
 def build_meta_user_identifiers(cust: dict) -> dict:
-    """Combines primary + Versium alternate emails & phones so online bookings and in-store POS swipes stitch to the same Meta profile."""
-    emails = [cust.get("email")] + (cust.get("versium_alt_emails") or [])
-    phones = [cust.get("phone")] + (cust.get("versium_alt_phones") or [])
-    hashed_emails = list({sha256_hash(e) for e in emails if e})
-    hashed_phones = list({sha256_hash(p) for p in phones if p})
+    """Primary + Versium alternate emails & phones, formatted the way Meta expects before hashing."""
+    emails = [cust.get("email")] + list(cust.get("versium_alt_emails") or [])
+    phones = [cust.get("phone")] + list(cust.get("versium_alt_phones") or [])
+    hashed_emails = sorted({sha256_hash(e) for e in emails if e})
+    hashed_phones = sorted({sha256_hash(meta_phone(p)) for p in phones if meta_phone(p)})
+    city = meta_city(cust.get("md_city"))
+    state = meta_state(cust.get("md_state"))
 
     user_data = {
         "em": hashed_emails,
         "ph": hashed_phones,
         "fn": [sha256_hash(cust.get("first_name"))] if cust.get("first_name") else [],
         "ln": [sha256_hash(cust.get("last_name"))] if cust.get("last_name") else [],
-        "ct": [sha256_hash(cust.get("md_city"))] if cust.get("md_city") else [],
-        "st": [sha256_hash(cust.get("md_state") or "mi")],
+        "ct": [sha256_hash(city)] if city else [],
+        "st": [sha256_hash(state)] if state else [],
         "zp": [sha256_hash(cust.get("zip5"))] if cust.get("zip5") else [],
         "country": [sha256_hash("us")],
         "external_id": [sha256_hash(str(cust["cluster_id"]))],
@@ -319,7 +509,7 @@ def build_meta_user_identifiers(cust: dict) -> dict:
 
 
 def sync_customer_to_meta_custom_audiences(cust: dict):
-    """Pushes qualified Non-Detroit/Non-Southfield customers directly into your 4 Meta Value-Based Custom Audiences."""
+    """Pushes qualified non-excluded customers into the 4 Meta value-based Custom Audiences."""
     if not META_ACCESS_TOKEN or is_detroit_excluded(cust.get("md_city"), cust.get("zip5")):
         return
 
@@ -339,13 +529,13 @@ def sync_customer_to_meta_custom_audiences(cust: dict):
 
     schema = ["EMAIL", "PHONE", "FN", "LN", "CT", "ST", "ZIP", "COUNTRY", "LOOKALIKE_VALUE"]
     row = [
-        sha256_hash(cust.get("email", "")),
-        sha256_hash(cust.get("phone", "")),
-        sha256_hash(cust.get("first_name", "")),
-        sha256_hash(cust.get("last_name", "")),
-        sha256_hash(cust.get("md_city", "")),
-        sha256_hash(cust.get("md_state") or "mi"),
-        sha256_hash(cust.get("zip5", "")),
+        sha256_hash(cust.get("email")),
+        sha256_hash(meta_phone(cust.get("phone"))),
+        sha256_hash(cust.get("first_name")),
+        sha256_hash(cust.get("last_name")),
+        sha256_hash(meta_city(cust.get("md_city"))),
+        sha256_hash(meta_state(cust.get("md_state"))),
+        sha256_hash(cust.get("zip5")),
         sha256_hash("us"),
         round(ltv, 2),
     ]
@@ -359,23 +549,32 @@ def sync_customer_to_meta_custom_audiences(cust: dict):
                     json={"payload": {"schema": schema, "data": [row]}},
                     timeout=5,
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                log.warning("Meta audience sync failed: %s", type(e).__name__)
 
 
-def fire_meta_capi_event(cur, cust: dict, event_name: str, value: float, threshold: int, event_id_override: str = None):
+def fire_meta_capi_event(cur, cust: dict, event_name: str, value: float, threshold: int,
+                         event_id: str, action_source: str = "system_generated"):
+    """Sends one CAPI event, at most once per event_id.
+
+    A Meta error or timeout is logged with sent_to_meta = FALSE and never raises, so it can't roll back
+    the customer update. If the same event comes through again later, it's retried.
+    """
     if not META_PIXEL_ID or not META_ACCESS_TOKEN:
         return
+    cur.execute("SELECT sent_to_meta FROM capi_events_log WHERE event_id = %s;", (event_id,))
+    prior = cur.fetchone()
+    if prior and prior["sent_to_meta"]:
+        return
+
     cluster_id = cust["cluster_id"]
     score = int(cust.get("bowler_value_score") or 0)
-    event_id = event_id_override or f"{event_name}_{cluster_id}_{int(time.time())}"
-
     payload = {
         "data": [{
             "event_name": event_name,
             "event_time": int(time.time()),
             "event_id": event_id,
-            "action_source": "system_generated",
+            "action_source": action_source,
             "user_data": build_meta_user_identifiers(cust),
             "custom_data": {
                 "currency": "USD",
@@ -385,40 +584,193 @@ def fire_meta_capi_event(cur, cust: dict, event_name: str, value: float, thresho
             },
         }]
     }
-    resp = requests.post(
-        f"https://graph.facebook.com/v21.0/{META_PIXEL_ID}/events?access_token={META_ACCESS_TOKEN}",
-        json=payload,
-        timeout=5,
-    )
+    try:
+        resp = requests.post(
+            f"https://graph.facebook.com/v21.0/{META_PIXEL_ID}/events",
+            params={"access_token": META_ACCESS_TOKEN},
+            json=payload,
+            timeout=5,
+        )
+        status, body, ok = str(resp.status_code), resp.text[:1000], 200 <= resp.status_code < 300
+    except Exception as e:
+        status, body, ok = "NETWORK_ERROR", type(e).__name__, False
+
     cur.execute(
         """
         INSERT INTO capi_events_log (
             event_id, cluster_id, event_name, event_value, bowler_value_score,
             threshold_at_send, sent_to_meta, meta_response_status, meta_response_body
-        ) VALUES (%s, %s, %s, %s, %s, %s, TRUE, %s, %s)
-        ON CONFLICT (event_id) DO NOTHING;
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (event_id) DO UPDATE SET
+            sent_at = NOW(),
+            sent_to_meta = EXCLUDED.sent_to_meta,
+            meta_response_status = EXCLUDED.meta_response_status,
+            meta_response_body = EXCLUDED.meta_response_body
+        WHERE capi_events_log.sent_to_meta = FALSE;
         """,
-        (event_id, cluster_id, event_name, value, score, threshold, str(resp.status_code), resp.text[:1000]),
+        (event_id, cluster_id, event_name, value, score, threshold, ok, status, body),
     )
 
 
-def upsert_and_enrich_customer(cur, data: dict) -> tuple[dict, bool]:
-    """Resolves identity across Square/WebRes/Tripleseat/Partywirks (including Same-Day Name+Date stitching), enriches via Melissa+Versium, and updates master_customers."""
-    sq_id = (data.get("sq_id") or "").strip()
-    if sq_id and not (data.get("email") or data.get("phone")):
-        sq_profile = fetch_square_customer_profile(sq_id)
-        for k, v in sq_profile.items():
-            if v and not data.get(k):
-                data[k] = v
+# ---------------------------------------------------------------------------
+# Transactions ledger (unified_transactions): one row per external payment / booking / record.
+# This is what makes every webhook safe to receive more than once.
+# ---------------------------------------------------------------------------
 
-    email = (data.get("email") or "").strip().lower()
-    phone = clean_phone(data.get("phone") or "")
-    first_name = (data.get("first_name") or "").strip()
-    last_name = (data.get("last_name") or "").strip()
-    full_name_clean = f"{first_name} {last_name}".strip()
+def claim_transaction(cur, transaction_id: str, source_system: str, amount: float = 0.0,
+                      transaction_date=None) -> bool:
+    """Returns True the first time a transaction is seen. A concurrent duplicate blocks on the
+    uncommitted row until the first request finishes, then gets False."""
+    cur.execute(
+        """
+        INSERT INTO unified_transactions (transaction_id, source_system, total_amount, transaction_date)
+        VALUES (%s, %s, %s, COALESCE(%s::timestamptz, NOW()))
+        ON CONFLICT (transaction_id) DO NOTHING
+        RETURNING transaction_id;
+        """,
+        (transaction_id, source_system, round(amount, 2), transaction_date),
+    )
+    return cur.fetchone() is not None
 
-    # 1A. Primary Deterministic Identity Lookup (sq_id, email, phone)
-    existing = None
+
+def adjust_spend(cur, cluster_id: int, sq_diff: float = 0.0, wr_diff: float = 0.0, sq_visits: int = 0):
+    cur.execute(
+        """
+        UPDATE master_customers SET
+            sq_spend = GREATEST(0, COALESCE(sq_spend, 0) + %(sq)s),
+            wr_spend = GREATEST(0, COALESCE(wr_spend, 0) + %(wr)s),
+            webres_online_spend = GREATEST(0, COALESCE(wr_spend, 0) + %(wr)s),
+            true_lifetime_spend = GREATEST(GREATEST(0, COALESCE(sq_spend, 0) + %(sq)s),
+                                           GREATEST(0, COALESCE(wr_spend, 0) + %(wr)s)),
+            instore_pos_spend = GREATEST(0, GREATEST(0, COALESCE(sq_spend, 0) + %(sq)s)
+                                            - GREATEST(0, COALESCE(wr_spend, 0) + %(wr)s)),
+            sq_visits = COALESCE(sq_visits, 0) + %(v)s,
+            updated_at = NOW()
+        WHERE cluster_id = %(cid)s RETURNING *;
+        """,
+        {"sq": sq_diff, "wr": wr_diff, "v": sq_visits, "cid": cluster_id},
+    )
+    return cur.fetchone()
+
+
+def reprice_transaction(cur, transaction_id: str, new_amount: float, kind: str) -> dict:
+    """A repeat notice for a known transaction: only apply a change in amount (e.g. a refund)."""
+    cur.execute(
+        "SELECT cluster_id, total_amount FROM unified_transactions WHERE transaction_id = %s FOR UPDATE;",
+        (transaction_id,),
+    )
+    row = cur.fetchone()
+    diff = round(new_amount - float(row["total_amount"] or 0), 2)
+    if diff == 0:
+        return {"status": "ignored_duplicate", "transaction_id": transaction_id}
+    cur.execute("UPDATE unified_transactions SET total_amount = %s WHERE transaction_id = %s;",
+                (round(new_amount, 2), transaction_id))
+    if row["cluster_id"]:
+        adjust_spend(cur, row["cluster_id"], sq_diff=diff if kind == "square" else 0.0,
+                     wr_diff=diff if kind == "webres" else 0.0)
+    return {"status": "amount_adjusted", "transaction_id": transaction_id, "delta": diff}
+
+
+def claim_pending_square_payments(cur, cust: dict, sq_id: str) -> dict:
+    """Payments from a Square customer we couldn't identify yet are parked with no customer.
+    Once that Square customer ID is linked to someone, their spend and visits are credited."""
+    if not sq_id:
+        return cust
+    cur.execute(
+        """
+        UPDATE unified_transactions SET cluster_id = %s
+        WHERE source_system = 'square' AND external_customer_id = %s AND cluster_id IS NULL
+        RETURNING total_amount;
+        """,
+        (cust["cluster_id"], sq_id),
+    )
+    rows = cur.fetchall()
+    if not rows:
+        return cust
+    total = sum(float(r["total_amount"] or 0) for r in rows)
+    return adjust_spend(cur, cust["cluster_id"], sq_diff=total, sq_visits=len(rows))
+
+
+# ---------------------------------------------------------------------------
+# Identity resolution + upsert
+# ---------------------------------------------------------------------------
+
+ENRICHMENT_FIELDS = [
+    "md_address1", "md_city", "md_state", "zip5", "md_plus4", "md_carrier_route",
+    "distance_miles", "md_latitude", "md_longitude", "md_household_income",
+    "md_presence_of_children", "md_children_age_range", "md_own_rent", "md_marital_status",
+    "md_household_size", "md_length_of_residence", "md_education", "md_occupation",
+    "md_date_of_birth", "md_gender", "md_delivery_indicator", "md_mik", "md_mak", "md_results",
+    "versium_net_worth", "versium_home_market_value", "versium_auto_make_model",
+]
+JSONB_FIELDS = {"versium_alt_emails", "versium_alt_phones", "versium_lifestyle_flags"}
+
+_MC = "master_customers"
+
+
+def _keep(c):
+    return f"COALESCE(EXCLUDED.{c}, {_MC}.{c})"
+
+
+def _keep_text(c):
+    return f"COALESCE(NULLIF(EXCLUDED.{c}, ''), {_MC}.{c})"
+
+
+def _flag(c):
+    return f"GREATEST(COALESCE({_MC}.{c}, 0), EXCLUDED.{c})"
+
+
+def _add(c):
+    return f"COALESCE({_MC}.{c}, 0) + EXCLUDED.{c}"
+
+
+def _jsonb(c, empty):
+    return f"CASE WHEN EXCLUDED.{c} <> '{empty}'::jsonb THEN EXCLUDED.{c} ELSE {_MC}.{c} END"
+
+
+_SQ_NEW = f"GREATEST(0, COALESCE({_MC}.sq_spend, 0) + EXCLUDED.sq_spend)"
+_WR_NEW = f"GREATEST(0, COALESCE({_MC}.wr_spend, 0) + EXCLUDED.wr_spend)"
+
+UPSERT_UPDATE_RULES = {
+    "first_name": _keep_text("first_name"),
+    "last_name": _keep_text("last_name"),
+    "full_name": _keep_text("full_name"),
+    "email": _keep_text("email"),
+    "phone": _keep_text("phone"),
+    "sq_id": _keep_text("sq_id"),
+    "avs_postal_code": _keep_text("avs_postal_code"),
+    "in_tripleseat": _flag("in_tripleseat"),
+    "in_square": _flag("in_square"),
+    "in_webres": _flag("in_webres"),
+    "in_partywirks": _flag("in_partywirks"),
+    "sq_spend": _SQ_NEW,
+    "wr_spend": _WR_NEW,
+    "true_lifetime_spend": f"GREATEST({_SQ_NEW}, {_WR_NEW})",
+    "webres_online_spend": _WR_NEW,
+    "instore_pos_spend": f"GREATEST(0, {_SQ_NEW} - {_WR_NEW})",
+    "sq_visits": _add("sq_visits"),
+    "wr_bookings": _add("wr_bookings"),
+    "ts_events": _add("ts_events"),
+    "pw_bookings": _add("pw_bookings"),
+    "ts_account": _keep("ts_account"),
+    "pw_last_package": _keep("pw_last_package"),
+    "pw_last_party_date": _keep("pw_last_party_date"),
+    "wr_last_reservation_date": _keep("wr_last_reservation_date"),
+    "sq_first_visit_date": f"COALESCE({_MC}.sq_first_visit_date, EXCLUDED.sq_first_visit_date)",
+    "sq_last_visit_date": _keep("sq_last_visit_date"),
+    **{c: _keep(c) for c in ENRICHMENT_FIELDS},
+    "versium_alt_emails": _jsonb("versium_alt_emails", "[]"),
+    "versium_alt_phones": _jsonb("versium_alt_phones", "[]"),
+    "versium_lifestyle_flags": _jsonb("versium_lifestyle_flags", "{}"),
+    "ts_lead_status": _keep("ts_lead_status"),
+    "ts_max_guests": f"GREATEST(COALESCE({_MC}.ts_max_guests, 0), COALESCE(EXCLUDED.ts_max_guests, 0))",
+    "ts_last_event_date": _keep("ts_last_event_date"),
+    "ts_turned_down_reason": _keep("ts_turned_down_reason"),
+}
+
+
+def _find_existing(cur, sq_id: str, email: str, phone: str, first_name: str, last_name: str):
+    # 1A. Deterministic identity lookup (sq_id, email, phone)
     for id_type, id_val in [("sq_id", sq_id), ("email", email), ("phone", phone)]:
         if id_val:
             cur.execute(
@@ -429,14 +781,13 @@ def upsert_and_enrich_customer(cur, data: dict) -> tuple[dict, bool]:
                 """,
                 (id_type, id_val),
             )
-            existing = cur.fetchone()
-            if existing:
-                break
+            row = cur.fetchone()
+            if row:
+                return row
 
-    # 1B. Live Same-Day POS-to-WebRes/Partywirks/Tripleseat Name Stitch
-    # If an email-less Square card swipe has a valid First + Last Name, check if that person
-    # has an active online reservation/party within +/- 1 day of today (or is a unique known name in Neon).
-    if not existing and len(first_name) >= 2 and len(last_name) >= 2:
+    # 1B. Same-day POS-to-WebRes/Partywirks/Tripleseat name stitch
+    if len(first_name) >= 2 and len(last_name) >= 2:
+        full_name = f"{first_name} {last_name}"
         cur.execute(
             """
             SELECT * FROM master_customers
@@ -451,37 +802,73 @@ def upsert_and_enrich_customer(cur, data: dict) -> tuple[dict, bool]:
             ORDER BY updated_at DESC NULLS LAST, true_lifetime_spend DESC NULLS LAST
             LIMIT 1;
             """,
-            (full_name_clean,),
+            (full_name,),
         )
-        existing = cur.fetchone()
+        row = cur.fetchone()
+        if row:
+            return row
 
-        # Fallback: If only 1 known profile in the entire database has that exact First + Last Name, link to them
-        if not existing:
-            cur.execute(
-                """
-                SELECT * FROM master_customers
-                WHERE LOWER(TRIM(full_name)) = LOWER(%s)
-                  AND source != 'Square_Instant_Profile'
-                """,
-                (full_name_clean,),
-            )
-            name_matches = cur.fetchall()
-            if len(name_matches) == 1:
-                existing = name_matches[0]
+        # Fallback: exactly one known profile in the database has this first + last name
+        cur.execute(
+            """
+            SELECT * FROM master_customers
+            WHERE LOWER(TRIM(full_name)) = LOWER(%s)
+              AND source != 'Square_Instant_Profile'
+            LIMIT 2;
+            """,
+            (full_name,),
+        )
+        matches = cur.fetchall()
+        if len(matches) == 1:
+            return matches[0]
+    return None
 
-    # 2. Progressive Enrichment Trigger
-    needs_enrichment = (existing is None) or (not existing.get("md_address1") and (email or phone or data.get("zip")))
+
+def _needs_enrichment(existing, email: str, phone: str, data: dict) -> bool:
+    has_input = bool(email or phone or data.get("address") or data.get("zip"))
+    if not has_input:
+        return False
+    if existing is None:
+        return True
+    if existing.get("md_address1"):
+        return False
+    # Never pay twice for the same inputs: only retry if Melissa never answered for this person,
+    # or we now have an email/phone we didn't have the last time.
+    never_answered = existing.get("md_results") is None
+    new_contact = (email and not existing.get("email")) or (phone and not existing.get("phone"))
+    return bool(never_answered or new_contact)
+
+
+def upsert_and_enrich_customer(cur, data: dict) -> tuple:
+    """Resolves identity across Square/WebRes/Tripleseat/Partywirks, enriches via Melissa+Versium
+    when worthwhile, and upserts master_customers.
+
+    Counter/spend changes are explicit deltas (sq_spend_delta, sq_visit_delta, wr_spend_delta,
+    wr_booking_delta, ts_event_delta, pw_booking_delta); callers only pass them for
+    transactions they have just claimed, so repeated webhooks never double count.
+    """
+    sq_id = (data.get("sq_id") or "").strip()
+    email = (data.get("email") or "").strip().lower()
+    phone = clean_phone(data.get("phone") or "")
+    first_name = (data.get("first_name") or "").strip()
+    last_name = (data.get("last_name") or "").strip()
+
+    existing = _find_existing(cur, sq_id, email, phone, first_name, last_name)
+
+    # 2. Progressive enrichment
+    needs_enrichment = _needs_enrichment(existing, email, phone, data)
     enriched = {}
-    if needs_enrichment and (email or phone or data.get("address") or data.get("zip")):
+    if needs_enrichment:
+        prior = existing or {}
         enriched = run_melissa_and_versium_waterfall(
-            first_name or (existing or {}).get("first_name", ""),
-            last_name or (existing or {}).get("last_name", ""),
-            email or (existing or {}).get("email", ""),
-            phone or (existing or {}).get("phone", ""),
-            data.get("address", ""),
-            data.get("city", ""),
-            data.get("state", ""),
-            data.get("zip", ""),
+            first_name or prior.get("first_name") or "",
+            last_name or prior.get("last_name") or "",
+            email or prior.get("email") or "",
+            phone or prior.get("phone") or "",
+            data.get("address") or "",
+            data.get("city") or "",
+            data.get("state") or "",
+            data.get("zip") or "",
         )
         if not existing and enriched.get("md_mik"):
             cur.execute(
@@ -493,148 +880,79 @@ def upsert_and_enrich_customer(cur, data: dict) -> tuple[dict, bool]:
                 (enriched["md_mik"],),
             )
             existing = cur.fetchone()
+    elif data.get("zip") and not (existing or {}).get("zip5"):
+        # No paid lookup needed, but keep the ZIP we were handed so the geo gate can use it.
+        enriched = {"zip5": str(data["zip"])[:5], "md_city": data.get("city") or None,
+                    "md_state": data.get("state") or None}
 
     if existing:
         cluster_id = existing["cluster_id"]
     else:
-        cur.execute("SELECT COALESCE(MAX(cluster_id), 24220) + 1 AS next_id FROM master_customers;")
+        cur.execute("SELECT nextval('master_cluster_id_seq') AS next_id;")
         cluster_id = cur.fetchone()["next_id"]
 
+    is_pw = 1 if data.get("in_partywirks") else 0
     sq_delta = float(data.get("sq_spend_delta") or 0.0)
     wr_delta = float(data.get("wr_spend_delta") or 0.0)
-    is_ts = 1 if data.get("in_tripleseat") else 0
-    is_sq = 1 if data.get("in_square") else 0
-    is_wr = 1 if data.get("in_webres") else 0
-    is_pw = 1 if data.get("in_partywirks") else 0
-    guest_count = int(data.get("ts_max_guests") or 0)
+    sq_visit_delta = int(data.get("sq_visit_delta") or 0)
     today_iso = date.today().isoformat()
 
-    # 3. Upsert into master_customers
-    cur.execute(
-        """
-        INSERT INTO master_customers (
-            cluster_id, first_name, last_name, full_name, email, phone, source,
-            in_tripleseat, in_square, in_webres, in_partywirks,
-            sq_spend, wr_spend, true_lifetime_spend, webres_online_spend, instore_pos_spend,
-            sq_visits, wr_bookings, ts_events, pw_bookings, ts_account, sq_id,
-            pw_last_package, pw_last_party_date, wr_last_reservation_date, sq_last_visit_date,
-            md_address1, md_city, md_state, zip5, md_plus4, md_carrier_route,
-            distance_miles, md_latitude, md_longitude, md_household_income,
-            md_presence_of_children, md_children_age_range, md_own_rent, md_marital_status,
-            md_household_size, md_length_of_residence, md_education, md_occupation,
-            md_date_of_birth, md_gender, md_delivery_indicator, md_mik, md_mak, md_results,
-            versium_net_worth, versium_home_market_value, versium_auto_make_model,
-            versium_alt_emails, versium_alt_phones, versium_lifestyle_flags,
-            ts_lead_status, ts_max_guests, ts_last_event_date, ts_turned_down_reason, updated_at
-        ) VALUES (
-            %s, %s, %s, %s, %s, %s, %s,
-            %s, %s, %s, %s,
-            %s, %s, GREATEST(%s, %s), %s, GREATEST(0, %s - %s),
-            %s, %s, %s, %s, %s, %s,
-            %s, %s, %s, %s,
-            %s, %s, %s, %s, %s, %s,
-            %s, %s, %s, %s,
-            %s, %s, %s, %s,
-            %s, %s, %s, %s,
-            %s, %s, %s, %s, %s, %s,
-            %s, %s, %s,
-            %s::jsonb, %s::jsonb, %s::jsonb,
-            %s, %s, %s, %s, NOW()
-        )
-        ON CONFLICT (cluster_id) DO UPDATE SET
-            first_name = COALESCE(NULLIF(EXCLUDED.first_name, ''), master_customers.first_name),
-            last_name = COALESCE(NULLIF(EXCLUDED.last_name, ''), master_customers.last_name),
-            full_name = COALESCE(NULLIF(EXCLUDED.full_name, ''), master_customers.full_name),
-            email = COALESCE(NULLIF(EXCLUDED.email, ''), master_customers.email),
-            phone = COALESCE(NULLIF(EXCLUDED.phone, ''), master_customers.phone),
-            in_tripleseat = GREATEST(COALESCE(master_customers.in_tripleseat, 0), EXCLUDED.in_tripleseat),
-            in_square = GREATEST(COALESCE(master_customers.in_square, 0), EXCLUDED.in_square),
-            in_webres = GREATEST(COALESCE(master_customers.in_webres, 0), EXCLUDED.in_webres),
-            in_partywirks = GREATEST(COALESCE(master_customers.in_partywirks, 0), EXCLUDED.in_partywirks),
-            sq_spend = master_customers.sq_spend + EXCLUDED.sq_spend,
-            wr_spend = master_customers.wr_spend + EXCLUDED.wr_spend,
-            true_lifetime_spend = GREATEST(master_customers.sq_spend + EXCLUDED.sq_spend, master_customers.wr_spend + EXCLUDED.wr_spend),
-            webres_online_spend = master_customers.wr_spend + EXCLUDED.wr_spend,
-            instore_pos_spend = GREATEST(0, (master_customers.sq_spend + EXCLUDED.sq_spend) - (master_customers.wr_spend + EXCLUDED.wr_spend)),
-            sq_visits = master_customers.sq_visits + EXCLUDED.sq_visits,
-            wr_bookings = master_customers.wr_bookings + EXCLUDED.wr_bookings,
-            ts_events = master_customers.ts_events + EXCLUDED.ts_events,
-            pw_bookings = COALESCE(master_customers.pw_bookings, 0) + EXCLUDED.pw_bookings,
-            ts_account = COALESCE(EXCLUDED.ts_account, master_customers.ts_account),
-            sq_id = COALESCE(NULLIF(EXCLUDED.sq_id, ''), master_customers.sq_id),
-            pw_last_package = COALESCE(EXCLUDED.pw_last_package, master_customers.pw_last_package),
-            pw_last_party_date = COALESCE(EXCLUDED.pw_last_party_date, master_customers.pw_last_party_date),
-            wr_last_reservation_date = COALESCE(EXCLUDED.wr_last_reservation_date, master_customers.wr_last_reservation_date),
-            sq_last_visit_date = COALESCE(EXCLUDED.sq_last_visit_date, master_customers.sq_last_visit_date),
-            md_address1 = COALESCE(EXCLUDED.md_address1, master_customers.md_address1),
-            md_city = COALESCE(EXCLUDED.md_city, master_customers.md_city),
-            md_state = COALESCE(EXCLUDED.md_state, master_customers.md_state),
-            zip5 = COALESCE(EXCLUDED.zip5, master_customers.zip5),
-            distance_miles = COALESCE(EXCLUDED.distance_miles, master_customers.distance_miles),
-            md_household_income = COALESCE(EXCLUDED.md_household_income, master_customers.md_household_income),
-            md_presence_of_children = COALESCE(EXCLUDED.md_presence_of_children, master_customers.md_presence_of_children),
-            md_children_age_range = COALESCE(EXCLUDED.md_children_age_range, master_customers.md_children_age_range),
-            md_own_rent = COALESCE(EXCLUDED.md_own_rent, master_customers.md_own_rent),
-            md_delivery_indicator = COALESCE(EXCLUDED.md_delivery_indicator, master_customers.md_delivery_indicator),
-            md_mik = COALESCE(EXCLUDED.md_mik, master_customers.md_mik),
-            md_mak = COALESCE(EXCLUDED.md_mak, master_customers.md_mak),
-            versium_net_worth = COALESCE(EXCLUDED.versium_net_worth, master_customers.versium_net_worth),
-            versium_home_market_value = COALESCE(EXCLUDED.versium_home_market_value, master_customers.versium_home_market_value),
-            versium_alt_emails = CASE WHEN jsonb_array_length(EXCLUDED.versium_alt_emails) > 0 THEN EXCLUDED.versium_alt_emails ELSE master_customers.versium_alt_emails END,
-            versium_alt_phones = CASE WHEN jsonb_array_length(EXCLUDED.versium_alt_phones) > 0 THEN EXCLUDED.versium_alt_phones ELSE master_customers.versium_alt_phones END,
-            ts_lead_status = COALESCE(EXCLUDED.ts_lead_status, master_customers.ts_lead_status),
-            ts_max_guests = GREATEST(COALESCE(master_customers.ts_max_guests, 0), COALESCE(EXCLUDED.ts_max_guests, 0)),
-            ts_last_event_date = COALESCE(EXCLUDED.ts_last_event_date, master_customers.ts_last_event_date),
-            ts_turned_down_reason = COALESCE(EXCLUDED.ts_turned_down_reason, master_customers.ts_turned_down_reason),
-            updated_at = NOW()
-        RETURNING *;
-        """,
-        (
-            cluster_id, first_name, last_name, full_name_clean, email, phone, data.get("source", "Webhook"),
-            is_ts, is_sq, is_wr, is_pw,
-            sq_delta, wr_delta, sq_delta, wr_delta, wr_delta, sq_delta, wr_delta,
-            1 if is_sq else 0, 1 if is_wr else 0, 1 if is_ts else 0, 1 if is_pw else 0, data.get("ts_account"), sq_id,
-            data.get("pw_last_package"), data.get("pw_last_party_date"),
-            data.get("wr_last_reservation_date"), today_iso if is_sq else None,
-            enriched.get("md_address1"), enriched.get("md_city"), enriched.get("md_state"), enriched.get("zip5"),
-            enriched.get("md_plus4"), enriched.get("md_carrier_route"), enriched.get("distance_miles"),
-            enriched.get("md_latitude"), enriched.get("md_longitude"), enriched.get("md_household_income"),
-            "Children Present" if is_pw else enriched.get("md_presence_of_children"),
-            enriched.get("md_children_age_range"), enriched.get("md_own_rent"),
-            enriched.get("md_marital_status"), enriched.get("md_household_size"), enriched.get("md_length_of_residence"),
-            enriched.get("md_education"), enriched.get("md_occupation"), enriched.get("md_date_of_birth"),
-            enriched.get("md_gender"), enriched.get("md_delivery_indicator"), enriched.get("md_mik"),
-            enriched.get("md_mak"), enriched.get("md_results"),
-            enriched.get("versium_net_worth"), enriched.get("versium_home_market_value"), enriched.get("versium_auto_make_model"),
-            json.dumps(enriched.get("alt_emails", [])), json.dumps(enriched.get("alt_phones", [])), json.dumps(enriched.get("lifestyle_flags", {})),
-            data.get("ts_lead_status"), guest_count or None, data.get("ts_last_event_date"), data.get("ts_turned_down_reason")
-        ),
-    )
+    vals = {
+        "cluster_id": cluster_id,
+        "first_name": first_name,
+        "last_name": last_name,
+        "full_name": f"{first_name} {last_name}".strip(),
+        "email": email,
+        "phone": phone,
+        "source": data.get("source", "Webhook"),
+        "sq_id": sq_id,
+        "avs_postal_code": (data.get("avs_postal_code") or "")[:5],
+        "in_tripleseat": 1 if data.get("in_tripleseat") else 0,
+        "in_square": 1 if data.get("in_square") else 0,
+        "in_webres": 1 if data.get("in_webres") else 0,
+        "in_partywirks": is_pw,
+        "sq_spend": sq_delta,
+        "wr_spend": wr_delta,
+        "true_lifetime_spend": max(sq_delta, wr_delta),
+        "webres_online_spend": wr_delta,
+        "instore_pos_spend": max(0.0, sq_delta - wr_delta),
+        "sq_visits": sq_visit_delta,
+        "wr_bookings": int(data.get("wr_booking_delta") or 0),
+        "ts_events": int(data.get("ts_event_delta") or 0),
+        "pw_bookings": int(data.get("pw_booking_delta") or 0),
+        "ts_account": data.get("ts_account") or None,
+        "pw_last_package": data.get("pw_last_package"),
+        "pw_last_party_date": data.get("pw_last_party_date"),
+        "wr_last_reservation_date": data.get("wr_last_reservation_date"),
+        "sq_first_visit_date": today_iso if sq_visit_delta else None,
+        "sq_last_visit_date": today_iso if sq_visit_delta else None,
+        **{c: enriched.get(c) for c in ENRICHMENT_FIELDS},
+        "versium_alt_emails": json.dumps(enriched.get("alt_emails") or []),
+        "versium_alt_phones": json.dumps(enriched.get("alt_phones") or []),
+        "versium_lifestyle_flags": json.dumps(enriched.get("lifestyle_flags") or {}),
+        "ts_lead_status": data.get("ts_lead_status"),
+        "ts_max_guests": int(data.get("ts_max_guests") or 0) or None,
+        "ts_last_event_date": data.get("ts_last_event_date"),
+        "ts_turned_down_reason": data.get("ts_turned_down_reason"),
+    }
+    if is_pw:
+        vals["md_presence_of_children"] = "Children Present"
+
+    cols = list(vals)
+    placeholders = [f"%({c})s::jsonb" if c in JSONB_FIELDS else f"%({c})s" for c in cols]
+    sql = f"INSERT INTO master_customers ({', '.join(cols)}, updated_at) VALUES ({', '.join(placeholders)}, NOW())"
+    if existing:
+        sets = [f"{c} = {UPSERT_UPDATE_RULES[c]}" for c in cols if c in UPSERT_UPDATE_RULES]
+        sql += f" ON CONFLICT (cluster_id) DO UPDATE SET {', '.join(sets)}, updated_at = NOW()"
+    # A brand-new customer is a plain INSERT: if the ID were ever taken, this fails loudly
+    # instead of silently merging two different people.
+    cur.execute(sql + " RETURNING *;", vals)
     cust = cur.fetchone()
 
-    # 4. Recalculate Persona & Bowler Value Score with combined data
-    persona, score = score_and_assign_persona(cust)
-    cur.execute(
-        """
-        UPDATE master_customers
-        SET pg_mosaic_persona = %s,
-            bowler_value_score = CASE
-                WHEN %s = 25 THEN 25
-                ELSE GREATEST(COALESCE(bowler_value_score, 0), %s)
-            END
-        WHERE cluster_id = %s RETURNING *;
-        """,
-        (persona, score, score, cluster_id),
-    )
-    cust = cur.fetchone()
-
-    # 5. Index all primary & Versium alternate identifiers into customer_identities
+    # 3. Index all primary & Versium alternate identifiers
     id_pairs = [("email", email), ("phone", phone), ("sq_id", sq_id), ("md_mik", enriched.get("md_mik"))]
-    for alt_e in enriched.get("alt_emails", []):
-        id_pairs.append(("email", alt_e.strip().lower()))
-    for alt_p in enriched.get("alt_phones", []):
-        id_pairs.append(("phone", alt_p))
-
+    id_pairs += [("email", e) for e in enriched.get("alt_emails") or []]
+    id_pairs += [("phone", p) for p in enriched.get("alt_phones") or []]
     for id_type, id_val in id_pairs:
         if id_val:
             cur.execute(
@@ -645,8 +963,44 @@ def upsert_and_enrich_customer(cur, data: dict) -> tuple[dict, bool]:
                 (cluster_id, id_type, id_val, data.get("source", "Webhook")),
             )
 
+    # 4. Credit any parked Square payments from this Square customer, then rescore
+    cust = claim_pending_square_payments(cur, cust, sq_id)
+    cust = rescore_customer(cur, cust)
     return cust, needs_enrichment
 
+
+def save_enrichment(cur, cluster_id: int, enr: dict, source: str, extra: dict = None):
+    """Used by the cron backfills: writes every enrichment field without overwriting known values."""
+    vals = {c: enr.get(c) for c in ENRICHMENT_FIELDS}
+    vals.update(extra or {})
+    sets = [f"{c} = COALESCE(%({c})s, {c})" for c in vals]
+    alt_e, alt_p = enr.get("alt_emails") or [], enr.get("alt_phones") or []
+    flags = enr.get("lifestyle_flags") or {}
+    if alt_e:
+        sets.append("versium_alt_emails = %(alt_e)s::jsonb")
+    if alt_p:
+        sets.append("versium_alt_phones = %(alt_p)s::jsonb")
+    if flags:
+        sets.append("versium_lifestyle_flags = %(flags)s::jsonb")
+    vals.update({"alt_e": json.dumps(alt_e), "alt_p": json.dumps(alt_p), "flags": json.dumps(flags),
+                 "cid": cluster_id})
+    cur.execute(f"UPDATE master_customers SET {', '.join(sets)}, updated_at = NOW() "
+                f"WHERE cluster_id = %(cid)s RETURNING *;", vals)
+    cust = cur.fetchone()
+    pairs = [("md_mik", enr.get("md_mik"))] + [("email", e) for e in alt_e] + [("phone", p) for p in alt_p]
+    for id_type, id_val in pairs:
+        if id_val:
+            cur.execute(
+                "INSERT INTO customer_identities (cluster_id, id_type, id_value, source_system) "
+                "VALUES (%s, %s, %s, %s) ON CONFLICT DO NOTHING;",
+                (cluster_id, id_type, id_val, source),
+            )
+    return cust
+
+
+# ---------------------------------------------------------------------------
+# Square catalog
+# ---------------------------------------------------------------------------
 
 def run_square_catalog_sync() -> dict:
     """Pulls all Square Catalog Categories, Items, and Price Key Variations into square_catalog_items in Neon."""
@@ -733,7 +1087,7 @@ def run_square_catalog_sync() -> dict:
                     price_dollars, sku, dept, is_deleted
                 ))
 
-        conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+        conn = get_conn()
         try:
             with conn:
                 with conn.cursor() as cur:
@@ -785,122 +1139,177 @@ def run_square_catalog_sync() -> dict:
         return {"status": "exception", "detail": str(e)}
 
 
-@app.post("/webhooks/square")
-async def square_webhook(request: Request, background_tasks: BackgroundTasks):
-    """Handles Square POS payments (payment.updated), new customers (customer.created), and real-time catalog updates (catalog.version.updated)."""
-    body = await request.json()
+# ---------------------------------------------------------------------------
+# Webhook handlers.
+# Each route is `async` only to read the raw body; all blocking work (database, Square,
+# Melissa, Versium, Meta) runs in a worker thread so one slow request never stalls the others.
+# ---------------------------------------------------------------------------
+
+def _identified_sq_customer(cur, sq_id: str) -> bool:
+    cur.execute("SELECT 1 FROM customer_identities WHERE id_type = 'sq_id' AND id_value = %s LIMIT 1;", (sq_id,))
+    return cur.fetchone() is not None
+
+
+def handle_square_payment(cur, payment: dict, background_tasks: BackgroundTasks) -> dict:
+    if payment.get("status") != "COMPLETED":
+        return {"status": "ignored_incomplete_payment"}
+    payment_id = payment.get("id")
+    if not payment_id:
+        return {"status": "ignored_missing_payment_id"}
+
+    # total_money includes tips; refunds are subtracted.
+    total_cents = to_int((payment.get("total_money") or payment.get("amount_money") or {}).get("amount"))
+    refund_cents = to_int((payment.get("refunded_money") or {}).get("amount"))
+    net = round((total_cents - refund_cents) / 100.0, 2)
+    txn_id = f"sq_pay_{payment_id}"
+
+    if not claim_transaction(cur, txn_id, "square", net, payment.get("created_at")):
+        return reprice_transaction(cur, txn_id, net, "square")
+
+    sq_id = (payment.get("customer_id") or "").strip()
+    email = (payment.get("buyer_email_address") or "").strip().lower()
+    card = (payment.get("card_details") or {}).get("card") or {}
+    card_zip = ((card.get("billing_address") or {}).get("postal_code")
+                or (payment.get("billing_address") or {}).get("postal_code") or "")[:5]
+    chip_fn, chip_ln = parse_cardholder_name(card.get("cardholder_name") or "")
+    has_name = bool(chip_fn and chip_ln)
+
+    data = {
+        "sq_id": sq_id, "first_name": chip_fn, "last_name": chip_ln, "email": email,
+        "zip": card_zip, "avs_postal_code": card_zip,
+        "sq_spend_delta": net, "sq_visit_delta": 1, "in_square": 1, "source": "Square_POS",
+    }
+
+    if sq_id and not _identified_sq_customer(cur, sq_id):
+        profile = fetch_square_customer_profile(sq_id)
+        if profile is None and not (email or has_name):
+            # Square is the only way to identify this buyer and it didn't answer: fail so Square retries.
+            raise HTTPException(status_code=503, detail="Square customer lookup unavailable; retry")
+        profile = profile or {}
+        for k in ("first_name", "last_name", "email", "phone", "address", "city", "state", "zip"):
+            if profile.get(k) and not data.get(k):
+                data[k] = profile[k]
+        if not any([data.get("email"), clean_phone(data.get("phone")),
+                    (data.get("first_name") and data.get("last_name"))]):
+            # Blank Square profile: park the payment; it's credited if this Square customer is identified later.
+            cur.execute("UPDATE unified_transactions SET external_customer_id = %s WHERE transaction_id = %s;",
+                        (sq_id, txn_id))
+            return {"status": "parked_unidentified_square_customer", "payment_id": payment_id}
+    elif not sq_id and not (email or has_name):
+        return {"status": "skipped_anonymous_payment", "payment_id": payment_id}
+
+    cust, newly_enriched = upsert_and_enrich_customer(cur, data)
+    cur.execute("UPDATE unified_transactions SET cluster_id = %s WHERE transaction_id = %s;",
+                (cust["cluster_id"], txn_id))
+
+    thresh = get_threshold(cur)
+    if net > 0 and not is_detroit_excluded(cust.get("md_city"), cust.get("zip5")):
+        fire_meta_capi_event(cur, cust, "Purchase", net, thresh, event_id=txn_id, action_source="physical_store")
+        if cust["bowler_value_score"] >= thresh and newly_enriched:
+            background_tasks.add_task(sync_customer_to_meta_custom_audiences, dict(cust))
+    return {"status": "payment_attributed", "cluster_id": cust["cluster_id"], "amount": net}
+
+
+def handle_square_customer(cur, event_type: str, c_obj: dict, background_tasks: BackgroundTasks) -> dict:
+    if event_type == "customer.deleted":
+        return {"status": "ignored_deleted_customer"}
+    fn = (c_obj.get("given_name") or "").strip()
+    ln = (c_obj.get("family_name") or "").strip()
+    em = (c_obj.get("email_address") or "").strip()
+    ph = clean_phone(c_obj.get("phone_number") or "")
+    if not any([em, ph, (len(fn) >= 2 and len(ln) >= 2)]):
+        return {"status": "ignored_blank_customer_profile"}
+
+    addr = c_obj.get("address") or {}
+    cust, _ = upsert_and_enrich_customer(cur, {
+        "sq_id": c_obj.get("id"),
+        "first_name": fn,
+        "last_name": ln,
+        "email": em,
+        "phone": ph,
+        "address": addr.get("address_line_1"),
+        "city": addr.get("locality"),
+        "state": addr.get("administrative_district_level_1"),
+        "zip": addr.get("postal_code"),
+        "in_square": 1,
+        "source": "Square_Customer",
+    })
+    thresh = get_threshold(cur)
+    if not is_detroit_excluded(cust.get("md_city"), cust.get("zip5")) and cust["bowler_value_score"] >= thresh:
+        background_tasks.add_task(sync_customer_to_meta_custom_audiences, dict(cust))
+    return {"status": "customer_synced", "cluster_id": cust["cluster_id"]}
+
+
+def handle_square_event(body: dict, background_tasks: BackgroundTasks) -> dict:
     event_type = body.get("type", "")
-    obj = body.get("data", {}).get("object", {})
+    obj = (body.get("data") or {}).get("object") or {}
 
     if event_type == "catalog.version.updated":
         background_tasks.add_task(run_square_catalog_sync)
         return {"status": "catalog_sync_queued"}
+    if not (event_type.startswith("payment.") or event_type.startswith("customer.")):
+        return {"status": "ignored"}
 
-    conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+    conn = get_conn()
     try:
         with conn:
             with conn.cursor() as cur:
                 if event_type.startswith("payment."):
-                    payment = obj.get("payment", {})
-                    if payment.get("status") != "COMPLETED":
-                        return {"status": "ignored_incomplete_payment"}
-
-                    payment_id = payment.get("id")
-                    amount_dollars = float(payment.get("amount_money", {}).get("amount", 0)) / 100.0
-                    sq_id = payment.get("customer_id") or ""
-                    buyer_email = payment.get("buyer_email_address") or ""
-                    card_obj = (payment.get("card_details") or {}).get("card") or {}
-                    card_zip = (
-                        (card_obj.get("billing_address") or {}).get("postal_code")
-                        or (payment.get("billing_address") or {}).get("postal_code")
-                        or ""
-                    )
-                    chip_fn, chip_ln = parse_cardholder_name(card_obj.get("cardholder_name") or "")
-
-                    cust, newly_enriched = upsert_and_enrich_customer(cur, {
-                        "sq_id": sq_id,
-                        "first_name": chip_fn,
-                        "last_name": chip_ln,
-                        "email": buyer_email,
-                        "zip": card_zip[:5] if card_zip else "",
-                        "sq_spend_delta": amount_dollars,
-                        "in_square": 1,
-                        "source": "Square_POS",
-                    })
-
-                    cur.execute("SELECT current_score_threshold FROM cdp_thermostat_config WHERE id = 1;")
-                    thresh = cur.fetchone()["current_score_threshold"]
-
-                    if not is_detroit_excluded(cust.get("md_city"), cust.get("zip5")):
-                        fire_meta_capi_event(cur, cust, "Purchase", amount_dollars, thresh, event_id_override=f"sq_pay_{payment_id}")
-                        if cust["bowler_value_score"] >= thresh and newly_enriched:
-                            background_tasks.add_task(sync_customer_to_meta_custom_audiences, dict(cust))
-
-                    return {"status": "payment_attributed", "cluster_id": cust["cluster_id"], "amount": amount_dollars}
-
-                elif event_type.startswith("customer."):
-                    c_obj = obj.get("customer", {})
-                    addr = c_obj.get("address", {})
-                    cust, newly_enriched = upsert_and_enrich_customer(cur, {
-                        "sq_id": c_obj.get("id"),
-                        "first_name": c_obj.get("given_name"),
-                        "last_name": c_obj.get("family_name"),
-                        "email": c_obj.get("email_address"),
-                        "phone": c_obj.get("phone_number"),
-                        "address": addr.get("address_line_1"),
-                        "city": addr.get("locality"),
-                        "state": addr.get("administrative_district_level_1"),
-                        "zip": addr.get("postal_code"),
-                        "in_square": 1,
-                        "source": "Square_Customer",
-                    })
-                    cur.execute("SELECT current_score_threshold FROM cdp_thermostat_config WHERE id = 1;")
-                    thresh = cur.fetchone()["current_score_threshold"]
-                    if not is_detroit_excluded(cust.get("md_city"), cust.get("zip5")) and cust["bowler_value_score"] >= thresh:
-                        background_tasks.add_task(sync_customer_to_meta_custom_audiences, dict(cust))
-                    return {"status": "customer_synced", "cluster_id": cust["cluster_id"]}
+                    return handle_square_payment(cur, obj.get("payment") or {}, background_tasks)
+                return handle_square_customer(cur, event_type, obj.get("customer") or {}, background_tasks)
     finally:
         conn.close()
-    return {"status": "ignored"}
 
 
-@app.post("/webhooks/webres")
-async def webres_webhook(request: Request, background_tasks: BackgroundTasks):
-    """Receives online lane reservations (WebRes/BowlNow), records reservation date for same-day POS stitching, enriches contact data, and fires Purchase CAPI."""
-    data = await request.json()
-    amount = float(data.get("total_amount") or data.get("amount") or 0.0)
-    booking_id = data.get("reservation_id") or data.get("id") or str(int(time.time()))
-    res_date = (
-        data.get("reservation_date")
-        or data.get("event_date")
-        or data.get("date")
+@app.post("/webhooks/square")
+async def square_webhook(request: Request, background_tasks: BackgroundTasks):
+    """Square POS payments, customers, and catalog updates. Safe to receive the same event many times."""
+    raw, body = await read_json(request)
+    verify_square_signature(request, raw)
+    return await run_in_threadpool(handle_square_event, body, background_tasks)
+
+
+def handle_webres(data: dict, background_tasks: BackgroundTasks) -> dict:
+    amount = to_float(data.get("total_amount") or data.get("amount"))
+    res_date = date_only(data.get("reservation_date") or data.get("event_date") or data.get("date")) \
         or date.today().isoformat()
-    )
-    if isinstance(res_date, str) and "T" in res_date:
-        res_date = res_date.split("T")[0]
+    booking_id = data.get("reservation_id") or data.get("id")
+    if not booking_id:
+        # No ID in the payload: derive a stable one (hashed, so no contact details leave in event IDs).
+        basis = f"{(data.get('email') or '').strip().lower()}|{clean_phone(data.get('phone'))}|{res_date}|{amount:.2f}"
+        booking_id = "h" + hashlib.sha256(basis.encode()).hexdigest()[:16]
+    txn_id = f"wr_{booking_id}"
+    if not any([data.get("email"), clean_phone(data.get("phone")), data.get("first_name")]):
+        return {"status": "ignored_empty_webres_payload"}
 
-    conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+    conn = get_conn()
     try:
         with conn:
             with conn.cursor() as cur:
+                if not claim_transaction(cur, txn_id, "webres", amount):
+                    return reprice_transaction(cur, txn_id, amount, "webres")
+
                 cust, _ = upsert_and_enrich_customer(cur, {
                     "first_name": data.get("first_name"),
                     "last_name": data.get("last_name"),
                     "email": data.get("email"),
                     "phone": data.get("phone"),
                     "wr_spend_delta": amount,
+                    "wr_booking_delta": 1,
                     "wr_last_reservation_date": res_date,
                     "in_webres": 1,
                     "source": "WebRes",
                 })
-                cur.execute("SELECT current_score_threshold FROM cdp_thermostat_config WHERE id = 1;")
-                thresh = cur.fetchone()["current_score_threshold"]
+                cur.execute("UPDATE unified_transactions SET cluster_id = %s WHERE transaction_id = %s;",
+                            (cust["cluster_id"], txn_id))
+                thresh = get_threshold(cur)
 
                 if not is_detroit_excluded(cust.get("md_city"), cust.get("zip5")):
                     if amount > 0:
-                        fire_meta_capi_event(cur, cust, "Purchase", amount, thresh, event_id_override=f"wr_{booking_id}")
+                        fire_meta_capi_event(cur, cust, "Purchase", amount, thresh, event_id=txn_id)
                     if cust["bowler_value_score"] >= thresh:
-                        fire_meta_capi_event(cur, cust, "Qualified_Bowler", max(amount, 250.0), thresh, event_id_override=f"qb_wr_{booking_id}")
+                        fire_meta_capi_event(cur, cust, "Qualified_Bowler", max(amount, 250.0), thresh,
+                                             event_id=f"qb_wr_{booking_id}")
                         background_tasks.add_task(sync_customer_to_meta_custom_audiences, dict(cust))
 
         return {"status": "webres_synced", "cluster_id": cust["cluster_id"], "score": cust["bowler_value_score"]}
@@ -908,20 +1317,35 @@ async def webres_webhook(request: Request, background_tasks: BackgroundTasks):
         conn.close()
 
 
-@app.post("/webhooks/tripleseat")
-async def tripleseat_webhook(request: Request, background_tasks: BackgroundTasks):
-    """Unwraps native Tripleseat Lead, Event, Booking, and Contact webhooks, enriches via Melissa+Versium, and fires Qualified_Bowler CAPI."""
-    raw = await request.json()
+@app.post("/webhooks/webres")
+async def webres_webhook(request: Request, background_tasks: BackgroundTasks):
+    """Online lane reservations (WebRes/BowlNow). Each booking is counted once."""
+    require_webhook_key(request)
+    _, data = await read_json(request)
+    return await run_in_threadpool(handle_webres, data, background_tasks)
 
-    obj = (
-        raw.get("lead")
-        or raw.get("event")
-        or raw.get("booking")
-        or raw.get("contact")
-        or raw
-    )
-    contact = obj.get("contact") or obj
+
+def _count_record_once(cur, cust: dict, txn_id: str, source_system: str, counter: str) -> dict:
+    """Bumps a booking/event counter only the first time we see this Tripleseat/Partywirks record."""
+    if not claim_transaction(cur, txn_id, source_system):
+        return cust
+    cur.execute("UPDATE unified_transactions SET cluster_id = %s WHERE transaction_id = %s;",
+                (cust["cluster_id"], txn_id))
+    cur.execute(f"UPDATE master_customers SET {counter} = COALESCE({counter}, 0) + 1 "
+                f"WHERE cluster_id = %s RETURNING *;", (cust["cluster_id"],))
+    return cur.fetchone()
+
+
+def handle_tripleseat(raw: dict, background_tasks: BackgroundTasks) -> dict:
+    kind, obj = "record", raw
+    for key in ("lead", "event", "booking", "contact"):
+        if isinstance(raw.get(key), dict):
+            kind, obj = key, raw[key]
+            break
+    contact = obj.get("contact") if isinstance(obj.get("contact"), dict) else obj
     account = obj.get("account") or contact.get("account") or {}
+    if not isinstance(account, dict):
+        account = {}
 
     email = contact.get("email_address") or obj.get("email_address") or obj.get("email") or ""
     if not email and isinstance(contact.get("email_addresses"), list) and contact["email_addresses"]:
@@ -939,39 +1363,17 @@ async def tripleseat_webhook(request: Request, background_tasks: BackgroundTasks
 
     first_name = contact.get("first_name") or obj.get("first_name") or ""
     last_name = contact.get("last_name") or obj.get("last_name") or ""
-    company = (
-        account.get("name")
-        or obj.get("company")
-        or obj.get("account_name")
-        or contact.get("company")
-        or ""
-    )
-    status = (obj.get("status") or obj.get("lead_status") or "PROSPECT").upper()
-    guest_count = int(
-        obj.get("guest_count")
-        or obj.get("guaranteed_guest_count")
-        or obj.get("expected_guest_count")
-        or 0
-    )
-    event_date = (
-        obj.get("event_date")
-        or obj.get("event_start_iso8601")
-        or obj.get("desired_date")
-        or None
-    )
-    if event_date and isinstance(event_date, str) and "T" in event_date:
-        event_date = event_date.split("T")[0]
-
-    turned_down_reason = (
-        obj.get("turned_down_reason")
-        or obj.get("lost_reason")
-        or None
-    )
+    company = account.get("name") or obj.get("company") or obj.get("account_name") or contact.get("company") or ""
+    status = str(obj.get("status") or obj.get("lead_status") or "PROSPECT").upper().replace(" ", "_")
+    guest_count = to_int(obj.get("guest_count") or obj.get("guaranteed_guest_count") or obj.get("expected_guest_count"))
+    event_date = date_only(obj.get("event_date") or obj.get("event_start_iso8601") or obj.get("desired_date"))
+    turned_down_reason = obj.get("turned_down_reason") or obj.get("lost_reason") or None
+    record_id = obj.get("id") or obj.get("lead_id") or obj.get("event_id")
 
     if not any([email, phone, first_name, last_name]):
         return {"status": "ignored_empty_tripleseat_payload"}
 
-    conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+    conn = get_conn()
     try:
         with conn:
             with conn.cursor() as cur:
@@ -992,16 +1394,21 @@ async def tripleseat_webhook(request: Request, background_tasks: BackgroundTasks
                     "in_tripleseat": 1,
                     "source": "Tripleseat",
                 })
-                cur.execute("SELECT current_score_threshold FROM cdp_thermostat_config WHERE id = 1;")
-                thresh = cur.fetchone()["current_score_threshold"]
+                if record_id and kind in ("lead", "event", "booking"):
+                    cust = _count_record_once(cur, cust, f"ts_{kind}_{record_id}", "tripleseat", "ts_events")
 
+                thresh = get_threshold(cur)
                 if (
                     not is_detroit_excluded(cust.get("md_city"), cust.get("zip5"))
                     and cust["bowler_value_score"] >= thresh
                     and status not in ("LOST", "TURNED_DOWN")
                 ):
+                    # One Qualified_Bowler per customer per event date, however many times Tripleseat
+                    # re-sends the lead/event (a lead and the event it turns into share the date).
+                    key = event_date or (f"{kind}_{record_id}" if record_id else "undated")
                     synthetic_val = 1000.0 if (cust.get("pg_mosaic_persona") or "").startswith("PG-1") else 450.0
-                    fire_meta_capi_event(cur, cust, "Qualified_Bowler", synthetic_val, thresh)
+                    fire_meta_capi_event(cur, cust, "Qualified_Bowler", synthetic_val, thresh,
+                                         event_id=f"qb_ts_{cust['cluster_id']}_{key}")
                     background_tasks.add_task(sync_customer_to_meta_custom_audiences, dict(cust))
 
         return {
@@ -1014,25 +1421,24 @@ async def tripleseat_webhook(request: Request, background_tasks: BackgroundTasks
         conn.close()
 
 
-@app.post("/webhooks/partywirks")
-async def partywirks_webhook(request: Request, background_tasks: BackgroundTasks):
-    """Receives live Partywirks birthday bookings, stitches to Square without double-counting spend, enriches via Melissa, and fires Qualified_Bowler CAPI."""
-    raw = await request.json()
-    obj = raw.get("reservation") or raw.get("order") or raw.get("data") or raw
-    cust_obj = obj.get("customer") or raw.get("customer") or {}
+@app.post("/webhooks/tripleseat")
+async def tripleseat_webhook(request: Request, background_tasks: BackgroundTasks):
+    """Tripleseat Lead, Event, Booking, and Contact webhooks."""
+    require_webhook_key(request)
+    _, raw = await read_json(request)
+    return await run_in_threadpool(handle_tripleseat, raw, background_tasks)
 
-    email = (
-        cust_obj.get("email")
-        or obj.get("email")
-        or obj.get("customer_email")
-        or ""
-    ).strip().lower()
-    phone = clean_phone(
-        cust_obj.get("phone")
-        or obj.get("phone")
-        or obj.get("customer_phone")
-        or ""
-    )
+
+def handle_partywirks(raw: dict, background_tasks: BackgroundTasks) -> dict:
+    obj = raw.get("reservation") or raw.get("order") or raw.get("data") or raw
+    if not isinstance(obj, dict):
+        obj = raw
+    cust_obj = obj.get("customer") if isinstance(obj.get("customer"), dict) else (raw.get("customer") or {})
+    if not isinstance(cust_obj, dict):
+        cust_obj = {}
+
+    email = (cust_obj.get("email") or obj.get("email") or obj.get("customer_email") or "").strip().lower()
+    phone = clean_phone(cust_obj.get("phone") or obj.get("phone") or obj.get("customer_phone") or "")
     first_name = cust_obj.get("first_name") or obj.get("first_name") or ""
     last_name = cust_obj.get("last_name") or obj.get("last_name") or ""
     full_name = cust_obj.get("name") or obj.get("customer_name") or obj.get("customer") or ""
@@ -1042,17 +1448,20 @@ async def partywirks_webhook(request: Request, background_tasks: BackgroundTasks
         last_name = parts[1] if len(parts) > 1 else ""
 
     package = obj.get("package_name") or obj.get("package") or obj.get("reservation") or "BIRTHDAY PARTY"
-    party_date = obj.get("event_date") or obj.get("party_date") or obj.get("date") or None
-    if isinstance(package, str) and "-" in package and not party_date:
+    if not isinstance(package, str):
+        package = "BIRTHDAY PARTY"
+    party_date = date_only(obj.get("event_date") or obj.get("party_date") or obj.get("date"))
+    if "-" in package and not party_date:
         m = re.match(r"^(.*?)\s*-\s*(\d{4}-\d{2}-\d{2})", package)
         if m:
             package = m.group(1).strip()
             party_date = m.group(2).strip()
+    record_id = obj.get("id") or obj.get("reservation_id") or obj.get("order_id")
 
     if not any([email, phone, first_name]):
         return {"status": "ignored_empty_partywirks_payload"}
 
-    conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+    conn = get_conn()
     try:
         with conn:
             with conn.cursor() as cur:
@@ -1066,15 +1475,16 @@ async def partywirks_webhook(request: Request, background_tasks: BackgroundTasks
                     "state": cust_obj.get("state") or obj.get("state"),
                     "zip": cust_obj.get("zip") or obj.get("zip"),
                     "in_partywirks": 1,
-                    "pw_last_package": str(package)[:100],
+                    "pw_last_package": package[:100],
                     "pw_last_party_date": party_date,
                     "source": "Partywirks",
                 })
-                cur.execute("SELECT current_score_threshold FROM cdp_thermostat_config WHERE id = 1;")
-                thresh = cur.fetchone()["current_score_threshold"]
+                party_key = record_id or f"c{cust['cluster_id']}_{party_date or 'undated'}"
+                cust = _count_record_once(cur, cust, f"pw_{party_key}", "partywirks", "pw_bookings")
 
+                thresh = get_threshold(cur)
                 if not is_detroit_excluded(cust.get("md_city"), cust.get("zip5")) and cust["bowler_value_score"] >= thresh:
-                    fire_meta_capi_event(cur, cust, "Qualified_Bowler", 450.0, thresh)
+                    fire_meta_capi_event(cur, cust, "Qualified_Bowler", 450.0, thresh, event_id=f"qb_pw_{party_key}")
                     background_tasks.add_task(sync_customer_to_meta_custom_audiences, dict(cust))
 
         return {
@@ -1087,13 +1497,26 @@ async def partywirks_webhook(request: Request, background_tasks: BackgroundTasks
         conn.close()
 
 
+@app.post("/webhooks/partywirks")
+async def partywirks_webhook(request: Request, background_tasks: BackgroundTasks):
+    """Partywirks birthday bookings."""
+    require_webhook_key(request)
+    _, raw = await read_json(request)
+    return await run_in_threadpool(handle_partywirks, raw, background_tasks)
+
+
+# ---------------------------------------------------------------------------
+# Cron endpoints (plain `def`, so FastAPI runs them in a worker thread)
+# ---------------------------------------------------------------------------
+
 @app.post("/cron/enrich-partywirks")
-async def enrich_partywirks_customers():
-    """Runs all un-enriched Partywirks parents through Melissa Personator, updates addresses/incomes, and recalculates persona & score."""
+def enrich_partywirks_customers(request: Request):
+    """Runs un-enriched Partywirks parents through Melissa (+Versium) and recalculates persona & score."""
+    require_cron_key(request)
     if not MELISSA_API_KEY:
         return {"status": "error", "message": "Missing MELISSA_API_KEY"}
 
-    conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+    conn = get_conn()
     try:
         with conn:
             with conn.cursor() as cur:
@@ -1106,110 +1529,56 @@ async def enrich_partywirks_customers():
                 )
                 rows = cur.fetchall()
 
-        enriched_count = 0
-        address_matched = 0
-        pg2_count = 0
-
+        processed = address_matched = pg2_count = lookup_failures = 0
         for r in rows:
             enr = run_melissa_and_versium_waterfall(
-                r.get("first_name") or "",
-                r.get("last_name") or "",
-                r.get("email") or "",
-                r.get("phone") or "",
+                r.get("first_name") or "", r.get("last_name") or "",
+                r.get("email") or "", r.get("phone") or "",
             )
-            enriched_count += 1
+            if enr.get("md_results") is None:
+                lookup_failures += 1  # Melissa didn't answer; leave it for the next run
+                continue
+            processed += 1
             if enr.get("md_address1"):
                 address_matched += 1
-
-            combined = dict(r)
-            for k, v in enr.items():
-                if v is not None and k not in ("alt_emails", "alt_phones", "lifestyle_flags"):
-                    combined[k] = v
-            combined["md_presence_of_children"] = "Children Present"
-            persona, score = score_and_assign_persona(combined)
-            if persona.startswith("PG-2"):
-                pg2_count += 1
-
             with conn:
                 with conn.cursor() as cur:
-                    cur.execute(
-                        """
-                        UPDATE master_customers
-                        SET md_address1 = COALESCE(%s, md_address1),
-                            md_city = COALESCE(%s, md_city),
-                            md_state = COALESCE(%s, md_state),
-                            zip5 = COALESCE(%s, zip5),
-                            md_plus4 = COALESCE(%s, md_plus4),
-                            md_carrier_route = COALESCE(%s, md_carrier_route),
-                            md_latitude = COALESCE(%s, md_latitude),
-                            md_longitude = COALESCE(%s, md_longitude),
-                            distance_miles = COALESCE(%s, distance_miles),
-                            md_household_income = COALESCE(%s, md_household_income),
-                            md_presence_of_children = 'Children Present',
-                            md_children_age_range = COALESCE(%s, md_children_age_range),
-                            md_own_rent = COALESCE(%s, md_own_rent),
-                            md_marital_status = COALESCE(%s, md_marital_status),
-                            md_household_size = COALESCE(%s, md_household_size),
-                            md_length_of_residence = COALESCE(%s, md_length_of_residence),
-                            md_education = COALESCE(%s, md_education),
-                            md_occupation = COALESCE(%s, md_occupation),
-                            md_date_of_birth = COALESCE(%s, md_date_of_birth),
-                            md_gender = COALESCE(%s, md_gender),
-                            md_delivery_indicator = COALESCE(%s, md_delivery_indicator),
-                            md_mik = COALESCE(%s, md_mik),
-                            md_mak = COALESCE(%s, md_mak),
-                            md_results = COALESCE(%s, 'ENRICHED_ATTEMPT'),
-                            pg_mosaic_persona = %s,
-                            bowler_value_score = %s,
-                            updated_at = NOW()
-                        WHERE cluster_id = %s;
-                        """,
-                        (
-                            enr.get("md_address1"), enr.get("md_city"), enr.get("md_state"), enr.get("zip5"),
-                            enr.get("md_plus4"), enr.get("md_carrier_route"), enr.get("md_latitude"), enr.get("md_longitude"),
-                            enr.get("distance_miles"), enr.get("md_household_income"), enr.get("md_children_age_range"),
-                            enr.get("md_own_rent"), enr.get("md_marital_status"), enr.get("md_household_size"),
-                            enr.get("md_length_of_residence"), enr.get("md_education"), enr.get("md_occupation"),
-                            enr.get("md_date_of_birth"), enr.get("md_gender"), enr.get("md_delivery_indicator"),
-                            enr.get("md_mik"), enr.get("md_mak"), enr.get("md_results"),
-                            persona, score, r["cluster_id"],
-                        ),
-                    )
-                    if enr.get("md_mik"):
-                        cur.execute(
-                            """
-                            INSERT INTO customer_identities (cluster_id, id_type, id_value, source_system)
-                            VALUES (%s, 'md_mik', %s, 'Partywirks') ON CONFLICT DO NOTHING;
-                            """,
-                            (r["cluster_id"], enr["md_mik"]),
-                        )
+                    cust = save_enrichment(cur, r["cluster_id"], enr, "Partywirks",
+                                           extra={"md_presence_of_children": "Children Present"})
+                    cust = rescore_customer(cur, cust, exact=True)
+                    if (cust.get("pg_mosaic_persona") or "").startswith("PG-2"):
+                        pg2_count += 1
 
         return {
             "status": "partywirks_melissa_enriched",
-            "records_processed": enriched_count,
+            "records_processed": processed,
             "street_addresses_found": address_matched,
             "upgraded_to_pg2_affluent_families": pg2_count,
+            "lookup_failures_retry_later": lookup_failures,
         }
     finally:
         conn.close()
 
 
 @app.post("/cron/recover-square-avs-zips")
-async def recover_square_avs_zips(limit: int = 150, scan_payment_pages: int = 15):
-    """Scans Square Payments API & Customer Cards API for hidden AVS Billing ZIPs on email-less Instant Profiles, then enriches via Melissa."""
+def recover_square_avs_zips(request: Request, limit: int = 150, scan_payment_pages: int = 15):
+    """Finds card billing ZIPs for email-less Square profiles, then enriches via Melissa."""
+    require_cron_key(request)
     if not SQUARE_ACCESS_TOKEN:
         return {"status": "error", "message": "Missing SQUARE_ACCESS_TOKEN"}
+    limit = max(1, min(limit, 500))
+    scan_payment_pages = max(1, min(scan_payment_pages, 50))
 
     headers = {"Authorization": f"Bearer {SQUARE_ACCESS_TOKEN}", "Accept": "application/json"}
     customer_zip_map = {}
-
     cursor = None
     for _ in range(scan_payment_pages):
         try:
             params = {"limit": 100}
             if cursor:
                 params["cursor"] = cursor
-            p_resp = requests.get("https://connect.squareup.com/v2/payments", headers=headers, params=params, timeout=10).json()
+            p_resp = requests.get("https://connect.squareup.com/v2/payments", headers=headers,
+                                  params=params, timeout=10).json()
             for pay in (p_resp.get("payments") or []):
                 cid = pay.get("customer_id")
                 if not cid:
@@ -1220,14 +1589,14 @@ async def recover_square_avs_zips(limit: int = 150, scan_payment_pages: int = 15
                     or ""
                 ).strip()[:5]
                 if len(p_zip) == 5 and p_zip.isdigit():
-                    customer_zip_map[cid] = p_zip
+                    customer_zip_map.setdefault(cid, p_zip)  # payments are newest first: keep the newest
             cursor = p_resp.get("cursor")
             if not cursor:
                 break
         except Exception:
             break
 
-    conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+    conn = get_conn()
     try:
         with conn:
             with conn.cursor() as cur:
@@ -1236,7 +1605,7 @@ async def recover_square_avs_zips(limit: int = 150, scan_payment_pages: int = 15
                     SELECT * FROM master_customers
                     WHERE md_address1 IS NULL
                       AND md_results IS NULL
-                      AND sq_id IS NOT NULL
+                      AND sq_id IS NOT NULL AND sq_id <> ''
                     ORDER BY CASE WHEN phone IS NOT NULL AND phone != '' THEN 0 ELSE 1 END,
                              true_lifetime_spend DESC
                     LIMIT %s;
@@ -1245,81 +1614,50 @@ async def recover_square_avs_zips(limit: int = 150, scan_payment_pages: int = 15
                 )
                 rows = cur.fetchall()
 
-        checked = 0
-        zips_found = 0
-        addresses_unlocked = 0
-
+        checked = zips_found = addresses_unlocked = lookup_failures = 0
         for r in rows:
             checked += 1
             sq_id = r["sq_id"]
             phone = clean_phone(r.get("phone") or "")
             avs_zip = customer_zip_map.get(sq_id, "")
 
-            if not avs_zip:
+            if not avs_zip or not phone:
                 prof = fetch_square_customer_profile(sq_id)
-                avs_zip = prof.get("zip") or ""
-                if not phone and prof.get("phone"):
-                    phone = clean_phone(prof["phone"])
+                if prof is None and not (avs_zip or phone):
+                    lookup_failures += 1  # Square didn't answer; try this one next run
+                    continue
+                prof = prof or {}
+                avs_zip = avs_zip or prof.get("zip") or ""
+                phone = phone or clean_phone(prof.get("phone"))
 
             if avs_zip:
                 zips_found += 1
 
-            if phone or avs_zip:
-                enr = run_melissa_and_versium_waterfall(
-                    r.get("first_name") or "",
-                    r.get("last_name") or "",
-                    r.get("email") or "",
-                    phone,
-                    zip_code=avs_zip,
-                )
-                if enr.get("md_address1"):
-                    addresses_unlocked += 1
-
-                combined = dict(r)
-                for k, v in enr.items():
-                    if v is not None and k not in ("alt_emails", "alt_phones", "lifestyle_flags"):
-                        combined[k] = v
-                persona, score = score_and_assign_persona(combined)
-
-                with conn:
-                    with conn.cursor() as cur:
-                        cur.execute(
-                            """
-                            UPDATE master_customers
-                            SET phone = COALESCE(NULLIF(%s, ''), phone),
-                                avs_postal_code = COALESCE(NULLIF(%s, ''), avs_postal_code),
-                                md_address1 = COALESCE(%s, md_address1),
-                                md_city = COALESCE(%s, md_city),
-                                md_state = COALESCE(%s, md_state),
-                                zip5 = COALESCE(%s, zip5),
-                                distance_miles = COALESCE(%s, distance_miles),
-                                md_household_income = COALESCE(%s, md_household_income),
-                                md_presence_of_children = COALESCE(%s, md_presence_of_children),
-                                md_own_rent = COALESCE(%s, md_own_rent),
-                                md_mik = COALESCE(%s, md_mik),
-                                md_mak = COALESCE(%s, md_mak),
-                                md_results = COALESCE(%s, 'AVS_CHECKED'),
-                                pg_mosaic_persona = %s,
-                                bowler_value_score = %s,
-                                updated_at = NOW()
-                            WHERE cluster_id = %s;
-                            """,
-                            (
-                                phone, avs_zip,
-                                enr.get("md_address1"), enr.get("md_city"), enr.get("md_state"), enr.get("zip5"),
-                                enr.get("distance_miles"), enr.get("md_household_income"),
-                                enr.get("md_presence_of_children"), enr.get("md_own_rent"),
-                                enr.get("md_mik"), enr.get("md_mak"), enr.get("md_results"),
-                                persona, score, r["cluster_id"],
-                            ),
-                        )
-            else:
-                with conn:
-                    with conn.cursor() as cur:
-                        cur.execute(
-                            "UPDATE master_customers SET md_results = 'NO_AVS_ZIP_ON_CARD' WHERE cluster_id = %s;",
-                            (r["cluster_id"],),
-                        )
+            with conn:
+                with conn.cursor() as cur:
+                    if not (phone or avs_zip):
+                        cur.execute("UPDATE master_customers SET md_results = 'NO_AVS_ZIP_ON_CARD' "
+                                    "WHERE cluster_id = %s;", (r["cluster_id"],))
+                        continue
+                    enr = run_melissa_and_versium_waterfall(
+                        r.get("first_name") or "", r.get("last_name") or "",
+                        r.get("email") or "", phone, zip_code=avs_zip,
+                    )
+                    if enr.get("md_results") is None and MELISSA_API_KEY and (
+                            phone or (r.get("first_name") and r.get("last_name"))):
+                        lookup_failures += 1  # Melissa didn't answer; try again next run
+                        continue
+                    if enr.get("md_address1"):
+                        addresses_unlocked += 1
+                    if enr.get("md_results") is None:
+                        enr["md_results"] = "AVS_CHECKED"
+                    cust = save_enrichment(cur, r["cluster_id"], enr, "Square",
+                                           extra={"phone": phone or None, "avs_postal_code": avs_zip or None})
+                    if phone:
+                        cur.execute("INSERT INTO customer_identities (cluster_id, id_type, id_value, source_system) "
+                                    "VALUES (%s, 'phone', %s, 'Square') ON CONFLICT DO NOTHING;",
+                                    (r["cluster_id"], phone))
+                    rescore_customer(cur, cust, exact=True)
 
         return {
             "status": "square_avs_recovery_complete",
@@ -1327,14 +1665,16 @@ async def recover_square_avs_zips(limit: int = 150, scan_payment_pages: int = 15
             "payment_zips_cached": len(customer_zip_map),
             "avs_zips_found_for_batch": zips_found,
             "street_addresses_unlocked_via_melissa": addresses_unlocked,
+            "lookup_failures_retry_later": lookup_failures,
         }
     finally:
         conn.close()
 
 
 @app.post("/cron/adjust-thermostat")
-async def adjust_thermostat():
-    conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+def adjust_thermostat(request: Request):
+    require_cron_key(request)
+    conn = get_conn()
     try:
         with conn:
             with conn.cursor() as cur:
@@ -1346,6 +1686,40 @@ async def adjust_thermostat():
 
 
 @app.post("/cron/sync-square-catalog")
-async def sync_square_catalog():
+def sync_square_catalog(request: Request):
     """Manual or scheduled trigger to sync Square Catalog into Neon."""
+    require_cron_key(request)
     return run_square_catalog_sync()
+
+
+@app.get("/health")
+def health():
+    """Liveness check. Also shows which authentication checks are switched on (no data exposed)."""
+    return {
+        "status": "ok",
+        "square_signature_check": bool(SQUARE_WEBHOOK_SIGNATURE_KEY),
+        "webhook_key_check": bool(WEBHOOK_SECRET),
+        "cron_key_check": bool(CRON_SECRET),
+    }
+
+
+def sync_cluster_sequence():
+    """Keeps the customer-number sequence ahead of every existing customer number."""
+    if not DATABASE_URL:
+        return
+    try:
+        conn = get_conn()
+        try:
+            with conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT setval('master_cluster_id_seq', GREATEST(
+                            (SELECT COALESCE(MAX(cluster_id), 24220) FROM master_customers),
+                            (SELECT last_value FROM master_cluster_id_seq)));
+                        """
+                    )
+        finally:
+            conn.close()
+    except Exception as e:
+        log.error("Could not sync master_cluster_id_seq (has the migration been run?): %s", e)

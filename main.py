@@ -652,23 +652,55 @@ def fire_meta_capi_event(cur, cust: dict, event_name: str, value: float, thresho
     )
 
 
+def _action_source_for(event_id: str) -> str:
+    return "physical_store" if event_id.startswith("sq_pay_") else "system_generated"
+
+
+def retry_unsent_event(cur, event_id: str) -> bool:
+    """Re-sends a logged event Meta didn't accept. Safe to call for any ID: does nothing otherwise."""
+    cur.execute("SELECT * FROM capi_events_log WHERE event_id = %s AND NOT sent_to_meta FOR UPDATE SKIP LOCKED;",
+                (event_id,))
+    row = cur.fetchone()
+    if not row or not row["cluster_id"]:
+        return False
+    cur.execute("SELECT * FROM master_customers WHERE cluster_id = %s;", (row["cluster_id"],))
+    cust = cur.fetchone()
+    if not cust:
+        return False
+    fire_meta_capi_event(cur, cust, row["event_name"], float(row["event_value"] or 0),
+                         int(row["threshold_at_send"] or 0), event_id=event_id,
+                         action_source=_action_source_for(event_id))
+    return True
+
+
+def retry_unsent_events(cur, max_age_days: int = 6) -> dict:
+    """Re-sends every event Meta hasn't accepted yet. Meta only takes events up to 7 days old."""
+    cur.execute("SELECT event_id FROM capi_events_log WHERE NOT sent_to_meta "
+                "AND sent_at > NOW() - make_interval(days => %s) ORDER BY sent_at;", (max_age_days,))
+    ids = [r["event_id"] for r in cur.fetchall()]
+    tried = sum(1 for eid in ids if retry_unsent_event(cur, eid))
+    cur.execute("SELECT COUNT(*) AS n FROM capi_events_log WHERE event_id = ANY(%s) AND NOT sent_to_meta;", (ids,))
+    return {"retried": tried, "still_unsent": cur.fetchone()["n"]}
+
+
 # ---------------------------------------------------------------------------
 # Transactions ledger (unified_transactions): one row per external payment / booking / record.
 # This is what makes every webhook safe to receive more than once.
 # ---------------------------------------------------------------------------
 
 def claim_transaction(cur, transaction_id: str, source_system: str, amount: float = 0.0,
-                      transaction_date=None) -> bool:
+                      transaction_date=None, source_updated_at=None) -> bool:
     """Returns True the first time a transaction is seen. A concurrent duplicate blocks on the
     uncommitted row until the first request finishes, then gets False."""
     cur.execute(
         """
-        INSERT INTO unified_transactions (transaction_id, source_system, total_amount, transaction_date)
-        VALUES (%s, %s, %s, COALESCE(%s::timestamptz, NOW()))
+        INSERT INTO unified_transactions (transaction_id, source_system, total_amount, transaction_date,
+                                          source_updated_at)
+        VALUES (%s, %s, %s, COALESCE(%s::timestamptz, NOW()), %s::timestamptz)
         ON CONFLICT (transaction_id) DO NOTHING
         RETURNING transaction_id;
         """,
-        (transaction_id, source_system, round(amount, 2), transaction_date),
+        (transaction_id, source_system, round(amount, 2), transaction_date, source_updated_at),
     )
     return cur.fetchone() is not None
 
@@ -693,14 +725,26 @@ def adjust_spend(cur, cluster_id: int, sq_diff: float = 0.0, wr_diff: float = 0.
     return cur.fetchone()
 
 
-def reprice_transaction(cur, transaction_id: str, new_amount: float, kind: str) -> dict:
-    """A repeat notice for a known transaction: only apply a change in amount (e.g. a refund)."""
+def reprice_transaction(cur, transaction_id: str, new_amount: float, kind: str, source_updated_at=None) -> dict:
+    """A repeat notice for a known transaction: only apply a change in amount (e.g. a refund).
+    A notice older than the one already applied (Square can deliver out of order) is ignored."""
     cur.execute(
-        "SELECT cluster_id, total_amount FROM unified_transactions WHERE transaction_id = %s FOR UPDATE;",
-        (transaction_id,),
+        """
+        SELECT cluster_id, total_amount,
+               (%s::timestamptz IS NOT NULL AND source_updated_at IS NOT NULL
+                AND %s::timestamptz < source_updated_at) AS is_stale
+        FROM unified_transactions WHERE transaction_id = %s FOR UPDATE;
+        """,
+        (source_updated_at, source_updated_at, transaction_id),
     )
     row = cur.fetchone()
+    if row["is_stale"]:
+        return {"status": "ignored_stale_notice", "transaction_id": transaction_id}
     diff = round(new_amount - float(row["total_amount"] or 0), 2)
+    if source_updated_at:
+        cur.execute("UPDATE unified_transactions SET source_updated_at = GREATEST(COALESCE(source_updated_at, "
+                    "%s::timestamptz), %s::timestamptz) WHERE transaction_id = %s;",
+                    (source_updated_at, source_updated_at, transaction_id))
     if diff == 0:
         return {"status": "ignored_duplicate", "transaction_id": transaction_id}
     cur.execute("UPDATE unified_transactions SET total_amount = %s WHERE transaction_id = %s;",
@@ -769,6 +813,8 @@ def _jsonb(c, empty):
 
 
 _SQ_NEW = f"GREATEST(0, COALESCE({_MC}.sq_spend, 0) + EXCLUDED.sq_spend)"
+_PW_NEWER = (f"(EXCLUDED.pw_last_party_date IS NOT NULL AND ({_MC}.pw_last_party_date IS NULL "
+             f"OR EXCLUDED.pw_last_party_date >= {_MC}.pw_last_party_date))")
 _WR_NEW = f"GREATEST(0, COALESCE({_MC}.wr_spend, 0) + EXCLUDED.wr_spend)"
 
 UPSERT_UPDATE_RULES = {
@@ -793,9 +839,12 @@ UPSERT_UPDATE_RULES = {
     "ts_events": _add("ts_events"),
     "pw_bookings": _add("pw_bookings"),
     "ts_account": _keep("ts_account"),
-    "pw_last_package": _keep("pw_last_package"),
-    "pw_last_party_date": _keep("pw_last_party_date"),
-    "wr_last_reservation_date": _keep("wr_last_reservation_date"),
+    # Last-booking fields only move forward: recording an older booking never replaces a newer one.
+    "pw_last_party_date": f"CASE WHEN {_PW_NEWER} THEN EXCLUDED.pw_last_party_date ELSE {_MC}.pw_last_party_date END",
+    "pw_last_package": (f"CASE WHEN EXCLUDED.pw_last_package IS NOT NULL AND ({_PW_NEWER} OR "
+                        f"(EXCLUDED.pw_last_party_date IS NULL AND {_MC}.pw_last_party_date IS NULL)) "
+                        f"THEN EXCLUDED.pw_last_package ELSE {_MC}.pw_last_package END"),
+    "wr_last_reservation_date": f"GREATEST({_MC}.wr_last_reservation_date, EXCLUDED.wr_last_reservation_date)",
     "sq_first_visit_date": f"COALESCE({_MC}.sq_first_visit_date, EXCLUDED.sq_first_visit_date)",
     "sq_last_visit_date": _keep("sq_last_visit_date"),
     **{c: _keep(c) for c in ENRICHMENT_FIELDS},
@@ -894,6 +943,11 @@ def upsert_and_enrich_customer(cur, data: dict) -> tuple:
     first_name = (data.get("first_name") or "").strip()
     last_name = (data.get("last_name") or "").strip()
 
+    # Two webhooks for the same brand-new person (e.g. Square's customer.created and payment) can arrive
+    # together. Lock each identifier for this transaction, in a fixed order so two requests can't deadlock;
+    # the second waits, then finds the customer the first one created.
+    for key in sorted({f"{t}:{v}" for t, v in (("sq_id", sq_id), ("email", email), ("phone", phone)) if v}):
+        cur.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0));", (key,))
     existing = _find_existing(cur, sq_id, email, phone, first_name, last_name)
 
     # 2. Progressive enrichment
@@ -1204,8 +1258,10 @@ def handle_square_payment(cur, payment: dict, background_tasks: BackgroundTasks)
     net = round((total_cents - refund_cents) / 100.0, 2)
     txn_id = f"sq_pay_{payment_id}"
 
-    if not claim_transaction(cur, txn_id, "square", net, payment.get("created_at")):
-        return reprice_transaction(cur, txn_id, net, "square")
+    if not claim_transaction(cur, txn_id, "square", net, payment.get("created_at"), payment.get("updated_at")):
+        result = reprice_transaction(cur, txn_id, net, "square", payment.get("updated_at"))
+        retry_unsent_event(cur, txn_id)
+        return result
 
     sq_id = (payment.get("customer_id") or "").strip()
     email = (payment.get("buyer_email_address") or "").strip().lower()
@@ -1317,7 +1373,8 @@ def handle_webres(data: dict, background_tasks: BackgroundTasks) -> dict:
     booking_id = data.get("reservation_id") or data.get("id")
     if not booking_id:
         # No ID in the payload: derive a stable one (hashed, so no contact details leave in event IDs).
-        basis = f"{(data.get('email') or '').strip().lower()}|{clean_phone(data.get('phone'))}|{res_date}|{amount:.2f}"
+        name = f"{data.get('first_name') or ''} {data.get('last_name') or ''}".strip().lower()
+        basis = f"{(data.get('email') or '').strip().lower()}|{clean_phone(data.get('phone'))}|{name}|{res_date}|{amount:.2f}"
         booking_id = "h" + hashlib.sha256(basis.encode()).hexdigest()[:16]
     txn_id = f"wr_{booking_id}"
     if not any([data.get("email"), clean_phone(data.get("phone")), data.get("first_name")]):
@@ -1328,7 +1385,10 @@ def handle_webres(data: dict, background_tasks: BackgroundTasks) -> dict:
         with conn:
             with conn.cursor() as cur:
                 if not claim_transaction(cur, txn_id, "webres", amount):
-                    return reprice_transaction(cur, txn_id, amount, "webres")
+                    result = reprice_transaction(cur, txn_id, amount, "webres")
+                    retry_unsent_event(cur, txn_id)
+                    retry_unsent_event(cur, f"qb_wr_{booking_id}")
+                    return result
 
                 cust, _ = upsert_and_enrich_customer(cur, {
                     "first_name": data.get("first_name"),
@@ -1557,11 +1617,14 @@ def fetch_partywirks_record(order_id: str):
     res = body.get("data") or {}
     if not res:
         return {}
-    customer = None
+    customer, complete = None, True
     if res.get("customer_id"):
         cbody = partywirks_api(f"/customers/{res['customer_id']}")
         customer = (cbody or {}).get("data") if cbody else None
-    return partywirks_record(res, customer)
+        complete = cbody is not None  # None = API trouble (a 404 just means no extra details)
+    rec = partywirks_record(res, customer)
+    rec["customer_complete"] = complete
+    return rec
 
 
 def ingest_partywirks(cur, rec: dict, background_tasks: BackgroundTasks = None, count_booking: bool = True) -> dict:
@@ -1592,11 +1655,15 @@ def ingest_partywirks(cur, rec: dict, background_tasks: BackgroundTasks = None, 
     cust, is_new = _count_record_once(cur, cust, f"pw_{key}", "partywirks", "pw_bookings", bump=count_booking)
 
     thresh = get_threshold(cur)
-    if (is_new and count_booking and not is_detroit_excluded(cust.get("md_city"), cust.get("zip5"))
+    if not is_new:
+        retry_unsent_event(cur, f"qb_pw_{key}")  # a Meta failure last time gets another try
+    elif (count_booking and not is_detroit_excluded(cust.get("md_city"), cust.get("zip5"))
             and cust["bowler_value_score"] >= thresh):
         fire_meta_capi_event(cur, cust, "Qualified_Bowler", 450.0, thresh, event_id=f"qb_pw_{key}")
         if background_tasks is not None:
             background_tasks.add_task(sync_customer_to_meta_custom_audiences, dict(cust))
+        else:
+            sync_customer_to_meta_custom_audiences(dict(cust))  # catch-up/backfill: no request to defer to
     return {
         "status": "partywirks_synced" if is_new else "partywirks_already_recorded",
         "cluster_id": cust["cluster_id"],
@@ -1674,8 +1741,8 @@ def run_partywirks_sync(days_back: int = 3, count_bookings_created_since: str = 
                 continue
             rec = fetch_partywirks_record(oid)
             time.sleep(pause_seconds)  # two API calls per reservation; stay under 60/min
-            if not rec:
-                stats["api_lookup_failed"] += 1
+            if not rec or not rec.get("customer_complete", True):
+                stats["api_lookup_failed_retry_next_run"] += 1  # not recorded, so the next run tries again
                 continue
             with conn:
                 with conn.cursor() as cur:
@@ -1862,9 +1929,11 @@ def adjust_thermostat(request: Request):
     try:
         with conn:
             with conn.cursor() as cur:
+                # First re-send anything Meta didn't accept, so the thermostat counts it.
+                retried = retry_unsent_events(cur)
                 cur.execute("SELECT adjust_meta_capi_thermostat() AS new_threshold;")
                 res = cur.fetchone()
-        return {"status": "adjusted", "new_threshold": res["new_threshold"]}
+        return {"status": "adjusted", "new_threshold": res["new_threshold"], "meta_retry": retried}
     finally:
         conn.close()
 

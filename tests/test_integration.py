@@ -301,6 +301,107 @@ def test_partywirks_sync_dry_run_writes_nothing(db, fake, uid):
     assert db.fetchone() is None
 
 
+# --- Review fixes ---------------------------------------------------------------------------
+
+def test_simultaneous_webhooks_for_new_customer_make_one_record(db, fake, uid):
+    email = f"newrace-{uid}@example.test"
+    bodies = [payment(f"NR{i}{uid}", 1000, email=email) for i in range(5)]
+    results = []
+
+    def go(b):
+        results.append(main.handle_square_event(json.loads(json.dumps(b)), BackgroundTasks()))
+
+    threads = [threading.Thread(target=go, args=(b,)) for b in bodies]
+    [t.start() for t in threads]
+    [t.join() for t in threads]
+    assert len({r["cluster_id"] for r in results}) == 1, results
+    c = customer_row(db, results[0]["cluster_id"])
+    assert float(c["sq_spend"]) == 50.0 and c["sq_visits"] == 5
+
+
+def test_stale_square_notice_does_not_undo_refund(client, db, fake, uid):
+    email = f"stale-{uid}@example.test"
+    first = payment(f"S{uid}", 8000, email=email)
+    first["data"]["object"]["payment"]["updated_at"] = "2026-11-17T10:00:00Z"
+    refund = payment(f"S{uid}", 8000, refund=3000, email=email)
+    refund["data"]["object"]["payment"]["updated_at"] = "2026-11-17T11:00:00Z"
+    r = square_post(client, first).json()
+    square_post(client, refund)
+    assert square_post(client, first).json()["status"] == "ignored_stale_notice"  # old snapshot arrives late
+    assert float(customer_row(db, r["cluster_id"])["sq_spend"]) == 50.0
+
+
+def test_failed_meta_event_is_resent_on_redelivery(client, db, fake, uid):
+    email = f"resend-{uid}@example.test"
+    fake.meta_mode = "500"
+    r = square_post(client, payment(f"RS{uid}", 2000, email=email)).json()
+    assert capi_rows(db, f"sq_pay_RS{uid}")[0]["sent_to_meta"] is False
+    fake.meta_mode = "ok"
+    square_post(client, payment(f"RS{uid}", 2000, email=email))   # Square re-delivers
+    row = capi_rows(db, f"sq_pay_RS{uid}")[0]
+    assert row["sent_to_meta"] is True
+    assert float(customer_row(db, r["cluster_id"])["sq_spend"]) == 20.0   # spend not counted twice
+
+
+def test_nightly_retry_resends_unsent_events(client, db, fake, uid):
+    email = f"nightly-{uid}@example.test"
+    fake.meta_mode = "timeout"
+    square_post(client, payment(f"NT{uid}", 1500, email=email))
+    fake.meta_mode = "ok"
+    db.execute("SELECT current_score_threshold AS t FROM cdp_thermostat_config WHERE id = 1")
+    before = db.fetchone()["t"]
+    out = client.post("/cron/adjust-thermostat", headers={"X-CDP-Key": "test-cron-secret"}).json()
+    db.execute("UPDATE cdp_thermostat_config SET current_score_threshold = %s WHERE id = 1", (before,))
+    assert out["meta_retry"]["retried"] >= 1
+    assert capi_rows(db, f"sq_pay_NT{uid}")[0]["sent_to_meta"] is True
+
+
+def test_webres_without_id_keeps_different_people_apart(client, db, fake, uid):
+    a = client.post("/webhooks/webres", headers=WH, json={"first_name": "Alice", "last_name": f"Smith{uid}",
+                                                           "amount": 60, "date": "2026-11-22"}).json()
+    b = client.post("/webhooks/webres", headers=WH, json={"first_name": "Bob", "last_name": f"Jones{uid}",
+                                                           "amount": 60, "date": "2026-11-22"}).json()
+    assert a["status"] == b["status"] == "webres_synced" and a["cluster_id"] != b["cluster_id"]
+
+
+def test_older_partywirks_booking_does_not_replace_newer(client, db, fake, uid):
+    newer = fake.add_partywirks(uid, f"40{uid}", event_date="2026-12-20", package="TEEN PARTY")
+    r = client.post("/webhooks/partywirks", headers=WH, json=newer).json()
+    older = fake.add_partywirks(uid, f"41{uid}", event_date="2025-06-01", package="BOWLING PARTY")
+    client.post("/webhooks/partywirks", headers=WH, json=older)
+    c = customer_row(db, r["cluster_id"])
+    assert str(c["pw_last_party_date"]) == "2026-12-20" and c["pw_last_package"] == "TEEN PARTY"
+    assert c["pw_bookings"] == 2
+
+
+def test_catch_up_retries_when_customer_lookup_fails(db, fake, uid, monkeypatch):
+    monkeypatch.setattr(main.time, "sleep", lambda s: None)
+    fake.add_partywirks(uid, f"50{uid}", event_date="2099-03-01", created_at="2026-11-16 09:00:00")
+    real_get = fake.get
+
+    def customers_down(url, **kw):
+        if "/customers/" in url:
+            return __import__("conftest").FakeResponse(503, {"message": "down"})
+        return real_get(url, **kw)
+
+    monkeypatch.setattr(main.requests, "get", customers_down)
+    first = main.run_partywirks_sync(days_back=1, count_bookings_created_since="2026-11-15 00:00:00")
+    assert first.get("api_lookup_failed_retry_next_run") == 1
+    monkeypatch.setattr(main.requests, "get", real_get)
+    second = main.run_partywirks_sync(days_back=1, count_bookings_created_since="2026-11-15 00:00:00")
+    assert second.get("new_counted") == 1
+    db.execute("SELECT md_address1 FROM master_customers WHERE email = %s", (f"party-{uid}@example.test",))
+    assert db.fetchone()["md_address1"]
+
+
+def test_catch_up_pushes_recovered_customers_to_audiences(db, fake, uid, monkeypatch):
+    monkeypatch.setattr(main.time, "sleep", lambda s: None)
+    fake.add_partywirks(uid, f"60{uid}", event_date="2099-04-01", created_at="2026-11-16 09:00:00")
+    main.run_partywirks_sync(days_back=1, count_bookings_created_since="2026-11-15 00:00:00")
+    assert len(capi_rows(db, f"qb_pw_60{uid}")) == 1
+    assert fake.count("/users") >= 1
+
+
 # --- Authentication ----------------------------------------------------------------------------
 
 def test_endpoints_reject_missing_or_wrong_credentials(client, fake):

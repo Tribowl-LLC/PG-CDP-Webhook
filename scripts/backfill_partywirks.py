@@ -9,6 +9,10 @@ Run where PARTYWIRKS_API_KEY is set (e.g. `render ssh <service> --ephemeral`):
     python scripts/backfill_partywirks.py --count-since "2026-11-15 00:00:00"            # dry run
     python scripts/backfill_partywirks.py --count-since "2026-11-15 00:00:00" --apply    # writes
 
+Before the API existed, a webhook without a usable order ID was recorded under a placeholder key
+(pw_c<customer>_...) with a guessed package/date. Those rows are undone first (booking count -1,
+last package/date cleared) so the real reservation data replaces them.
+
 Paces itself under the API limit (two calls per new reservation), so a full run takes a few minutes.
 Only aggregate counts are printed.
 """
@@ -20,6 +24,27 @@ from datetime import date
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import main  # noqa: E402
+
+
+def undo_placeholder_rows(apply: bool) -> int:
+    conn = main.get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("SELECT transaction_id, cluster_id FROM unified_transactions "
+                        "WHERE source_system = 'partywirks' AND transaction_id LIKE 'pw\\_c%%';")
+            rows = cur.fetchall()
+            if apply:
+                for r in rows:
+                    if r["cluster_id"]:
+                        cur.execute("UPDATE master_customers SET pw_bookings = GREATEST(0, COALESCE(pw_bookings, 0) - 1), "
+                                    "pw_last_package = NULL, pw_last_party_date = NULL WHERE cluster_id = %s;",
+                                    (r["cluster_id"],))
+                    cur.execute("DELETE FROM unified_transactions WHERE transaction_id = %s;", (r["transaction_id"],))
+            else:
+                conn.rollback()
+        return len(rows)
+    finally:
+        conn.close()
 
 
 def created_per_day(days: int = 7):
@@ -47,6 +72,7 @@ if __name__ == "__main__":
     a = p.parse_args()
     if not main.PARTYWIRKS_API_KEY:
         sys.exit("PARTYWIRKS_API_KEY is not set")
+    print(f"Placeholder rows from pre-API webhooks {'undone' if a.apply else 'to undo'}: {undo_placeholder_rows(a.apply)}")
     if not a.apply:
         created_per_day()
     out = main.run_partywirks_sync(days_back=2000, count_bookings_created_since=a.count_since, apply=a.apply)

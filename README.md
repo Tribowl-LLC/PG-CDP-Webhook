@@ -32,6 +32,11 @@ Variable	Purpose
 `AUDIENCE_PG2_FAMILIES`	Meta Custom Audience ID (`120246555006040358`) - Affluent Suburban Party Families
 `AUDIENCE_PRIME_SUBURBS`	Meta Custom Audience ID (`120246555019320358`) - Prime Western/Northern Suburbs
 `AUDIENCE_ALL_NONDETROIT`	Meta Custom Audience ID (`120246555027130358`) - All Qualified Non-Excluded Customers
+`SQUARE_WEBHOOK_SIGNATURE_KEY`	Signature key of the Square webhook subscription. When set, `/webhooks/square` rejects requests without a valid `x-square-hmacsha256-signature`.
+`SQUARE_WEBHOOK_URL`	The exact notification URL registered with Square (default `https://pg-cdp-webhook.onrender.com/webhooks/square`). Square signs this URL + the body.
+`WEBHOOK_SECRET`	Shared key for `/webhooks/webres`, `/webhooks/tripleseat`, `/webhooks/partywirks`. Senders pass it as header `X-CDP-Key` or query `?key=`.
+`CRON_SECRET`	Separate key for every `/cron/*` endpoint (header `X-CDP-Key` or query `?key=`).
+Each authentication check switches on as soon as its variable is set. `GET /health` shows which are on.
 ---
 3. PostgreSQL Database Schema (Neon)
 3.1 `master_customers` (Golden Household Record)
@@ -74,7 +79,8 @@ Automated Department Classification (`pg_department`):
 4.1 Hard Geographic Exclusion Gate (`is_detroit_excluded`)
 To prevent Meta's ad delivery AI from optimizing toward lower-converting or out-of-market areas, any non-corporate customer matching the following verified cities or ZIP codes is hard-capped at a `bowler_value_score` of `25`, assigned to `PG-5: Excluded Geo`, and completely blocked from firing Meta CAPI events or entering Meta Custom Audiences:
 Excluded Cities: `detroit`, `pontiac`, `redford`, `redford charter township`, `redford twp`, `inkster`, `highland park`, `hamtramck`, `southfield`, `lathrup village`, `oak park`, `ferndale`, `hazel park`, `eastpointe`, `harper woods`, `ecorse`, `river rouge`
-Excluded ZIP Prefixes / Codes: All `482xx` ZIP codes, plus `48033`, `48034`, `48037`, `48075`, `48076`, `48340`, `48341`, `48342`, `48141`
+Excluded ZIP Prefixes / Codes: All `482xx` ZIP codes except the Grosse Pointes (`48230`, `48236`, see `ALLOWED_482_ZIPS`), plus `48033`, `48034`, `48037`, `48075`, `48076`, `48340`, `48341`, `48342`, `48141`
+Grosse Pointe: `48230` (Grosse Pointe, Farms, Park) and `48236` (Woods, Shores) are marketable. The city check runs first, so a `48236` address in Harper Woods or Detroit is still excluded.
 Important Guardrail: Unmatched cell-phone area code cities (where `md_address1 IS NULL`) are stripped during enrichment so a Novi resident with a `313` or `248` cell phone number is never falsely flagged as Detroit or Southfield unless a verified street address confirms it.
 4.2 Prime Suburban Target ZIPs (`PRIME_SUBURB_ZIPS`)
 Customers in these core western/northern Oakland and Wayne County suburbs are synced to the `AUDIENCE_PRIME_SUBURBS` (`120246555019320358`) seed list:
@@ -129,6 +135,11 @@ Calls PostgreSQL function `adjust_meta_capi_thermostat()` nightly at 3:00 AM via
 Paginates through Square `/v2/catalog/list` (`ITEM,CATEGORY`), classifies items into Perfect Game departments, and upserts all variations into `square_catalog_items`.
 `POST /cron/enrich-partywirks`
 Batch-enriches any `in_partywirks = 1` rows missing `md_address1` via Melissa Personator and recalculates their persona and `bowler_value_score`.
+`POST /cron/recover-square-avs-zips`
+Finds card billing ZIPs for Square profiles with no address and enriches them via Melissa.
+All `/cron/*` endpoints require `CRON_SECRET` (when set). The cron-job.org jobs must send it.
+`GET /health`
+Liveness check; reports which authentication checks are switched on.
 ---
 6. Meta CAPI & Custom Audience Architecture
 Multi-Identifier Hashing (`build_meta_user_identifiers`):
@@ -138,3 +149,23 @@ Dual-Event Strategy:
 `Qualified_Bowler`: Synthetic conversion event gated by geography (`not is_detroit_excluded`) and `bowler_value_score >= threshold`. Used as the primary Optimization Goal in Meta Ad Sets so Meta's bidding AI hunts exclusively for high-scoring suburban families and corporate planners.
 Live Custom Audience Sync (`sync_customer_to_meta_custom_audiences`):
 Whenever a qualified customer is enriched or transacts, FastAPI's `BackgroundTasks` pushes their hashed identity and `LOOKALIKE_VALUE` directly into up to 4 live Meta Value-Based Custom Audiences (`PG-1 Corporate`, `PG-2 Affluent Families`, `Prime Suburbs`, and `All Non-Detroit`).
+---
+7. Reliability Rules (Nov 2026)
+Every webhook is safe to receive more than once. `unified_transactions` is the ledger: one row per Square payment (`sq_pay_<id>`), WebRes booking (`wr_<id>`), Tripleseat lead/event (`ts_<kind>_<id>`) and Partywirks booking (`pw_<id>`). Spend and visit/booking counts only change the first time an ID is seen; a later notice for the same Square payment or WebRes booking only applies the change in amount (e.g. a refund).
+Square spend is `total_money` (includes tips) minus `refunded_money`.
+Square payments with no customer ID, no email and no name on the card are recorded in the ledger but create no customer. Payments from a Square customer ID whose profile has no contact details are parked (`external_customer_id`, no `cluster_id`) and credited automatically once that Square customer is identified.
+`Qualified_Bowler` event IDs are stable: WebRes per booking, Tripleseat per customer per event date, Partywirks per booking. Repeat webhooks never create a second conversion.
+Melissa is called at most once per customer for the same inputs: `md_results` records that Melissa answered. It is only retried if Melissa was unreachable or the customer gains a new email/phone.
+Meta failures never roll back a customer update. `capi_events_log.sent_to_meta` reflects Meta's actual response, and a failed event is re-sent if it comes through again.
+New `cluster_id`s come from the `master_cluster_id_seq` sequence; a new customer is a plain INSERT, so a numbering clash fails loudly instead of merging two people.
+Webhook routes read the body asynchronously and run all blocking work in a worker thread, so a slow Melissa/Meta call doesn't hold up other webhooks.
+
+7.1 Rollout order (Render auto-deploys `main`)
+1. Run `migrations/001_transactions_ledger_and_cluster_sequence.sql` on production Neon.
+2. Merge the PR (deploys).
+3. `DATABASE_URL=... python scripts/repair_after_deploy.py` (dry run), then again with `--apply`.
+4. Set `SQUARE_WEBHOOK_SIGNATURE_KEY` in Render.
+5. Set `WEBHOOK_SECRET` and `CRON_SECRET` in Render at the same time as adding the key to the WebRes/Tripleseat/Partywirks webhook URLs and the cron-job.org jobs.
+
+7.2 Tests
+`pip install -r requirements-dev.txt`, then `pytest tests/test_unit.py`. Integration tests also need `TEST_DATABASE_URL` set to a disposable Neon branch with migration 001 applied (they write test customers into it); all outside services are faked.

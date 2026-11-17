@@ -508,27 +508,36 @@ def build_meta_user_identifiers(cust: dict) -> dict:
     return {k: v for k, v in user_data.items() if v}
 
 
-def sync_customer_to_meta_custom_audiences(cust: dict):
-    """Pushes qualified non-excluded customers into the 4 Meta value-based Custom Audiences."""
-    if not META_ACCESS_TOKEN or is_detroit_excluded(cust.get("md_city"), cust.get("zip5")):
-        return
+AUDIENCE_SCHEMA = ["EMAIL", "PHONE", "FN", "LN", "CT", "ST", "ZIP", "COUNTRY", "LOOKALIKE_VALUE"]
 
+
+def audience_names() -> dict:
+    return {AUDIENCE_ALL_NONDETROIT: "All Non-Detroit", AUDIENCE_PG1_CORP: "PG-1 Corporate",
+            AUDIENCE_PG2_FAMILIES: "PG-2 Families", AUDIENCE_PRIME_SUBURBS: "Prime Suburbs"}
+
+
+def audience_targets(cust: dict) -> tuple:
+    """Which of the 4 audiences a customer belongs in, plus the LTV sent as LOOKALIKE_VALUE.
+    Excluded-area customers belong in none."""
+    if is_detroit_excluded(cust.get("md_city"), cust.get("zip5")):
+        return [], 0.0
     persona = cust.get("pg_mosaic_persona") or ""
     ltv = max(
         float(cust.get("true_lifetime_spend") or 0),
         450.0 if (cust.get("in_tripleseat") or cust.get("in_partywirks")) else 0.0,
     )
-    target_audiences = [AUDIENCE_ALL_NONDETROIT]
-
+    targets = [AUDIENCE_ALL_NONDETROIT]
     if persona.startswith("PG-1") or cust.get("in_tripleseat") == 1 or ltv >= 600:
-        target_audiences.append(AUDIENCE_PG1_CORP)
+        targets.append(AUDIENCE_PG1_CORP)
     if persona.startswith("PG-2") or cust.get("in_partywirks") == 1:
-        target_audiences.append(AUDIENCE_PG2_FAMILIES)
+        targets.append(AUDIENCE_PG2_FAMILIES)
     if (cust.get("zip5") or "") in PRIME_SUBURB_ZIPS:
-        target_audiences.append(AUDIENCE_PRIME_SUBURBS)
+        targets.append(AUDIENCE_PRIME_SUBURBS)
+    return [a for a in dict.fromkeys(targets) if a], ltv
 
-    schema = ["EMAIL", "PHONE", "FN", "LN", "CT", "ST", "ZIP", "COUNTRY", "LOOKALIKE_VALUE"]
-    row = [
+
+def audience_row(cust: dict, ltv: float) -> list:
+    return [
         sha256_hash(cust.get("email")),
         sha256_hash(meta_phone(cust.get("phone"))),
         sha256_hash(cust.get("first_name")),
@@ -540,17 +549,44 @@ def sync_customer_to_meta_custom_audiences(cust: dict):
         round(ltv, 2),
     ]
 
-    for aud_id in set(target_audiences):
-        if aud_id:
-            try:
-                requests.post(
-                    f"https://graph.facebook.com/v21.0/{aud_id}/users",
-                    params={"access_token": META_ACCESS_TOKEN},
-                    json={"payload": {"schema": schema, "data": [row]}},
-                    timeout=5,
-                )
-            except Exception as e:
-                log.warning("Meta audience sync failed: %s", type(e).__name__)
+
+def upload_audience_rows(aud_id: str, rows: list) -> dict:
+    """Uploads hashed rows (max 10,000 per call) to one audience. Logs and returns Meta's answer,
+    so a rejected upload is never silent."""
+    label = audience_names().get(aud_id, aud_id)
+    try:
+        resp = requests.post(
+            f"https://graph.facebook.com/v21.0/{aud_id}/users",
+            params={"access_token": META_ACCESS_TOKEN},
+            json={"payload": {"schema": AUDIENCE_SCHEMA, "data": rows}},
+            timeout=30 if len(rows) > 1 else 5,
+        )
+    except Exception as e:
+        log.error("Meta audience upload to %s failed: %s", label, type(e).__name__)
+        return {"ok": False, "error": type(e).__name__}
+    try:
+        body = resp.json()
+    except ValueError:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    ok = resp.status_code == 200 and "error" not in body
+    if not ok:
+        err = body.get("error") if isinstance(body, dict) else None
+        msg = (err.get("message") if isinstance(err, dict) else err) or resp.text[:300]
+        log.error("Meta audience upload to %s rejected (HTTP %s): %s", label, resp.status_code, msg)
+        return {"ok": False, "status": resp.status_code, "error": msg}
+    return {"ok": True, "received": body.get("num_received"), "invalid": body.get("num_invalid_entries")}
+
+
+def sync_customer_to_meta_custom_audiences(cust: dict):
+    """Pushes one qualified non-excluded customer into the Meta value-based Custom Audiences they belong in."""
+    if not META_ACCESS_TOKEN:
+        return
+    targets, ltv = audience_targets(cust)
+    row = audience_row(cust, ltv)
+    for aud_id in targets:
+        upload_audience_rows(aud_id, [row])
 
 
 def fire_meta_capi_event(cur, cust: dict, event_name: str, value: float, threshold: int,

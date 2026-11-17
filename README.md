@@ -1,12 +1,12 @@
-Perfect Game CDP, Identity Graph & Meta CAPI Engine
+**Perfect Game CDP, Identity Graph & Meta CAPI Engine**
 > **AI & Agent Context Prompt:** This repository powers the centralized Customer Data Platform (CDP), real-time identity resolution graph, demographic enrichment waterfall, and server-side Meta Conversions API (CAPI) engine for **Perfect Game** (`35000 Grand River Ave, Farmington Hills, MI 48335`, Coordinates: `42.4705, -83.3932`). Read this specification carefully before modifying database schemas, scoring logic, geographic exclusion rules, or webhook handlers.
 ---
-1. Executive Summary & Core Objectives
+**1. Executive Summary & Core Objectives**
 Perfect Game is a single-location family entertainment center (bowling, two-story laser tag, arcade, bar/kitchen, kids' birthday parties, leagues and corporate events) in Farmington Hills, MI. This system has two jobs. The first one drives everything else:
 1. **An online ads engine.** Teach Meta (and later Google) to find more of Perfect Game's best customers, meaning affluent suburban families and corporate event planners close to the venue, and to measure what those ads actually earn, online and in person. It is a legal, local version of the "predictive signal" playbook: track first-party behavior, enrich it, score every household, and send the ad platform only the signals worth learning from.
 2. **The foundation of a Perfect Game CRM.** One record per household that unifies every system's data and what each customer buys (Square price keys). It grows into a CRM tied directly to Square: quotes, payments and segments.
 
-Strategic direction (decided by the owner; treat as rules):
+**Strategic direction (decided by the owner; treat as rules):**
 - **Hyperlocal.** Shift the customer base toward the immediate western/northern suburbs (Farmington Hills, Novi, Northville, West Bloomfield, Livonia, Bloomfield Hills, Plymouth, Commerce/Walled Lake …; see `PRIME_SUBURB_ZIPS`).
 - **Detroit and Southfield (and the other excluded areas in `is_detroit_excluded`) are removed from Meta entirely.** No Meta events, no audience uploads, no lookalikes seeded from them. They are excluded from *advertising*, not from data collection: their records are still stored and enriched. The Grosse Pointes (48230/48236) are allowed.
 - **Only great customers go to Meta.** The 4 curated value-based seed audiences, never the full customer list.
@@ -14,21 +14,21 @@ Strategic direction (decided by the owner; treat as rules):
 - **Legal and within platform rules.** The privacy policy and SMS terms disclose enrichment and hashed ad-platform sharing. Never use credit scores, scraping or exclusion lists built from broker financial data. Low-value prospects are handled by withholding the signal, not by excluding people. Promotional SMS goes only to people who opted in.
 - **Scoring is provisional.** The rule-based `bowler_value_score` / personas will be re-tuned once Versium data is in. Don't change weights without the owner.
 
-Where customer data comes from:
+**Where customer data comes from:**
 - Square POS & Square Online: in-store card payments (lanes, bar, kitchen, arcade, shoes), online packages, event deposits. Live webhooks (payments, customers, catalog) plus a full payment and item history since Dec 2023. WebRes and Partywirks payments also settle through Square.
 - Qubica WebRes (QubicaAMF): online lane reservations. Qubica has no webhooks; each confirmation email (with a `W#####.pdf`) arrives at reservations@myperfectgame.com and a Google Apps Script posts it to `/webhooks/webres`.
 - Tripleseat: corporate events, banquets and large-group leads and bookings, via native webhooks.
 - Partywirks: kids'/teen birthday party bookings (`BIRTHDAY EXTRAVAGANZA`, `BOWLING PARTY`, `TEEN PARTY`), via webhooks verified against the Partywirks REST API, plus a nightly catch-up.
 - Possible future source: Intercard (arcade tellers and kiosks). Its revenue API has no customer data; registered game cards would.
 
-How the ads engine works:
+**How the ads engine works:**
 - **Identity:** every Square, WebRes, Tripleseat and Partywirks touch is resolved to one household (`master_customers.cluster_id`) through emails, phones, Square customer IDs and Melissa keys (`customer_identities`), without double-counting revenue that settles through Square.
 - **Enrichment:** Melissa first (verified address, geocode, distance, household demographics), then Versium (alternate emails/phones for Meta match rates, wealth, B2B employment).
 - **Scoring and gating:** each household gets a persona (`PG-1`…`PG-6`) and a `bowler_value_score`. A `Qualified_Bowler` event goes to Meta only for households outside the excluded areas that score at or above a nightly thermostat threshold, paced to ~50/week so ad sets exit "Learning Limited". Low scorers send nothing, so Meta learns not to chase them. Campaigns should optimize on the `Qualified_Bowler` custom conversion.
 - **Attribution:** real `Purchase` events (WebRes bookings, Square payments including in-store bar/arcade/kitchen spend) are sent with the same hashed identifiers. Meta can then attribute both the booking *and* later in-venue spend to the ad that drove it.
 - **Audiences:** qualifying households are pushed automatically into the 4 value-based Custom Audiences that seed the lookalikes.
 
-Roadmap (in rough order): Versium enrichment (alternate IDs, wealth, C2B) → recover more identities (card fingerprints, receipt emails, register phone/email capture) → re-tune the score on real spend and item data → the owner's own "Perfect Game Mosaic" (cluster households on demographics + spend; find look-alike Census tracts and non-customer households for lookalikes, prospect lists and carrier-route mail) → item-based segments (e.g. open-play families who never booked a party, the bar/league crowd, "book next year's birthday" reminders) → CRM features on Square price keys → Google Ads (offline conversions + Customer Match) → Intercard arcade data.
+**Roadmap (in rough order):** Versium enrichment (alternate IDs, wealth, C2B) → recover more identities (card fingerprints, receipt emails, register phone/email capture) → re-tune the score on real spend and item data → the owner's own "Perfect Game Mosaic" (cluster households on demographics + spend; find look-alike Census tracts and non-customer households for lookalikes, prospect lists and carrier-route mail) → item-based segments (e.g. open-play families who never booked a party, the bar/league crowd, "book next year's birthday" reminders) → CRM features on Square price keys → Google Ads (offline conversions + Customer Match) → Intercard arcade data.
 
 What this system does today:
 Identity Resolution & Deduplication: Stitches fragmented customer records across Square, WebRes, Tripleseat, and Partywirks into a single golden household record (`master_customers.cluster_id`) without double-counting revenue when online bookings or Partywirks/Tripleseat deposits settle through Square POS.

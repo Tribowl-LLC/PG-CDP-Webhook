@@ -1769,6 +1769,51 @@ def _count_record_once(cur, cust: dict, txn_id: str, source_system: str, counter
     return cur.fetchone(), True
 
 
+# Temporary (Nov 2026): learn what Tripleseat's webhooks contain before building the API sync.
+# Logs field NAMES only (nested paths), plus whether the money fields are filled; never values.
+TRIPLESEAT_LOG_FIELDS = os.getenv("TRIPLESEAT_LOG_FIELDS", "1") == "1"
+_TS_MONEY_HINTS = ("total", "amount", "due", "deposit", "payment", "balance", "fee", "price", "paid")
+
+
+def field_paths(obj, prefix: str = "", depth: int = 0, out: set = None) -> set:
+    """Nested key paths of a JSON object (`a.b`, lists as `a[]`), without any values."""
+    out = set() if out is None else out
+    if depth > 6:
+        return out
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            path = f"{prefix}.{k}" if prefix else str(k)
+            out.add(path)
+            field_paths(v, path, depth + 1, out)
+    elif isinstance(obj, list):
+        for item in obj[:3]:
+            field_paths(item, f"{prefix}[]", depth + 1, out)
+    return out
+
+
+def log_tripleseat_fields(raw: dict):
+    try:
+        paths = sorted(field_paths(raw))
+        money = sorted({p for p in paths if any(h in p.rsplit(".", 1)[-1].lower() for h in _TS_MONEY_HINTS)})
+        filled = []
+        for p in money:
+            cur, ok = [raw], True
+            for part in p.split("."):
+                key, many = (part[:-2], True) if part.endswith("[]") else (part, False)
+                nxt = []
+                for c in cur:
+                    v = c.get(key) if isinstance(c, dict) else None
+                    nxt.extend(v if many and isinstance(v, list) else [v] if v not in (None, "", [], {}) else [])
+                cur = nxt
+            if any(v not in (None, "", "0", "0.0", "0.00", 0) and not isinstance(v, (dict, list)) for v in cur):
+                filled.append(p)
+        log.info("Tripleseat webhook fields (%d): %s", len(paths), ", ".join(paths)[:6000])
+        log.info("Tripleseat webhook money fields filled: %s | empty: %s",
+                 ", ".join(filled)[:1500], ", ".join(p for p in money if p not in filled)[:1500])
+    except Exception as e:  # logging must never break the webhook
+        log.warning("Tripleseat field logging failed: %s", type(e).__name__)
+
+
 def handle_tripleseat(raw: dict, background_tasks: BackgroundTasks) -> dict:
     kind, obj = "record", raw
     for key in ("lead", "event", "booking", "contact"):
@@ -1859,6 +1904,8 @@ async def tripleseat_webhook(request: Request, background_tasks: BackgroundTasks
     """Tripleseat Lead, Event, Booking, and Contact webhooks."""
     require_webhook_key(request)
     _, raw = await read_json(request)
+    if TRIPLESEAT_LOG_FIELDS and isinstance(raw, dict):
+        log_tripleseat_fields(raw)
     return await run_in_threadpool(handle_tripleseat, raw, background_tasks)
 
 

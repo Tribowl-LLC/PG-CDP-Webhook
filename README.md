@@ -42,14 +42,15 @@ Perfect Game is a single-location family entertainment center (bowling, two-stor
 Application Server: FastAPI (`main.py`) hosted on Render (`https://pg-cdp-webhook.onrender.com`)
 Database: Serverless PostgreSQL hosted on Neon (`customer_database`)
 Enrichment Providers:
-Melissa Data Personator API (`/v3/WEB/ContactVerify/doContactVerify`): Address verification, geocoding (`GrpGeo`), household demographics (`GrpDemographicBasic`), and persistent identity keys (`MelissaIdentityKey` / `md_mik` and `MelissaAddressKey` / `md_mak`).
+Melissa Data Personator API (`/v3/WEB/ContactVerify/doContactVerify`): street-address verification, geocoding (`GrpGeocode`), carrier route and household/address keys via `act=Check` (credit license: no Append/Move, no demographics; see `MELISSA_ACT` / `MELISSA_COLS`).
 Versium REACH API (`/v2/contact`, `/v2/demographic`, `/v2/onlineAudience`): Multi-email/phone identity graph (`email_1..5`, `phone_1..5`), wealth/home value signals, B2B company/title matching, and platform-ready online audience IDs for Meta, Google, LinkedIn and TikTok (only for customers passing `versium_online_append_eligible`). Versium's hashed Facebook emails/phones are added to every CAPI event's `em`/`ph`.
 Ad Destination: Meta Graph API `v21.0` (Server-Side Conversions API + Real-Time Custom Audience API).
 Required Environment Variables (Render Dashboard)
 Variable	Purpose
 `DATABASE_URL`	PostgreSQL connection string for Neon (`customer_database`)
 `SQUARE_ACCESS_TOKEN`	Production Square API token (used for Customer Profile lookups & Catalog sync)
-`MELISSA_API_KEY`	License key for Melissa Personator Consumer Verification & Append
+`MELISSA_API_KEY`	License key for Melissa Personator Consumer (credit license: address Check only)
+`MELISSA_ACT` / `MELISSA_COLS`	Optional overrides for the Melissa actions/column groups (defaults `Check` / `GrpAddressDetails,GrpGeocode`; a subscription license can add `Verify,Append` and `GrpDemographicBasic`)
 `VERSIUM_API_KEY`	API key for Versium REACH Contact, Demographic & B2B Append
 `META_PIXEL_ID`	Meta Dataset / Pixel ID (`Perfect Game Facebook Data`)
 `META_ACCESS_TOKEN`	Meta System User Access Token with CAPI & Custom Audience permissions
@@ -166,7 +167,7 @@ Batch-enriches any `in_partywirks = 1` rows missing `md_address1` via Melissa Pe
 `POST /cron/census-geocode?limit=200`
 Free US Census Geocoder (no key; only the street address is sent) for customers with a street address but no census tract or no coordinates: census tract/block, county, school districts, plus coordinates and `distance_miles` when Melissa had none; then rescores. Each address is asked once (`census_checked_at`, `migrations/005`). Live enrichment does the same right after Melissa.
 `POST /cron/melissa-geocode?limit=100`
-Runs customers with a street address + ZIP but no Melissa address work (no coordinates or no carrier route, e.g. addresses from a Versium CSV) through Melissa: verified address, coordinates/`distance_miles`, carrier route, household key; then rescores them. Melissa is address-only (`MELISSA_COLS`, default `GrpAddressDetails,GrpGeo`): the credit license rejects demographic groups with GE29, so demographics come from Versium. Highest scores first, at most `limit` paid lookups per call (max 500). Each customer is tried once (`md_results` gets `GEO_TRIED`); a Melissa outage leaves them for the next run.
+Runs customers with a street address + ZIP but no Melissa address work (no coordinates or no carrier route, e.g. addresses from a Versium CSV) through Melissa: verified address, coordinates/`distance_miles`, carrier route, household key; then rescores them. Melissa is address-only on the current credit license (`MELISSA_ACT`, default `Check`; `MELISSA_COLS`, default `GrpAddressDetails,GrpGeocode`): credit licenses answer GE29 to the Append/Move actions and to demographic fields, so Melissa only checks a street address we already have (customers without one are marked `NO_STREET_TO_CHECK` and not charged), while email/phone→address and demographics come from Versium. Highest scores first, at most `limit` paid lookups per call (max 500). Each customer is tried once (`md_results` gets `GEO_TRIED`); a Melissa outage leaves them for the next run.
 `POST /cron/versium-online-audience?limit=100`
 Versium online audience append (Meta / Google / LinkedIn / TikTok IDs) for eligible customers (`versium_online_append_eligible`) that don't have it yet: never checked, or the live call was skipped (slow lookups) or failed. Highest scores first, at most `limit` paid lookups per call (max 500); stops after 3 rejections in a row. No-match customers are marked `_checked` so they aren't bought again.
 `POST /cron/recover-square-avs-zips`

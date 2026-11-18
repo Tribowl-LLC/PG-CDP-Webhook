@@ -993,6 +993,9 @@ def test_versium_catch_up_enriches_unchecked_and_marks_them(client, db, fake, ui
     fresh = _new_customer(db, uid, f"v-{uid}@example.test")
     done = _new_customer(db, uid, f"vcsv-{uid}@example.test", flags={"_source": "versium_reach_csv", "pets": "Y"})
     down = _new_customer(db, uid, f"vdown-{uid}@example.test")
+    # The test database keeps earlier runs' customers; rank this run's first.
+    db.execute("UPDATE master_customers SET bowler_value_score = 0 WHERE bowler_value_score >= 100000 "
+               "AND cluster_id NOT IN (%s, %s, %s)", (fresh, done, down))
     r = client.post("/cron/versium-enrich?limit=500", headers=CRON).json()
     assert r["status"] == "versium_enrich"
     c = customer_row(db, fresh)
@@ -1143,3 +1146,64 @@ def test_unmatched_customer_retried_once_with_new_details(client, db, fake, uid,
         "reservation_id": f"NM3{uid}", "first_name": "No", "last_name": f"Match{uid}",
         "email": f"third-{uid}@example.test", "amount": 30})
     assert customer_row(db, cid)["enrich_after"] is None and len(versium_emails(fake)) == n
+
+
+def test_catch_up_leaves_waiting_customers_to_the_worker(client, db, fake, uid, deferred):
+    email = f"wait-{uid}@example.test"
+    cid = client.post("/webhooks/webres", headers=WH, json={
+        "reservation_id": f"WT{uid}", "first_name": "Wait", "last_name": f"Er{uid}", "email": email,
+        "amount": 20}).json()["cluster_id"]
+    db.execute("UPDATE master_customers SET bowler_value_score = 100000 WHERE cluster_id = %s", (cid,))
+    client.post("/cron/versium-enrich?limit=500", headers=CRON)
+    assert email not in versium_emails(fake) and customer_row(db, cid)["enrich_after"] is not None
+
+
+def test_details_arriving_during_lookup_get_a_second_look(client, db, fake, uid, deferred, monkeypatch):
+    email = f"vnomatch-race-{uid}@example.test"
+    cid = client.post("/webhooks/webres", headers=WH, json={
+        "reservation_id": f"RC{uid}", "first_name": "Race", "last_name": f"Y{uid}", "email": email,
+        "amount": 20}).json()["cluster_id"]
+    real = main.run_melissa_and_versium_waterfall
+    late = f"late-{uid}@example.test"
+
+    def waterfall_with_webhook_meanwhile(*a, **kw):
+        out = real(*a, **kw)
+        client.post("/webhooks/webres", headers=WH, json={
+            "reservation_id": f"RC2{uid}", "first_name": "Race", "last_name": f"Y{uid}", "email": email,
+            "phone": "248" + str(int(uid[6:12], 16) % 10_000_000).zfill(7), "amount": 20})
+        db.execute("UPDATE master_customers SET enrich_inputs = enrich_inputs || %s::jsonb WHERE cluster_id = %s",
+                   (json.dumps({"email": late}), cid))
+        return out
+    monkeypatch.setattr(main, "run_melissa_and_versium_waterfall", waterfall_with_webhook_meanwhile)
+    assert run_worker_now(db, cid).get("rerun_new_details") == 1
+    c = customer_row(db, cid)
+    assert c["enrich_after"] is not None and c["enrich_inputs"].get("_retry") is True
+    assert capi_rows(db, f"wr_RC{uid}")[0]["meta_response_status"] == "DEFERRED_ENRICHMENT"
+    monkeypatch.setattr(main, "run_melissa_and_versium_waterfall", real)
+    run_worker_now(db, cid)
+    assert late in versium_emails(fake) and customer_row(db, cid)["enrich_after"] is None
+
+
+def test_released_events_log_the_final_score_and_threshold(client, db, fake, uid, deferred):
+    cid = client.post("/webhooks/webres", headers=WH, json={
+        "reservation_id": f"SC{uid}", "first_name": "Score", "last_name": f"Z{uid}",
+        "email": f"score-{uid}@example.test", "amount": 20}).json()["cluster_id"]
+    db.execute("UPDATE capi_events_log SET bowler_value_score = -1, threshold_at_send = -1 WHERE event_id = %s",
+               (f"wr_SC{uid}",))
+    run_worker_now(db, cid)
+    row = capi_rows(db, f"wr_SC{uid}")[0]
+    assert row["threshold_at_send"] == 55 and row["bowler_value_score"] == customer_row(db, cid)["bowler_value_score"]
+
+
+def test_melissa_household_key_still_merges_in_deferred_mode(client, db, fake, uid, deferred, monkeypatch):
+    monkeypatch.setattr(main, "MELISSA_LIVE", True)
+    mik = f"MIK-{uid}"
+    owner = client.post("/webhooks/webres", headers=WH, json={
+        "reservation_id": f"MK{uid}", "first_name": "House", "last_name": f"Hold{uid}",
+        "email": f"house-{uid}@example.test", "amount": 20}).json()["cluster_id"]
+    db.execute("INSERT INTO customer_identities (cluster_id, id_type, id_value, source_system) "
+               "VALUES (%s, 'md_mik', %s, 'test')", (owner, mik))
+    monkeypatch.setattr(main, "melissa_lookup", lambda *a, **kw: {"md_mik": mik, "md_address1": "1 Same St",
+                                                                  "md_results": "AS01"})
+    r = client.post("/webhooks/partywirks", headers=WH, json=fake.add_partywirks(uid, f"26{int(uid, 16)}"))
+    assert r.json().get("cluster_id") == owner

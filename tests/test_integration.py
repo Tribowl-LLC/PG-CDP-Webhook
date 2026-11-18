@@ -19,6 +19,13 @@ def melissa_append_enabled(monkeypatch):
     monkeypatch.setattr(main, "MELISSA_ACT", "Check,Verify,Append")
 
 
+@pytest.fixture(autouse=True)
+def fixed_threshold(monkeypatch):
+    """The test database is a copy of production, whose hourly thermostat moves the score threshold (45-90).
+    Pin it so these flows don't pass or fail with the live value."""
+    monkeypatch.setattr(main, "get_threshold", lambda cur: 55)
+
+
 def square_post(client, body: dict):
     raw = json.dumps(body).encode()
     sig = main.square_signature(raw, main.SQUARE_WEBHOOK_SIGNATURE_KEY, main.SQUARE_WEBHOOK_URL)
@@ -965,3 +972,60 @@ def test_tripleseat_new_event_on_synced_booking_not_counted_again(client, db, fa
                       "status": "definite", "email_address": f"tsbook-{uid}@example.test", "event_date": "2026-12-13"}}
     cid = client.post("/webhooks/tripleseat", headers=WH, json=hook).json()["cluster_id"]
     assert customer_row(db, cid)["ts_events"] == 1
+
+
+CRON = {"X-CDP-Key": "test-cron-secret"}
+
+
+def _new_customer(db, uid, email, flags=None, address=None):
+    db.execute("SELECT nextval('master_cluster_id_seq') AS id")
+    cid = db.fetchone()["id"]
+    db.execute("""INSERT INTO master_customers (cluster_id, first_name, last_name, email, md_address1, md_city,
+                  md_state, zip5, versium_lifestyle_flags, bowler_value_score, updated_at)
+                  VALUES (%s, 'Vee', %s, %s, %s, %s, 'MI', %s, %s::jsonb, 100000, NOW())""",
+               (cid, f"Catch{uid}", email, address, "Novi" if address else None, "48375" if address else None,
+                json.dumps(flags) if flags is not None else None))
+    return cid
+
+
+def test_versium_catch_up_enriches_unchecked_and_marks_them(client, db, fake, uid, monkeypatch):
+    monkeypatch.setattr(main, "VERSIUM_API_KEY", "test-versium-key")
+    fresh = _new_customer(db, uid, f"v-{uid}@example.test")
+    done = _new_customer(db, uid, f"vcsv-{uid}@example.test", flags={"_source": "versium_reach_csv", "pets": "Y"})
+    down = _new_customer(db, uid, f"vdown-{uid}@example.test")
+    r = client.post("/cron/versium-enrich?limit=500", headers=CRON).json()
+    assert r["status"] == "versium_enrich"
+    c = customer_row(db, fresh)
+    assert c["md_address1"] == "500 Versium Way" and c["zip5"] == "48375" and c["md_census_tract"]
+    assert c["distance_miles"] is not None and c["versium_net_worth"] == "$100,000 - $249,999"
+    f = c["versium_lifestyle_flags"]
+    assert f["presence_of_children"] == "Yes" and f["_versium_checked"] and "religion" not in f
+    assert "_versium_pending" not in f and c["versium_alt_phones"]
+    assert customer_row(db, done)["versium_lifestyle_flags"] == {"_source": "versium_reach_csv", "pets": "Y"}
+    dflags = customer_row(db, down)["versium_lifestyle_flags"] or {}
+    assert "_versium_checked" not in dflags and "_versium_pending" not in dflags  # retried next run
+    # A second run never pays for the finished customer again.
+    mine = lambda: sum(1 for m, u, kw in fake.calls
+                       if "versium" in u and (kw.get("params") or {}).get("email") == f"v-{uid}@example.test")
+    before = mine()
+    client.post("/cron/versium-enrich?limit=500", headers=CRON)
+    assert before > 0 and mine() == before
+
+
+def test_webhook_versium_merges_with_csv_flags_and_melissa_off_marks_done(client, db, fake, uid, monkeypatch):
+    monkeypatch.setattr(main, "VERSIUM_API_KEY", "test-versium-key")
+    monkeypatch.setattr(main, "MELISSA_LIVE", False)
+    email = f"vweb-{uid}@example.test"
+    r = client.post("/webhooks/webres", headers=WH, json={"reservation_id": f"VW{uid}", "first_name": "Web",
+                                                           "last_name": f"Vee{uid}", "email": email, "amount": 30}).json()
+    c = customer_row(db, r["cluster_id"])
+    assert c["md_results"] == main.MELISSA_OFF and c["md_address1"] == "500 Versium Way"
+    assert c["versium_lifestyle_flags"]["presence_of_children"] == "Yes"
+    assert fake.count("melissadata") == 0
+    db.execute("UPDATE master_customers SET versium_lifestyle_flags = versium_lifestyle_flags || "
+               "'{\"pets\": \"Y\"}'::jsonb WHERE cluster_id = %s", (r["cluster_id"],))
+    n = sum(1 for m, u, kw in fake.calls if "versium" in u)
+    client.post("/webhooks/webres", headers=WH, json={"reservation_id": f"VW2{uid}", "first_name": "Web",
+                                                      "last_name": f"Vee{uid}", "email": email, "amount": 30})
+    assert sum(1 for m, u, kw in fake.calls if "versium" in u) == n  # finished: not looked up again
+    assert customer_row(db, r["cluster_id"])["versium_lifestyle_flags"]["pets"] == "Y"

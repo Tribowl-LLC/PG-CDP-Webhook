@@ -537,3 +537,118 @@ def test_tripleseat_sync_endpoint_off_without_secret(monkeypatch):
     monkeypatch.setattr(main, "TRIPLESEAT_CLIENT_SECRET", None)
     r = TestClient(main.app).post("/cron/sync-tripleseat?key=test-cron-secret")
     assert r.status_code == 200 and r.json()["status"] == "error"
+
+
+# Real Versium answers use display names (seen on the live API, Nov 18 2026).
+V_CONTACT = {"First Name": "Ann", "Last Name": "Lee", "Postal Address": "12 Oak St", "City": "Novi",
+             "State": "MI", "Zip": "48375", "Zip+4": "48375-1234", "Country": "US",
+             "Phone": "(248) 555-0199", "Email Address": "ann.alt@example.test"}
+V_DEMO = {"Estimated Net Worth": "$250,000 - $499,999", "Home Market Value": "$300,000 - $349,999",
+          "Auto Make": "Ford", "Auto Model": "ESCAPE", "Presence of Children": "Yes", "Household Income": "$100K+",
+          "Religion": "X", "Ethnic Group": "X", "Party Affiliation": "X", "Credit Rating": "X",
+          "Donor Political": "X", "Pets": "", "Individual Level Match": "Yes"}
+
+
+def test_versium_contact_parsing_uses_display_names():
+    c = main.parse_versium_contact(V_CONTACT, email="ann@example.test", phone="2485550100")
+    assert c["alt_phones"] == ["2485550199"] and c["alt_emails"] == ["ann.alt@example.test"]
+    assert c["address"] == {"md_address1": "12 Oak St", "md_city": "Novi", "md_state": "MI", "zip5": "48375",
+                            "md_plus4": "1234"}
+    same = main.parse_versium_contact({"Phone": "2485550100", "Email": "ann@example.test"}, "ann@example.test",
+                                      "(248) 555-0100")
+    assert same["alt_phones"] == [] and same["alt_emails"] == [] and same["address"] is None
+
+
+def test_versium_demographics_snake_case_blocked_fields_and_columns():
+    d = main.parse_versium_demographics(V_DEMO)
+    f = d["lifestyle_flags"]
+    assert f["presence_of_children"] == "Yes" and f["household_income"] == "$100K+" and "pets" not in f
+    for blocked in ("religion", "ethnic_group", "party_affiliation", "credit_rating", "donor_political"):
+        assert blocked not in f
+    assert d["versium_net_worth"] == "$250,000 - $499,999"
+    assert d["versium_home_market_value"] == "$300,000 - $349,999"
+    assert d["versium_auto_make_model"] == "Ford Escape"
+
+
+def test_versium_call_rejections_are_logged_and_retryable(monkeypatch, caplog):
+    from conftest import FakeResponse
+    answers = [FakeResponse(400, {"versium": {"errors": ["The request does not contain a valid output value"]}}),
+               FakeResponse(200, {"versium": {"errors": ["Out of credits"], "results": []}}),
+               FakeResponse(200, {"versium": {"results": []}})]
+    monkeypatch.setattr(main.requests, "get", lambda url, **kw: answers.pop(0))
+    with caplog.at_level("ERROR", logger="pg_cdp"):
+        assert main.versium_call("demographic", {}, {"email": "a@b.com"}) is None
+        assert main.versium_call("contact", {}, {"email": "a@b.com"}) is None
+    assert "demographic rejected (HTTP 400)" in caplog.text and "Out of credits" in caplog.text
+    assert "a@b.com" not in caplog.text
+    assert main.versium_call("contact", {}, {}) == {}  # answered, no match
+
+
+def _versium_world(monkeypatch, contact=None, demo=None, fail=()):
+    from conftest import FakeResponse
+    seen = []
+
+    def get(url, params=None, **kw):
+        seen.append((url, params or {}))
+        for name in fail:
+            if f"/v2/{name}" in url:
+                return FakeResponse(500, {})
+        if "/v2/contact" in url:
+            return FakeResponse(200, {"versium": {"results": [contact if contact is not None else V_CONTACT]}})
+        if "/v2/demographic" in url:
+            return FakeResponse(200, {"versium": {"results": [demo if demo is not None else V_DEMO]}})
+        if "onlineAudience" in url:
+            return FakeResponse(200, OA_BODY)
+        if "geocoding.geo.census.gov" in url:
+            return FakeResponse(200, {"result": {"addressMatches": [{"coordinates": {"x": -83.47, "y": 42.48},
+                                      "geographies": {"Census Tracts": [{"TRACT": "123400"}]}}]}})
+        raise AssertionError(url)
+    monkeypatch.setattr(main, "VERSIUM_API_KEY", "test-versium-key")
+    monkeypatch.setattr(main, "MELISSA_LIVE", False)
+    monkeypatch.setattr(main.requests, "get", get)
+    return seen
+
+
+def test_versium_only_waterfall_finds_address_then_census(monkeypatch):
+    seen = _versium_world(monkeypatch)
+    r = main.run_melissa_and_versium_waterfall("Ann", "Lee", "ann@example.test", "2485550100")
+    urls = [u for u, _ in seen]
+    assert not any("melissadata" in u for u in urls)
+    contact = next(p for u, p in seen if "/v2/contact" in u)
+    assert "address" in contact["output[]"]
+    demo = next(p for u, p in seen if "/v2/demographic" in u)
+    assert demo["output[]"] == ["demographic", "financial", "lifestyle"] and demo["address"] == "12 Oak St"
+    census = next(p for u, p in seen if "census.gov" in u)
+    assert census["street"] == "12 Oak St"
+    assert r["md_address1"] == "12 Oak St" and r["zip5"] == "48375" and r["md_census_tract"] == "123400"
+    assert r["distance_miles"] is not None and r["versium_net_worth"]
+    assert r["lifestyle_flags"]["_versium_checked"] and r["md_results"] == main.MELISSA_OFF
+    assert any("onlineAudience" in u for u in urls)
+
+
+def test_versium_skips_address_output_when_street_known_and_ignores_conflicting_zip(monkeypatch):
+    seen = _versium_world(monkeypatch)
+    main.run_melissa_and_versium_waterfall("Ann", "Lee", "ann@example.test", "", "9 Elm", "Novi", "MI", "48375")
+    assert "address" not in next(p for u, p in seen if "/v2/contact" in u)["output[]"]
+    _versium_world(monkeypatch, contact={**V_CONTACT, "Zip": "48009", "Zip+4": ""})
+    r = main.run_melissa_and_versium_waterfall("Ann", "Lee", "ann@example.test", "", zip_code="48375")
+    assert not r.get("md_address1") and r["zip5"] == "48375"
+
+
+def test_versium_address_in_excluded_area_stops_further_enrichment(monkeypatch):
+    seen = _versium_world(monkeypatch, contact={**V_CONTACT, "City": "Detroit", "Zip": "48226", "Zip+4": ""})
+    r = main.run_melissa_and_versium_waterfall("Ann", "Lee", "ann@example.test", "")
+    urls = [u for u, _ in seen]
+    assert r["md_city"] == "Detroit" and not any("/v2/demographic" in u or "onlineAudience" in u for u in urls)
+
+
+def test_failed_versium_call_leaves_customer_retryable(monkeypatch):
+    _versium_world(monkeypatch, fail=("demographic",))
+    r = main.run_melissa_and_versium_waterfall("Ann", "Lee", "ann@example.test", "")
+    assert r["md_results"] is None and "_versium_checked" not in r["lifestyle_flags"]
+
+
+def test_versium_checked_recognises_csv_and_live_markers():
+    assert main.versium_checked({"versium_lifestyle_flags": {"_source": "versium_reach_csv"}})
+    assert main.versium_checked({"versium_lifestyle_flags": {"_versium_checked": "2026-11-18"}})
+    assert not main.versium_checked({"versium_lifestyle_flags": {}}) and not main.versium_checked({})

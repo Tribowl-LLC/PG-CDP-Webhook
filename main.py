@@ -455,9 +455,16 @@ def save_order_items(cur, txn_id: str, order: dict, square_customer_id: str = No
 # Override with MELISSA_ACT / MELISSA_COLS (e.g. after a subscription upgrade).
 MELISSA_ACT = os.getenv("MELISSA_ACT", "Check")
 MELISSA_COLS = os.getenv("MELISSA_COLS", "GrpAddressDetails,GrpGeocode")
+# Melissa for new customers (live enrichment). Off by default: on a credit license it can only check a
+# street address the customer already gave, which the free Census Geocoder covers. Turn on (true) for a
+# direct-mail campaign that needs verified addresses and carrier routes; /cron/melissa-geocode works either way.
+MELISSA_LIVE = os.getenv("MELISSA_LIVE", "false").strip().lower() in ("1", "true", "yes")
 # Recorded in md_results when there was no street address to check (Check needs one); a later street
 # address triggers a lookup again.
 MELISSA_NO_STREET = "NO_STREET_TO_CHECK"
+# Recorded in md_results when enrichment finished with Melissa switched off (MELISSA_LIVE=false), so the
+# customer isn't treated as "Melissa never answered" and looked up (and Versium paid) again.
+MELISSA_OFF = "MELISSA_OFF"
 CENSUS_GEOCODER_URL = "https://geocoding.geo.census.gov/geocoder/geographies/address"
 CENSUS_BUDGET_SECONDS = 6
 
@@ -589,6 +596,143 @@ def melissa_lookup(first_name: str, last_name: str, email: str, phone: str,
     }
 
 
+# ---------------------------------------------------------------------------
+# Versium REACH contact + demographic append. Versium answers with display-name fields ("Phone",
+# "Postal Address", "Estimated Net Worth", ...); they are stored under the same snake_case names the
+# Nov 18 CSV import used. Valid demographic outputs: demographic, financial, lifestyle (political and
+# full_demographic are never requested). A rejected call is logged and returns None so it stays retryable.
+# ---------------------------------------------------------------------------
+VERSIUM_DEMOGRAPHIC_OUTPUTS = ("demographic", "financial", "lifestyle")
+VERSIUM_TIMEOUT = 5
+
+
+def versium_key(name) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", str(name).lower()).strip("_")
+
+
+def versium_call(endpoint: str, v_headers: dict, params: dict, timeout: float = VERSIUM_TIMEOUT):
+    """First result of a Versium /v2/<endpoint> call: a dict ({} = no match), or None when the call failed
+    or was rejected (logged with Versium's reason)."""
+    try:
+        resp = requests.get(f"https://api.versium.com/v2/{endpoint}", headers=v_headers, params=params,
+                            timeout=timeout)
+    except Exception as e:
+        log.warning("Versium %s lookup failed: %s", endpoint, type(e).__name__)
+        return None
+    try:
+        body = resp.json()
+    except ValueError:
+        body = None
+    v = body.get("versium") if isinstance(body, dict) and isinstance(body.get("versium"), dict) else {}
+    errors = v.get("errors") or (body.get("errors") if isinstance(body, dict) else None)
+    if resp.status_code != 200 or not isinstance(body, dict) or errors:
+        log.error("Versium %s rejected (HTTP %s): %s", endpoint, resp.status_code, str(errors)[:300])
+        return None
+    results = v.get("results") or []
+    first = results[0] if isinstance(results, list) and results else {}
+    return first if isinstance(first, dict) else {}
+
+
+def parse_versium_contact(res: dict, email: str = "", phone: str = "") -> dict:
+    """Alternate emails/phones (not the ones we sent) and the postal address from a contact answer."""
+    email, phone = (email or "").strip().lower(), clean_phone(phone or "")
+    emails, phones = [], []
+    for k, v in (res or {}).items():
+        key = versium_key(k)
+        for val in (v if isinstance(v, list) else [v]):
+            val = str(val or "").strip()
+            if "email" in key and "@" in val and val.lower() != email and val.lower() not in emails:
+                emails.append(val.lower())
+            elif "phone" in key and clean_phone(val) and clean_phone(val) != phone and clean_phone(val) not in phones:
+                phones.append(clean_phone(val))
+    by = {versium_key(k): str(v or "").strip() for k, v in (res or {}).items() if not isinstance(v, list)}
+    plus4 = by.get("zip_4", "").split("-")
+    address = {"md_address1": by.get("postal_address") or by.get("address") or None,
+               "md_city": by.get("city") or None, "md_state": by.get("state") or None,
+               "zip5": (by.get("zip") or "")[:5] or None,
+               "md_plus4": plus4[1] if len(plus4) > 1 and plus4[1] else None}
+    return {"alt_emails": emails[:5], "alt_phones": phones[:5],
+            "address": address if address["md_address1"] and (address["zip5"] or address["md_city"]) else None}
+
+
+def parse_versium_demographics(res: dict) -> dict:
+    """Lifestyle flags (snake_case, blocked categories removed) plus the three wealth/auto columns."""
+    flags = strip_blocked_versium_fields(
+        {versium_key(k): str(v).strip() for k, v in (res or {}).items()
+         if v not in (None, "") and not isinstance(v, (dict, list)) and str(v).strip()})
+    auto = " ".join(x for x in (flags.get("auto_make", ""), flags.get("auto_model", "").title()) if x)
+    return {"lifestyle_flags": flags,
+            "versium_net_worth": flags.get("estimated_net_worth") or flags.get("net_worth") or None,
+            "versium_home_market_value": flags.get("home_market_value") or flags.get("home_value") or None,
+            "versium_auto_make_model": auto or None}
+
+
+def versium_checked(cust: dict) -> bool:
+    """True once Versium has answered for this customer (live API or the CSV import), match or not."""
+    flags = (cust or {}).get("versium_lifestyle_flags") or {}
+    return bool(isinstance(flags, dict) and (flags.get("_versium_checked") or flags.get("_source")))
+
+
+def run_versium_enrichment(result: dict, first_name: str, last_name: str, email: str, phone: str,
+                           address: str, city: str, state: str, zip_code: str, known: dict,
+                           started: float, online_budget: float = None) -> dict:
+    """Versium contact (alt emails/phones; the address when we have no street), then demographics, then the
+    online audience append, updating `result` in place. Geography gates use the best address known so far,
+    including one Versium just found, so excluded or out-of-state people aren't enriched further."""
+    known = known or {}
+    gate = lambda: (result.get("md_city") or known.get("md_city"), result.get("md_state") or known.get("md_state"),
+                    result.get("zip5") or known.get("zip5"))
+    g_city, g_state, g_zip = gate()
+    if not VERSIUM_API_KEY or is_detroit_excluded(g_city, g_zip):
+        return result
+    v_headers = {"x-versium-api-key": VERSIUM_API_KEY, "Accept": "application/json"}
+    street = result.get("md_address1") or address or known.get("md_address1")
+    v_input = {k: v for k, v in {
+        "first": first_name, "last": last_name, "email": email, "phone": phone,
+        "address": street, "city": result.get("md_city") or city or known.get("md_city"),
+        "state": result.get("md_state") or state or known.get("md_state"),
+        "zip": result.get("zip5") or zip_code or known.get("zip5"), "country": "US"}.items() if v}
+    outputs = ["email_multiple", "phone_multiple"] + ([] if street else ["address"])
+    contact = versium_call("contact", v_headers, {**v_input, "output[]": outputs, "rcfg_max_emails": 5})
+    if contact is None:
+        result["_versium_failed"] = True
+    else:
+        c = parse_versium_contact(contact, email, phone)
+        result["alt_emails"], result["alt_phones"] = c["alt_emails"], c["alt_phones"]
+        a = c["address"]
+        have_zip = result.get("zip5") or known.get("zip5")
+        # Only fill a missing address, and only when it doesn't contradict a ZIP we already have.
+        if a and not street and (not have_zip or not a["zip5"] or a["zip5"] == have_zip):
+            for k, v in a.items():
+                if v and not result.get(k) and not known.get(k):
+                    result[k] = v
+            result["versium_address"] = True
+            v_input.update({k2: v for k2, v in (("address", result.get("md_address1")), ("city", result.get("md_city")),
+                                                ("state", result.get("md_state")), ("zip", result.get("zip5"))) if v})
+    g_city, g_state, g_zip = gate()
+    if is_detroit_excluded(g_city, g_zip):
+        return result  # Versium's address put them in an excluded area: no demographics or ad IDs
+    demo = versium_call("demographic", v_headers, {**v_input, "output[]": list(VERSIUM_DEMOGRAPHIC_OUTPUTS)})
+    if demo is None:
+        result["_versium_failed"] = True
+    else:
+        d = parse_versium_demographics(demo)
+        result.update({k: v for k, v in d.items() if k != "lifestyle_flags"})
+        result["lifestyle_flags"] = d["lifestyle_flags"]
+    if contact is not None and demo is not None:
+        # Marks the customer as asked, so neither webhooks nor the catch-up pay for them again.
+        result["lifestyle_flags"] = {**result.get("lifestyle_flags", {}),
+                                     "_versium_checked": date.today().isoformat()}
+    budget = VERSIUM_ONLINE_BUDGET_SECONDS if online_budget is None else online_budget
+    if not known.get("versium_online_audience") and versium_online_append_eligible(g_city, g_state, g_zip) and \
+            time.monotonic() - started < budget:
+        try:
+            result["online_audience"] = fetch_versium_online_audience(v_headers, v_input) or {}
+        except Exception as e:
+            log.warning("Versium online audience lookup failed: %s", type(e).__name__)
+    return result
+
+
 def run_melissa_and_versium_waterfall(first_name: str, last_name: str, email: str, phone: str,
                                       address: str = "", city: str = "", state: str = "", zip_code: str = "",
                                       known: dict = None) -> dict:
@@ -617,10 +761,15 @@ def run_melissa_and_versium_waterfall(first_name: str, last_name: str, email: st
     if not any([email, phone, address, (first_name and last_name and zip_code)]):
         return result
 
-    # --- STEP 1: MELISSA PERSONATOR ---
-    result.update(melissa_lookup(first_name, last_name, email, phone, address, city, state, zip_code))
+    # --- STEP 1: MELISSA PERSONATOR (only when MELISSA_LIVE) ---
+    if MELISSA_LIVE:
+        result.update(melissa_lookup(first_name, last_name, email, phone, address, city, state, zip_code))
 
-    # --- STEP 1b: US CENSUS GEOCODER (free): census/school fields, coordinates when Melissa had none ---
+    # --- STEP 2: VERSIUM REACH: alt contacts, the address when there's no street, demographics, ad IDs ---
+    run_versium_enrichment(result, first_name, last_name, email, phone, address, city, state, zip_code,
+                           known, started)
+
+    # --- STEP 3: US CENSUS GEOCODER (free): census/school fields, coordinates + distance when none ---
     street = result.get("md_address1") or address
     if street and not result.get("md_census_tract") and time.monotonic() - started < CENSUS_BUDGET_SECONDS:
         census = census_geocode(street, result.get("md_city") or city,
@@ -629,61 +778,10 @@ def run_melissa_and_versium_waterfall(first_name: str, last_name: str, email: st
         if census is not None:
             result["census_checked_at"] = datetime.now(timezone.utc).isoformat()
 
-    # --- STEP 2: VERSIUM REACH (When API Key is active) ---
-    known = known or {}
-    gate_zip = result.get("zip5") or known.get("zip5")
-    gate_city = result.get("md_city") or known.get("md_city")
-    gate_state = result.get("md_state") or known.get("md_state")
-    if VERSIUM_API_KEY and not is_detroit_excluded(gate_city, gate_zip):
-        v_headers = {"x-versium-api-key": VERSIUM_API_KEY, "Accept": "application/json"}
-        v_input = {
-            "first": first_name,
-            "last": last_name,
-            "email": email,
-            "phone": phone,
-            "address": result.get("md_address1") or address,
-            "city": result.get("md_city") or city,
-            "state": result.get("md_state") or state,
-            "zip": result.get("zip5") or zip_code,
-            "country": "US",
-        }
-        try:
-            vc = requests.get(
-                "https://api.versium.com/v2/contact",
-                headers=v_headers,
-                params={**v_input, "output[]": ["email_multiple", "phone_multiple"], "rcfg_max_emails": 5},
-                timeout=5,
-            ).json()
-            v_res = (vc.get("versium", {}).get("results") or [{}])[0]
-            result["alt_emails"] = [e.strip().lower() for e in [v_res.get(f"email_{i}") for i in range(1, 6)] if e]
-            result["alt_phones"] = [clean_phone(p) for p in [v_res.get(f"phone_{i}") for i in range(1, 6)] if clean_phone(p)]
-
-            vd = requests.get(
-                "https://api.versium.com/v2/demographic",
-                headers=v_headers,
-                params={**v_input, "output[]": ["basic_demographic", "financial_household_auto", "lifestyle_interests"]},
-                timeout=5,
-            ).json()
-            vd_res = (vd.get("versium", {}).get("results") or [{}])[0]
-            result["versium_net_worth"] = vd_res.get("net_worth") or None
-            result["versium_home_market_value"] = vd_res.get("home_market_value") or None
-            result["versium_auto_make_model"] = f"{vd_res.get('auto_make', '')} {vd_res.get('auto_model', '')}".strip() or None
-            result["lifestyle_flags"] = strip_blocked_versium_fields(vd_res)
-        except Exception as e:
-            log.warning("Versium lookup failed: %s", type(e).__name__)
-
-        # Online audience append (Meta / Google / LinkedIn / TikTok IDs): local, advertisable customers only.
-        # Enrichment runs inside the webhook request, so it is skipped when the earlier lookups were
-        # already slow. Skipped or failed calls leave the column empty for /cron/versium-online-audience.
-        # Already bought (or checked with no match) for this customer: never pay again.
-        if not known.get("versium_online_audience") and \
-                versium_online_append_eligible(gate_city, gate_state, gate_zip) and \
-                time.monotonic() - started < VERSIUM_ONLINE_BUDGET_SECONDS:
-            try:
-                result["online_audience"] = fetch_versium_online_audience(v_headers, v_input) or {}
-            except Exception as e:
-                log.warning("Versium online audience lookup failed: %s", type(e).__name__)
-
+    # With Melissa off, a finished lookup is marked so it isn't retried; a failed Versium call leaves
+    # md_results empty, which every caller already treats as "try again later".
+    if not MELISSA_LIVE and result.get("md_results") is None and not result.get("_versium_failed"):
+        result["md_results"] = MELISSA_OFF
     return result
 
 
@@ -1174,7 +1272,8 @@ UPSERT_UPDATE_RULES = {
     **{c: _keep(c) for c in ENRICHMENT_FIELDS},
     "versium_alt_emails": _jsonb("versium_alt_emails", "[]"),
     "versium_alt_phones": _jsonb("versium_alt_phones", "[]"),
-    "versium_lifestyle_flags": _jsonb("versium_lifestyle_flags", "{}"),
+    # Merged, so a live lookup adds to (never wipes) what the CSV import stored.
+    "versium_lifestyle_flags": f"COALESCE({_MC}.versium_lifestyle_flags, '{{}}'::jsonb) || EXCLUDED.versium_lifestyle_flags",
     "versium_online_audience": f"COALESCE({_MC}.versium_online_audience, '{{}}'::jsonb) || EXCLUDED.versium_online_audience",
     "ts_lead_status": _keep("ts_lead_status"),
     "ts_max_guests": f"GREATEST(COALESCE({_MC}.ts_max_guests, 0), COALESCE(EXCLUDED.ts_max_guests, 0))",
@@ -1405,7 +1504,7 @@ def save_enrichment(cur, cluster_id: int, enr: dict, source: str, extra: dict = 
     if alt_p:
         sets.append("versium_alt_phones = %(alt_p)s::jsonb")
     if flags:
-        sets.append("versium_lifestyle_flags = %(flags)s::jsonb")
+        sets.append("versium_lifestyle_flags = COALESCE(versium_lifestyle_flags, '{}'::jsonb) || %(flags)s::jsonb")
     online = enr.get("online_audience") or {}
     if online:
         sets.append("versium_online_audience = COALESCE(versium_online_audience, '{}'::jsonb) || %(online)s::jsonb")
@@ -3013,6 +3112,83 @@ def melissa_geocode_catch_up(request: Request, limit: int = 100, key: Optional[s
 OA_UNCLAIMED = ("(COALESCE(versium_online_audience, '{}'::jsonb) = '{}'::jsonb OR "
                 "(versium_online_audience - '_pending' = '{}'::jsonb AND "
                 "(versium_online_audience->>'_pending')::float < extract(epoch FROM now()) - 3600))")
+
+
+VERSIUM_UNCHECKED = ("(versium_lifestyle_flags IS NULL OR (NOT versium_lifestyle_flags ? '_source' AND "
+                     "NOT versium_lifestyle_flags ? '_versium_checked' AND "
+                     "(NOT versium_lifestyle_flags ? '_versium_pending' OR "
+                     "(versium_lifestyle_flags->>'_versium_pending')::float < extract(epoch FROM now()) - 3600)))")
+
+
+@app.post("/cron/versium-enrich")
+def versium_enrich_catch_up(request: Request, limit: int = 100, key: Optional[str] = CRON_KEY_PARAM):
+    """Versium contact + demographics (and the address when there's no street, then the free Census lookup)
+    for advertisable customers Versium has never answered for. Highest scores first; about 2 paid lookups
+    per customer (3 when the online audience append is also missing); `limit` customers per call (max 500).
+    Stops early after 3 rejections in a row (credits, auth) so a bad batch doesn't keep spending."""
+    require_cron_key(request)
+    if not VERSIUM_API_KEY:
+        return {"status": "error", "message": "Missing VERSIUM_API_KEY"}
+    limit = max(1, min(int(limit), 500))
+    conn = get_conn()
+    stats = collections.Counter()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute(f"""
+                SELECT * FROM master_customers
+                WHERE {VERSIUM_UNCHECKED} AND (COALESCE(email, '') <> '' OR COALESCE(phone, '') <> '')
+                ORDER BY bowler_value_score DESC NULLS LAST, true_lifetime_spend DESC NULLS LAST, cluster_id;""")
+            rows = [r for r in cur.fetchall() if not is_detroit_excluded(r["md_city"], r["zip5"])][:limit]
+        consecutive_failures = 0
+        for r in rows:
+            with conn, conn.cursor() as cur:  # claim first so overlapping runs never pay twice
+                cur.execute(f"""UPDATE master_customers SET versium_lifestyle_flags =
+                                    COALESCE(versium_lifestyle_flags, '{{}}'::jsonb)
+                                    || jsonb_build_object('_versium_pending', extract(epoch FROM now()))
+                                WHERE cluster_id = %s AND {VERSIUM_UNCHECKED} RETURNING cluster_id;""",
+                            (r["cluster_id"],))
+                if not cur.fetchone():
+                    continue
+            enr = {"alt_emails": [], "alt_phones": [], "lifestyle_flags": {}, "online_audience": {},
+                   "md_city": r["md_city"], "md_state": r["md_state"], "zip5": r["zip5"]}
+            run_versium_enrichment(enr, r["first_name"] or "", r["last_name"] or "", r["email"] or "",
+                                   r["phone"] or "", r["md_address1"] or "", r["md_city"] or "",
+                                   r["md_state"] or "", r["zip5"] or "", r, time.monotonic(),
+                                   online_budget=float("inf"))
+            stats["checked"] += 1
+            if enr.get("versium_address"):
+                stats["address_found"] += 1
+                census = census_geocode(enr["md_address1"], enr.get("md_city") or "", enr.get("md_state") or "",
+                                        enr.get("zip5") or "")
+                apply_census(enr, census or {})
+                if census is not None:
+                    enr["census_checked_at"] = datetime.now(timezone.utc).isoformat()
+                    stats["census_matched" if census else "census_no_match"] += 1
+            with conn, conn.cursor() as cur:
+                cur.execute("UPDATE master_customers SET versium_lifestyle_flags = versium_lifestyle_flags "
+                            "- '_versium_pending' WHERE cluster_id = %s;", (r["cluster_id"],))
+                if enr.get("_versium_failed") and not enr.get("versium_address") and not enr.get("online_audience"):
+                    stats["failed_retry_later"] += 1
+                    consecutive_failures += 1
+                    if consecutive_failures >= 3:
+                        break
+                    continue
+                consecutive_failures = 0
+                if enr.get("_versium_failed"):
+                    stats["partly_failed_retry_later"] += 1
+                elif set(enr.get("lifestyle_flags") or {}) - {"_versium_checked"}:
+                    stats["demographics_found"] += 1
+                else:
+                    stats["no_demographic_match"] += 1
+                stats["alt_contacts_found"] += int(bool(enr["alt_emails"] or enr["alt_phones"]))
+                cust = save_enrichment(cur, r["cluster_id"], enr, "versium")
+                rescore_customer(cur, cust, exact=True)
+        out = {"status": "versium_enrich", "eligible_in_batch": len(rows), **stats,
+               "stopped_early": consecutive_failures >= 3}
+        log.info("Versium enrich catch-up: %s", out)
+        return out
+    finally:
+        conn.close()
 
 
 @app.post("/cron/versium-online-audience")

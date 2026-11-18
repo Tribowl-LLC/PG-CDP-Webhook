@@ -446,11 +446,11 @@ CENSUS_BUDGET_SECONDS = 6
 
 def census_geocode(address: str, city: str = "", state: str = "", zip_code: str = ""):
     """US Census Geocoder (free, no key): coordinates, distance, census tract/block, county and school
-    districts for a street address. Only the address is sent. Returns {} when the Census has no match,
-    or None when the call failed (so it is retried later)."""
+    districts for a street address. Only the address is sent. Returns {} when the Census answered with no
+    match, or None when it wasn't asked (not enough address) or the call failed, so it stays retryable."""
     address = (address or "").strip()
     if not address or not ((zip_code or "").strip() or ((city or "").strip() and (state or "").strip())):
-        return {}
+        return None
     try:
         resp = requests.get(CENSUS_GEOCODER_URL, params={
             "street": address, "city": city or "", "state": state or "", "zip": (zip_code or "")[:5],

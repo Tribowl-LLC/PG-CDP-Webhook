@@ -280,7 +280,8 @@ def test_census_geocode_parses_and_handles_no_match_and_failure(monkeypatch):
     assert (out["md_census_tract"], out["md_census_block"], out["md_county_name"]) == ("141000", "2001", "Oakland")
     assert out["md_unified_school_district_name"] == "Novi Community School District"
     assert 3 < out["distance_miles"] < 6 and set(sent) >= {"street", "zip"} and "email" not in sent
-    assert main.census_geocode("", "Novi", "MI", "48375") == {}            # no street: nothing to ask
+    assert main.census_geocode("", "Novi", "MI", "48375") is None          # no street: not asked
+    assert main.census_geocode("1 Main St", "", "", "") is None            # no ZIP or city/state: not asked
     monkeypatch.setattr(main.requests, "get", lambda url, **kw: FakeResponse(200, {"result": {"addressMatches": []}}))
     assert main.census_geocode("1 Main St", "Novi", "MI", "48375") == {}
     def boom(url, **kw):
@@ -306,3 +307,12 @@ def test_waterfall_adds_census_after_melissa(monkeypatch):
     monkeypatch.setattr(main.requests, "get", lambda url, **kw: FakeResponse(200, CENSUS_BODY))
     r = main.run_melissa_and_versium_waterfall("A", "B", "a@b.com", "", "1 Main St", "Novi", "MI", "48375")
     assert r["md_census_tract"] == "141000" and r["census_checked_at"] and r["distance_miles"]
+
+
+def test_unaskable_census_address_is_not_marked_checked(monkeypatch):
+    calls = []
+    monkeypatch.setattr(main, "MELISSA_API_KEY", None)
+    monkeypatch.setattr(main, "VERSIUM_API_KEY", None)
+    monkeypatch.setattr(main.requests, "get", lambda url, **kw: calls.append(url))
+    r = main.run_melissa_and_versium_waterfall("A", "B", "a@b.com", "", "1 Main St")
+    assert calls == [] and "census_checked_at" not in r

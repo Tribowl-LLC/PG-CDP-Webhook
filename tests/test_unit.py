@@ -80,3 +80,25 @@ def test_accepted_audience_upload_reports_counts(fake, monkeypatch):
     monkeypatch.setattr(main.requests, "post",
                         lambda url, **kw: FakeResponse(200, {"num_received": 2, "num_invalid_entries": 0}))
     assert main.upload_audience_rows(main.AUDIENCE_PG1_CORP, [[], []]) == {"ok": True, "received": 2, "invalid": 0}
+
+
+def test_versium_online_append_only_for_local_advertisable_customers():
+    assert main.versium_online_append_eligible("Novi", "MI", "48375")
+    assert main.versium_online_append_eligible("Novi", "mi", "48375")
+    assert main.versium_online_append_eligible(None, None, None)          # unknown location: allowed
+    assert main.versium_online_append_eligible("Grosse Pointe", "MI", "48230")
+    assert not main.versium_online_append_eligible("Detroit", "MI", "48226")
+    assert not main.versium_online_append_eligible("Southfield", "MI", "48075")
+    assert not main.versium_online_append_eligible(None, None, "48224")    # Detroit ZIP, no city/state
+    assert not main.versium_online_append_eligible("Toledo", "OH", "43604")
+    assert not main.versium_online_append_eligible("Austin", "TX", "")
+
+
+def test_blocked_versium_fields_are_stripped():
+    raw = {"net_worth": "$100,000-249,999", "presence_of_children": "Yes", "Credit Rating": "750-799",
+           "number_of_credit_lines": "2", "ethnic_group": "x", "Religion": "x", "party_affiliation": "x",
+           "donor_political": "Yes", "donor_conservative_politics": "Yes", "donor_liberal_politics": "Yes",
+           "credit_card_holder_bank": "Yes", "donor_childrens_causes": "Yes"}
+    kept = main.strip_blocked_versium_fields(raw)
+    assert set(kept) == {"net_worth", "presence_of_children", "credit_card_holder_bank", "donor_childrens_causes"}
+    assert main.strip_blocked_versium_fields(None) == {}

@@ -193,6 +193,28 @@ def is_detroit_excluded(city, zip5) -> bool:
     return z.startswith("482")
 
 
+# Versium online audience append (Meta / TikTok / LinkedIn IDs) is only for customers we can advertise to
+# locally: never excluded areas, never out of state. Unknown state is allowed so Versium can help locate them.
+def versium_online_append_eligible(city, state, zip5) -> bool:
+    if is_detroit_excluded(city, zip5):
+        return False
+    st = str(state or "").strip().upper()
+    return st in ("", "MI", "MICHIGAN")
+
+
+# Versium fields we never store or use: credit data (owner rule: no credit scores) and sensitive
+# categories (owner decision Nov 18, 2026). Matched by substring of the normalized field name.
+VERSIUM_BLOCKED_FIELD_PARTS = ("credit_rating", "credit_lines", "ethnic", "religion", "party_affiliation",
+                               "politic")
+
+
+def strip_blocked_versium_fields(fields: dict) -> dict:
+    def norm(k):
+        return re.sub(r"[^a-z0-9]+", "_", str(k).lower()).strip("_")
+    return {k: v for k, v in (fields or {}).items()
+            if not any(part in norm(k) for part in VERSIUM_BLOCKED_FIELD_PARTS)}
+
+
 def get_threshold(cur) -> int:
     cur.execute("SELECT current_score_threshold FROM cdp_thermostat_config WHERE id = 1;")
     return int(cur.fetchone()["current_score_threshold"])
@@ -461,7 +483,7 @@ def run_melissa_and_versium_waterfall(first_name: str, last_name: str, email: st
             result["versium_net_worth"] = vd_res.get("net_worth") or None
             result["versium_home_market_value"] = vd_res.get("home_market_value") or None
             result["versium_auto_make_model"] = f"{vd_res.get('auto_make', '')} {vd_res.get('auto_model', '')}".strip() or None
-            result["lifestyle_flags"] = vd_res or {}
+            result["lifestyle_flags"] = strip_blocked_versium_fields(vd_res)
         except Exception as e:
             log.warning("Versium lookup failed: %s", type(e).__name__)
 

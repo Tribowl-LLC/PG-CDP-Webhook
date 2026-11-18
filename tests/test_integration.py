@@ -993,6 +993,9 @@ def test_versium_catch_up_enriches_unchecked_and_marks_them(client, db, fake, ui
     fresh = _new_customer(db, uid, f"v-{uid}@example.test")
     done = _new_customer(db, uid, f"vcsv-{uid}@example.test", flags={"_source": "versium_reach_csv", "pets": "Y"})
     down = _new_customer(db, uid, f"vdown-{uid}@example.test")
+    # The test database keeps earlier runs' customers; rank this run's first.
+    db.execute("UPDATE master_customers SET bowler_value_score = 0 WHERE bowler_value_score >= 100000 "
+               "AND cluster_id NOT IN (%s, %s, %s)", (fresh, done, down))
     r = client.post("/cron/versium-enrich?limit=500", headers=CRON).json()
     assert r["status"] == "versium_enrich"
     c = customer_row(db, fresh)
@@ -1029,3 +1032,178 @@ def test_webhook_versium_merges_with_csv_flags_and_melissa_off_marks_done(client
                                                       "last_name": f"Vee{uid}", "email": email, "amount": 30})
     assert sum(1 for m, u, kw in fake.calls if "versium" in u) == n  # finished: not looked up again
     assert customer_row(db, r["cluster_id"])["versium_lifestyle_flags"]["pets"] == "Y"
+
+
+# --- Deferred enrichment ---------------------------------------------------------------------
+
+@pytest.fixture
+def deferred(monkeypatch):
+    monkeypatch.setattr(main, "ENRICH_DELAY_MINUTES", 15)
+    monkeypatch.setattr(main, "MELISSA_LIVE", False)
+    monkeypatch.setattr(main, "VERSIUM_API_KEY", "test-versium-key")
+
+
+def run_worker_now(db, cluster_id):
+    db.execute("UPDATE master_customers SET enrich_after = NOW() - INTERVAL '1 second' "
+               "WHERE cluster_id = %s AND enrich_after IS NOT NULL", (cluster_id,))
+    return main.process_pending_enrichment(limit=500)
+
+
+def versium_emails(fake):
+    return [(kw.get("params") or {}).get("email") for m, u, kw in fake.calls if "api.versium.com" in u]
+
+
+def test_square_then_webres_enriches_once_on_merged_details(client, db, fake, uid, deferred):
+    email = f"sqwr-{uid}@example.test"
+    phone = "248" + str(int(uid[:6], 16) % 10_000_000).zfill(7)
+    r = square_post(client, payment(f"DP{uid}", 6800, email=email, name=f"DEFER/SAM{uid}", zip5="48375",
+                                    etype="payment.created")).json()
+    cid = r["cluster_id"]
+    c = customer_row(db, cid)
+    assert c["enrich_after"] is not None and fake.meta_events() == [] and versium_emails(fake) == []
+    assert capi_rows(db, f"sq_pay_DP{uid}")[0]["meta_response_status"] == "DEFERRED_ENRICHMENT"
+    # Five minutes later the WebRes booking arrives with a phone; it merges and the window doesn't restart.
+    w = client.post("/webhooks/webres", headers=WH, json={
+        "reservation_id": f"DW{uid}", "first_name": "Sam", "last_name": f"Defer{uid}", "email": email,
+        "phone": phone, "amount": 68}).json()
+    assert w["cluster_id"] == cid
+    c2 = customer_row(db, cid)
+    assert c2["enrich_after"] == c["enrich_after"] and c2["enrich_inputs"]["phone"] == phone
+    assert fake.meta_events() == []
+    out = run_worker_now(db, cid)
+    assert out["enriched"] >= 1
+    c3 = customer_row(db, cid)
+    assert c3["enrich_after"] is None and c3["md_address1"] == "500 Versium Way" and c3["md_census_tract"]
+    assert c3["versium_lifestyle_flags"]["_versium_checked"] and c3["md_results"] == main.MELISSA_OFF
+    contact = [kw["params"] for m, u, kw in fake.calls if "/v2/contact" in u and kw["params"].get("email") == email]
+    assert len(contact) == 1 and contact[0]["phone"] == phone   # one lookup, with the WebRes phone
+    sent = {e["event_id"] for e in fake.meta_events()}
+    assert f"sq_pay_DP{uid}" in sent and f"wr_DW{uid}" in sent
+    assert capi_rows(db, f"sq_pay_DP{uid}")[0]["sent_to_meta"] is True
+
+
+def test_deferred_events_dropped_when_versium_address_is_excluded(client, db, fake, uid, deferred, monkeypatch):
+    orig = fake._versium
+
+    def detroit(url, params):
+        r = orig(url, params)
+        if "/v2/contact" in url and r.status_code == 200:
+            body = r.json()
+            body["versium"]["results"][0].update({"City": "Detroit", "Zip": "48226", "Zip+4": ""})
+        return r
+    monkeypatch.setattr(fake, "_versium", detroit)
+    email = f"sqdet-{uid}@example.test"
+    # No card ZIP, so nothing contradicts the address Versium finds.
+    cid = square_post(client, payment(f"DD{uid}", 4000, email=email, zip5=None,
+                                      etype="payment.created")).json()["cluster_id"]
+    run_worker_now(db, cid)
+    row = capi_rows(db, f"sq_pay_DD{uid}")[0]
+    assert row["sent_to_meta"] is False and row["meta_response_status"] == "DROPPED_AFTER_ENRICHMENT"
+    assert row["meta_response_body"] == "excluded_area"
+    assert not any("/v2/demographic" in u for m, u, kw in fake.calls if (kw.get("params") or {}).get("email") == email)
+    assert main.retry_unsent_events(db)["still_unsent"] >= 0
+    assert capi_rows(db, f"sq_pay_DD{uid}")[0]["meta_response_status"] == "DROPPED_AFTER_ENRICHMENT"
+
+
+def test_versium_failure_retries_later_then_releases(client, db, fake, uid, deferred):
+    email = f"vdown-{uid}@example.test"
+    cid = client.post("/webhooks/webres", headers=WH, json={
+        "reservation_id": f"VD{uid}", "first_name": "Down", "last_name": f"V{uid}", "email": email,
+        "amount": 40}).json()["cluster_id"]
+    assert run_worker_now(db, cid).get("retry_later") == 1
+    c = customer_row(db, cid)
+    assert c["enrich_after"] is not None and c["enrich_attempts"] == 1
+    assert capi_rows(db, f"wr_VD{uid}")[0]["meta_response_status"] == "DEFERRED_ENRICHMENT"
+    db.execute("UPDATE master_customers SET enrich_attempts = %s WHERE cluster_id = %s",
+               (main.ENRICH_MAX_ATTEMPTS, cid))
+    run_worker_now(db, cid)  # gives up on Versium, but the purchase still reaches Meta
+    assert customer_row(db, cid)["enrich_after"] is None
+    assert capi_rows(db, f"wr_VD{uid}")[0]["sent_to_meta"] is True
+
+
+def test_unmatched_customer_retried_once_with_new_details(client, db, fake, uid, deferred):
+    first = f"vnomatch-{uid}@example.test"
+    cid = client.post("/webhooks/webres", headers=WH, json={
+        "reservation_id": f"NM{uid}", "first_name": "No", "last_name": f"Match{uid}", "email": first,
+        "amount": 30}).json()["cluster_id"]
+    run_worker_now(db, cid)
+    assert customer_row(db, cid)["versium_lifestyle_flags"].get("_versium_checked")
+    assert customer_row(db, cid)["md_results"] == main.MELISSA_OFF
+    # Weeks later a booking with the same name and a different email that Versium does know.
+    second = f"newmail-{uid}@example.test"
+    client.post("/webhooks/webres", headers=WH, json={
+        "reservation_id": f"NM2{uid}", "first_name": "No", "last_name": f"Match{uid}", "email": second,
+        "phone": "248" + str(int(uid[:6], 16) % 10_000_000).zfill(7), "amount": 30})
+    c = customer_row(db, cid)
+    assert c["enrich_after"] is not None and c["enrich_inputs"].get("_retry") is True
+    run_worker_now(db, cid)
+    c = customer_row(db, cid)
+    assert second in versium_emails(fake) and c["versium_lifestyle_flags"]["_versium_retried"]
+    assert c["versium_lifestyle_flags"]["presence_of_children"] == "Yes"
+    # Matched now, so a third new detail never triggers another paid lookup.
+    n = len(versium_emails(fake))
+    client.post("/webhooks/webres", headers=WH, json={
+        "reservation_id": f"NM3{uid}", "first_name": "No", "last_name": f"Match{uid}",
+        "email": f"third-{uid}@example.test", "amount": 30})
+    assert customer_row(db, cid)["enrich_after"] is None and len(versium_emails(fake)) == n
+
+
+def test_catch_up_leaves_waiting_customers_to_the_worker(client, db, fake, uid, deferred):
+    email = f"wait-{uid}@example.test"
+    cid = client.post("/webhooks/webres", headers=WH, json={
+        "reservation_id": f"WT{uid}", "first_name": "Wait", "last_name": f"Er{uid}", "email": email,
+        "amount": 20}).json()["cluster_id"]
+    db.execute("UPDATE master_customers SET bowler_value_score = 100000 WHERE cluster_id = %s", (cid,))
+    client.post("/cron/versium-enrich?limit=500", headers=CRON)
+    assert email not in versium_emails(fake) and customer_row(db, cid)["enrich_after"] is not None
+
+
+def test_details_arriving_during_lookup_get_a_second_look(client, db, fake, uid, deferred, monkeypatch):
+    email = f"vnomatch-race-{uid}@example.test"
+    cid = client.post("/webhooks/webres", headers=WH, json={
+        "reservation_id": f"RC{uid}", "first_name": "Race", "last_name": f"Y{uid}", "email": email,
+        "amount": 20}).json()["cluster_id"]
+    real = main.run_melissa_and_versium_waterfall
+    late = f"late-{uid}@example.test"
+
+    def waterfall_with_webhook_meanwhile(*a, **kw):
+        out = real(*a, **kw)
+        client.post("/webhooks/webres", headers=WH, json={
+            "reservation_id": f"RC2{uid}", "first_name": "Race", "last_name": f"Y{uid}", "email": email,
+            "phone": "248" + str(int(uid[6:12], 16) % 10_000_000).zfill(7), "amount": 20})
+        db.execute("UPDATE master_customers SET enrich_inputs = enrich_inputs || %s::jsonb WHERE cluster_id = %s",
+                   (json.dumps({"email": late}), cid))
+        return out
+    monkeypatch.setattr(main, "run_melissa_and_versium_waterfall", waterfall_with_webhook_meanwhile)
+    assert run_worker_now(db, cid).get("rerun_new_details") == 1
+    c = customer_row(db, cid)
+    assert c["enrich_after"] is not None and c["enrich_inputs"].get("_retry") is True
+    assert capi_rows(db, f"wr_RC{uid}")[0]["meta_response_status"] == "DEFERRED_ENRICHMENT"
+    monkeypatch.setattr(main, "run_melissa_and_versium_waterfall", real)
+    run_worker_now(db, cid)
+    assert late in versium_emails(fake) and customer_row(db, cid)["enrich_after"] is None
+
+
+def test_released_events_log_the_final_score_and_threshold(client, db, fake, uid, deferred):
+    cid = client.post("/webhooks/webres", headers=WH, json={
+        "reservation_id": f"SC{uid}", "first_name": "Score", "last_name": f"Z{uid}",
+        "email": f"score-{uid}@example.test", "amount": 20}).json()["cluster_id"]
+    db.execute("UPDATE capi_events_log SET bowler_value_score = -1, threshold_at_send = -1 WHERE event_id = %s",
+               (f"wr_SC{uid}",))
+    run_worker_now(db, cid)
+    row = capi_rows(db, f"wr_SC{uid}")[0]
+    assert row["threshold_at_send"] == 55 and row["bowler_value_score"] == customer_row(db, cid)["bowler_value_score"]
+
+
+def test_melissa_household_key_still_merges_in_deferred_mode(client, db, fake, uid, deferred, monkeypatch):
+    monkeypatch.setattr(main, "MELISSA_LIVE", True)
+    mik = f"MIK-{uid}"
+    owner = client.post("/webhooks/webres", headers=WH, json={
+        "reservation_id": f"MK{uid}", "first_name": "House", "last_name": f"Hold{uid}",
+        "email": f"house-{uid}@example.test", "amount": 20}).json()["cluster_id"]
+    db.execute("INSERT INTO customer_identities (cluster_id, id_type, id_value, source_system) "
+               "VALUES (%s, 'md_mik', %s, 'test')", (owner, mik))
+    monkeypatch.setattr(main, "melissa_lookup", lambda *a, **kw: {"md_mik": mik, "md_address1": "1 Same St",
+                                                                  "md_results": "AS01"})
+    r = client.post("/webhooks/partywirks", headers=WH, json=fake.add_partywirks(uid, f"26{int(uid, 16)}"))
+    assert r.json().get("cluster_id") == owner

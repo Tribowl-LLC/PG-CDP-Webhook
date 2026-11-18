@@ -7,6 +7,7 @@ import json
 import base64
 import hashlib
 import logging
+import asyncio
 import collections
 from datetime import date, datetime, timezone
 from typing import Optional
@@ -24,10 +25,24 @@ logging.basicConfig(level=logging.INFO)
 
 
 
+async def _enrichment_worker():
+    """Every minute: enrich customers whose waiting window has passed (see process_pending_enrichment)."""
+    while True:
+        try:
+            await run_in_threadpool(process_pending_enrichment)
+        except Exception as e:
+            log.exception("Deferred enrichment run failed: %s", type(e).__name__)
+        await asyncio.sleep(ENRICH_WORKER_INTERVAL_SECONDS)
+
+
 @asynccontextmanager
 async def lifespan(_app):
     await run_in_threadpool(sync_cluster_sequence)
+    # Always on: with ENRICH_DELAY_MINUTES=0 it just drains customers still waiting from before the switch.
+    worker = asyncio.create_task(_enrichment_worker()) if DATABASE_URL else None
     yield
+    if worker:
+        worker.cancel()
 
 
 app = FastAPI(title="Perfect Game CDP, Enrichment & Meta CAPI Engine", lifespan=lifespan)
@@ -71,6 +86,15 @@ TRIPLESEAT_SCOPES = os.getenv("TRIPLESEAT_SCOPES", "").strip()
 TRIPLESEAT_AUTHORIZE_URL = "https://login.tripleseat.com/oauth2/authorize"
 TRIPLESEAT_TOKEN_URL = "https://api.tripleseat.com/oauth2/token"
 TRIPLESEAT_API = os.getenv("TRIPLESEAT_API", "https://api.tripleseat.com/v1")
+
+# Deferred enrichment. A WebRes / Partywirks booking's Square payment arrives first and the booking details
+# (email, phone, address) follow a few minutes later, so webhooks only save the customer and Versium, Census,
+# scoring and the Meta events run ENRICH_DELAY_MINUTES after the first webhook, on the merged record.
+# 0 = enrich inside the webhook, as before (also the switch-back if anything goes wrong).
+ENRICH_DELAY_MINUTES = int(os.getenv("ENRICH_DELAY_MINUTES", "15"))
+ENRICH_MAX_ATTEMPTS = 5            # Versium failures retried 15, 30, 45, 60 min later, then given up (nightly catch-up)
+ENRICH_WORKER_INTERVAL_SECONDS = 60
+ENRICH_BATCH = 20                  # customers per worker run
 
 # Your 4 Live Non-Detroit Meta Custom Audience IDs
 AUDIENCE_PG1_CORP = os.getenv("AUDIENCE_PG1_CORP", "120246555016470358")
@@ -769,7 +793,7 @@ def run_versium_enrichment(result: dict, first_name: str, last_name: str, email:
 
 def run_melissa_and_versium_waterfall(first_name: str, last_name: str, email: str, phone: str,
                                       address: str = "", city: str = "", state: str = "", zip_code: str = "",
-                                      known: dict = None) -> dict:
+                                      known: dict = None, unhurried: bool = False) -> dict:
     """Step 1: Melissa Personator (Address, Lat/Long, Demographics). Step 2: Versium REACH (Alt Emails/Phones, Wealth).
 
     `md_results` is only set when Melissa actually answered. It stays None when Melissa is not
@@ -796,19 +820,21 @@ def run_melissa_and_versium_waterfall(first_name: str, last_name: str, email: st
         return result
 
     # --- STEP 1: MELISSA PERSONATOR (only when MELISSA_LIVE) ---
-    if MELISSA_LIVE:
+    if MELISSA_LIVE and not (known or {}).get("md_mik"):  # not twice: the webhook may have run it already
         result.update(melissa_lookup(first_name, last_name, email, phone, address, city, state, zip_code))
 
     if address and not result.get("md_address1"):
         result["md_address1"] = address.strip()  # the customer's own street (Melissa off or no answer)
 
     # --- STEP 2: VERSIUM REACH: alt contacts, the address when there's no street, demographics, ad IDs ---
+    # unhurried (the deferred worker): nobody is waiting, so no step is skipped for time.
     run_versium_enrichment(result, first_name, last_name, email, phone, address, city, state, zip_code,
-                           known, started)
+                           known, started, online_budget=float("inf") if unhurried else None)
 
     # --- STEP 3: US CENSUS GEOCODER (free): census/school fields, coordinates + distance when none ---
     street = result.get("md_address1") or address
-    if street and not result.get("md_census_tract") and time.monotonic() - started < CENSUS_BUDGET_SECONDS:
+    if street and not result.get("md_census_tract") and \
+            (unhurried or time.monotonic() - started < CENSUS_BUDGET_SECONDS):
         census = census_geocode(street, result.get("md_city") or city,
                                 result.get("md_state") or state, result.get("zip5") or zip_code)
         apply_census(result, census or {})
@@ -1009,8 +1035,8 @@ def upload_audience_rows(aud_id: str, rows: list) -> dict:
 
 def sync_customer_to_meta_custom_audiences(cust: dict):
     """Pushes one qualified non-excluded customer into the Meta value-based Custom Audiences they belong in."""
-    if not META_ACCESS_TOKEN:
-        return
+    if not META_ACCESS_TOKEN or cust.get("enrich_after"):
+        return  # a customer waiting for enrichment is synced by the worker once it's done
     targets, ltv = audience_targets(cust)
     row = audience_row(cust, ltv)
     for aud_id in targets:
@@ -1029,6 +1055,15 @@ def fire_meta_capi_event(cur, cust: dict, event_name: str, value: float, thresho
     cur.execute("SELECT sent_to_meta FROM capi_events_log WHERE event_id = %s;", (event_id,))
     prior = cur.fetchone()
     if prior and prior["sent_to_meta"]:
+        return
+    if cust.get("enrich_after"):
+        # Waiting for enrichment: hold the event until the address (Detroit gate) and score are known.
+        cur.execute("""INSERT INTO capi_events_log (event_id, cluster_id, event_name, event_value, bowler_value_score,
+                           threshold_at_send, sent_to_meta, meta_response_status, meta_response_body)
+                       VALUES (%s, %s, %s, %s, %s, %s, FALSE, 'DEFERRED_ENRICHMENT', %s)
+                       ON CONFLICT (event_id) DO NOTHING;""",
+                    (event_id, cust["cluster_id"], event_name, value, int(cust.get("bowler_value_score") or 0),
+                     threshold, action_source))
         return
 
     cluster_id = cust["cluster_id"]
@@ -1076,14 +1111,18 @@ def fire_meta_capi_event(cur, cust: dict, event_name: str, value: float, thresho
     )
 
 
+# Held for enrichment, or dropped once enrichment showed the customer doesn't qualify: never retried as failures.
+_NOT_HELD = "COALESCE(meta_response_status, '') NOT IN ('DEFERRED_ENRICHMENT', 'DROPPED_AFTER_ENRICHMENT')"
+
+
 def _action_source_for(event_id: str) -> str:
     return "physical_store" if event_id.startswith("sq_pay_") else "system_generated"
 
 
 def retry_unsent_event(cur, event_id: str) -> bool:
     """Re-sends a logged event Meta didn't accept. Safe to call for any ID: does nothing otherwise."""
-    cur.execute("SELECT * FROM capi_events_log WHERE event_id = %s AND NOT sent_to_meta FOR UPDATE SKIP LOCKED;",
-                (event_id,))
+    cur.execute("SELECT * FROM capi_events_log WHERE event_id = %s AND NOT sent_to_meta "
+                f"AND {_NOT_HELD} FOR UPDATE SKIP LOCKED;", (event_id,))
     row = cur.fetchone()
     if not row or not row["cluster_id"]:
         return False
@@ -1100,7 +1139,7 @@ def retry_unsent_event(cur, event_id: str) -> bool:
 def retry_unsent_events(cur, max_age_days: int = 6) -> dict:
     """Re-sends every event Meta hasn't accepted yet. Meta only takes events up to 7 days old."""
     cur.execute("SELECT event_id FROM capi_events_log WHERE NOT sent_to_meta "
-                "AND sent_at > NOW() - make_interval(days => %s) ORDER BY sent_at;", (max_age_days,))
+                f"AND {_NOT_HELD} AND sent_at > NOW() - make_interval(days => %s) ORDER BY sent_at;", (max_age_days,))
     ids = [r["event_id"] for r in cur.fetchall()]
     tried = sum(1 for eid in ids if retry_unsent_event(cur, eid))
     cur.execute("SELECT COUNT(*) AS n FROM capi_events_log WHERE event_id = ANY(%s) AND NOT sent_to_meta;", (ids,))
@@ -1390,6 +1429,36 @@ def _needs_enrichment(existing, email: str, phone: str, data: dict) -> bool:
     return bool(never_answered or new_contact or new_address)
 
 
+def versium_matched(cust: dict) -> bool:
+    """Versium returned demographics for this customer (not just our bookkeeping markers)."""
+    flags = (cust or {}).get("versium_lifestyle_flags") or {}
+    return isinstance(flags, dict) and any(not str(k).startswith("_") for k in flags)
+
+
+def enrichment_plan(existing, email: str, phone: str, data: dict) -> Optional[str]:
+    """With deferred enrichment: "new" (first sighting), "pending" (already waiting: just add the details),
+    "retry" (Versium found nothing before and this webhook brings an email/phone/street we didn't have; once),
+    "legacy" (never answered, same rule as before), or None."""
+    has_input = bool(email or phone or data.get("address") or data.get("zip"))
+    if not has_input:
+        return None
+    if existing is None:
+        return "new"
+    if existing.get("enrich_after"):
+        return "pending"
+    flags = existing.get("versium_lifestyle_flags") or {}
+    if versium_checked(existing) and not versium_matched(existing) and not flags.get("_versium_retried") \
+            and not is_detroit_excluded(existing.get("md_city"), existing.get("zip5")):
+        alt_e = [str(x).lower() for x in existing.get("versium_alt_emails") or []]
+        alt_p = [clean_phone(x) for x in existing.get("versium_alt_phones") or []]
+        new_email = email and email != (existing.get("email") or "").strip().lower() and email not in alt_e
+        new_phone = phone and phone != clean_phone(existing.get("phone") or "") and phone not in alt_p
+        new_street = bool((data.get("address") or "").strip()) and not existing.get("md_address1")
+        if new_email or new_phone or new_street:
+            return "retry"
+    return "legacy" if _needs_enrichment(existing, email, phone, data) else None
+
+
 def upsert_and_enrich_customer(cur, data: dict) -> tuple:
     """Resolves identity across Square/WebRes/Tripleseat/Partywirks, enriches via Melissa+Versium
     when worthwhile, and upserts master_customers.
@@ -1411,10 +1480,12 @@ def upsert_and_enrich_customer(cur, data: dict) -> tuple:
         cur.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0));", (key,))
     existing = _find_existing(cur, sq_id, email, phone, first_name, last_name)
 
-    # 2. Progressive enrichment
-    needs_enrichment = _needs_enrichment(existing, email, phone, data)
+    # 2. Progressive enrichment: deferred (scheduled below) or, with ENRICH_DELAY_MINUTES=0, right here
+    deferred = ENRICH_DELAY_MINUTES > 0
+    plan = enrichment_plan(existing, email, phone, data) if deferred else None
+    needs_enrichment = bool(plan) if deferred else _needs_enrichment(existing, email, phone, data)
     enriched = {}
-    if needs_enrichment:
+    if needs_enrichment and not deferred:
         prior = existing or {}
         enriched = run_melissa_and_versium_waterfall(
             first_name or prior.get("first_name") or "",
@@ -1427,20 +1498,32 @@ def upsert_and_enrich_customer(cur, data: dict) -> tuple:
             data.get("zip") or "",
             known=prior,
         )
-        if not existing and enriched.get("md_mik"):
-            cur.execute(
-                """
-                SELECT mc.* FROM customer_identities ci
-                JOIN master_customers mc ON mc.cluster_id = ci.cluster_id
-                WHERE ci.id_type = 'md_mik' AND ci.id_value = %s LIMIT 1;
-                """,
-                (enriched["md_mik"],),
-            )
-            existing = cur.fetchone()
+    elif deferred and plan == "new" and MELISSA_LIVE and (data.get("address") or "").strip():
+        # Melissa's household key can match this person to an existing household, which must be known before
+        # a new record is created; so with Melissa on, its street check stays in the webhook (about a second).
+        street = {"md_address1": data["address"].strip(), "zip5": str(data.get("zip") or "")[:5] or None,
+                  "md_city": data.get("city") or None, "md_state": data.get("state") or None}
+        enriched = {**street, **{k: v for k, v in melissa_lookup(
+            first_name, last_name, email, phone, data.get("address") or "", data.get("city") or "",
+            data.get("state") or "", data.get("zip") or "").items() if v is not None}}
+    elif not (existing or {}).get("md_address1") and (data.get("address") or "").strip():
+        # Keep the street we were handed (the deferred lookup and Census work from it).
+        enriched = {"md_address1": data["address"].strip(), "zip5": str(data.get("zip") or "")[:5] or None,
+                    "md_city": data.get("city") or None, "md_state": data.get("state") or None}
     elif data.get("zip") and not (existing or {}).get("zip5"):
         # No paid lookup needed, but keep the ZIP we were handed so the geo gate can use it.
         enriched = {"zip5": str(data["zip"])[:5], "md_city": data.get("city") or None,
                     "md_state": data.get("state") or None}
+    if not existing and enriched.get("md_mik"):
+        cur.execute(
+            """
+            SELECT mc.* FROM customer_identities ci
+            JOIN master_customers mc ON mc.cluster_id = ci.cluster_id
+            WHERE ci.id_type = 'md_mik' AND ci.id_value = %s LIMIT 1;
+            """,
+            (enriched["md_mik"],),
+        )
+        existing = cur.fetchone()
 
     if existing:
         cluster_id = existing["cluster_id"]
@@ -1506,6 +1589,18 @@ def upsert_and_enrich_customer(cur, data: dict) -> tuple:
     # instead of silently merging two different people.
     cur.execute(sql + " RETURNING *;", vals)
     cust = cur.fetchone()
+    if plan:
+        # Start (or keep) the waiting window; the first webhook's time counts, later ones just add details.
+        inputs = {k: v for k, v in {"email": email, "phone": phone, "address": (data.get("address") or "").strip(),
+                                    "city": data.get("city"), "state": data.get("state"),
+                                    "zip": str(data.get("zip") or "")[:5]}.items() if v}
+        if plan == "retry":
+            inputs["_retry"] = True
+        cur.execute("""UPDATE master_customers
+                       SET enrich_after = COALESCE(enrich_after, NOW() + make_interval(mins => %s)),
+                           enrich_inputs = COALESCE(enrich_inputs, '{}'::jsonb) || %s::jsonb
+                       WHERE cluster_id = %s RETURNING *;""", (ENRICH_DELAY_MINUTES, json.dumps(inputs), cluster_id))
+        cust = cur.fetchone()
 
     # 3. Index all primary & Versium alternate identifiers
     id_pairs = [("email", email), ("phone", phone), ("sq_id", sq_id), ("md_mik", enriched.get("md_mik"))]
@@ -1872,6 +1967,11 @@ def handle_webres(data: dict, background_tasks: BackgroundTasks) -> dict:
                     "last_name": data.get("last_name"),
                     "email": data.get("email"),
                     "phone": data.get("phone"),
+                    # Only if the Gmail script sends them (it reads name/email/phone from the PDF today).
+                    "address": data.get("address") or data.get("street"),
+                    "city": data.get("city"),
+                    "state": data.get("state"),
+                    "zip": data.get("zip") or data.get("postal_code"),
                     "wr_spend_delta": amount,
                     "wr_booking_delta": 1,
                     "wr_last_reservation_date": res_date,
@@ -1885,7 +1985,7 @@ def handle_webres(data: dict, background_tasks: BackgroundTasks) -> dict:
                 if not is_detroit_excluded(cust.get("md_city"), cust.get("zip5")):
                     if amount > 0:
                         fire_meta_capi_event(cur, cust, "Purchase", amount, thresh, event_id=txn_id)
-                    if cust["bowler_value_score"] >= thresh:
+                    if cust["bowler_value_score"] >= thresh or cust.get("enrich_after"):
                         fire_meta_capi_event(cur, cust, "Qualified_Bowler", max(amount, 250.0), thresh,
                                              event_id=f"qb_wr_{booking_id}")
                         background_tasks.add_task(sync_customer_to_meta_custom_audiences, dict(cust))
@@ -2037,7 +2137,7 @@ def handle_tripleseat(raw: dict, background_tasks: BackgroundTasks) -> dict:
                 thresh = get_threshold(cur)
                 if (
                     not is_detroit_excluded(cust.get("md_city"), cust.get("zip5"))
-                    and cust["bowler_value_score"] >= thresh
+                    and (cust["bowler_value_score"] >= thresh or cust.get("enrich_after"))
                     and status not in ("LOST", "TURNED_DOWN")
                 ):
                     # One Qualified_Bowler per customer per event date, however many times Tripleseat
@@ -2734,7 +2834,7 @@ def ingest_partywirks(cur, rec: dict, background_tasks: BackgroundTasks = None, 
     if not is_new:
         retry_unsent_event(cur, f"qb_pw_{key}")  # a Meta failure last time gets another try
     elif (count_booking and not is_detroit_excluded(cust.get("md_city"), cust.get("zip5"))
-            and cust["bowler_value_score"] >= thresh):
+            and (cust["bowler_value_score"] >= thresh or cust.get("enrich_after"))):
         fire_meta_capi_event(cur, cust, "Qualified_Bowler", 450.0, thresh, event_id=f"qb_pw_{key}")
         if background_tasks is not None:
             background_tasks.add_task(sync_customer_to_meta_custom_audiences, dict(cust))
@@ -2863,6 +2963,144 @@ def run_partywirks_sync(days_back: int = 3, count_bookings_created_since: str = 
            "date_from": date_from, **stats}
     log.info("Partywirks sync: %s", out)
     return out
+
+
+# ---------------------------------------------------------------------------
+# Deferred enrichment worker (runs inside the server every minute; see ENRICH_DELAY_MINUTES)
+# ---------------------------------------------------------------------------
+_VERSIUM_MARKERS = ("_versium_checked", "_versium_contact_done", "_versium_demo_done")
+
+
+def release_deferred_events(cur, cust: dict) -> collections.Counter:
+    """Sends the Meta events held while the customer waited for enrichment, now that the address and score are
+    known: Purchase if not in an excluded area; Qualified_Bowler also needs the score threshold."""
+    out = collections.Counter()
+    cur.execute("""SELECT * FROM capi_events_log WHERE cluster_id = %s AND NOT sent_to_meta
+                   AND meta_response_status = 'DEFERRED_ENRICHMENT' ORDER BY sent_at FOR UPDATE;""",
+                (cust["cluster_id"],))
+    rows = cur.fetchall()
+    if not rows:
+        return out
+    thresh = get_threshold(cur)
+    excluded = is_detroit_excluded(cust.get("md_city"), cust.get("zip5"))
+    score = int(cust.get("bowler_value_score") or 0)
+    cur.execute("UPDATE capi_events_log SET bowler_value_score = %s, threshold_at_send = %s "
+                "WHERE event_id = ANY(%s);", (score, thresh, [r["event_id"] for r in rows]))
+    for r in rows:
+        reason = "excluded_area" if excluded else (
+            "below_threshold" if r["event_name"] == "Qualified_Bowler" and score < thresh else None)
+        if reason:
+            cur.execute("UPDATE capi_events_log SET meta_response_status = 'DROPPED_AFTER_ENRICHMENT', "
+                        "meta_response_body = %s WHERE event_id = %s;", (reason, r["event_id"]))
+            out[f"dropped_{reason}"] += 1
+            continue
+        fire_meta_capi_event(cur, cust, r["event_name"], float(r["event_value"] or 0), thresh, r["event_id"],
+                             action_source=r.get("meta_response_body") or _action_source_for(r["event_id"]))
+        out["sent"] += 1
+    return out
+
+
+def _claim_pending(conn):
+    """Takes the customer whose waiting window ended first; the 10-minute lease stops a second worker."""
+    with conn, conn.cursor() as cur:
+        cur.execute("""UPDATE master_customers
+                       SET enrich_after = NOW() + INTERVAL '10 minutes', enrich_attempts = enrich_attempts + 1
+                       WHERE cluster_id = (SELECT cluster_id FROM master_customers
+                                           WHERE enrich_after IS NOT NULL AND enrich_after <= NOW()
+                                             AND NOT (COALESCE(versium_lifestyle_flags, '{}'::jsonb) ? '_versium_pending'
+                                                  AND (versium_lifestyle_flags->>'_versium_pending')::float
+                                                      > extract(epoch FROM now()) - 3600)
+                                           ORDER BY enrich_after LIMIT 1 FOR UPDATE SKIP LOCKED)
+                       RETURNING *;""")
+        rec = cur.fetchone()
+        if rec and (rec.get("enrich_inputs") or {}).get("_retry"):
+            # The one retry with new details: forget the old "already looked up" markers, once.
+            cur.execute(f"""UPDATE master_customers
+                            SET versium_lifestyle_flags = (COALESCE(versium_lifestyle_flags, '{{}}'::jsonb)
+                                    - ARRAY{list(_VERSIUM_MARKERS)}::text[])
+                                    || jsonb_build_object('_versium_retried', %s::text),
+                                enrich_inputs = enrich_inputs - '_retry'
+                            WHERE cluster_id = %s RETURNING *;""", (date.today().isoformat(), rec["cluster_id"]))
+            rec = cur.fetchone()
+        return rec
+
+
+def enrich_pending_customer(conn, rec: dict) -> str:
+    inputs = rec.get("enrich_inputs") or {}
+    pick = lambda col, key: str(rec.get(col) or inputs.get(key) or "").strip()
+    retried = bool((rec.get("versium_lifestyle_flags") or {}).get("_versium_retried"))
+    # A retry is about the new details, so they go first; otherwise the merged record's own values do.
+    email = str(inputs.get("email") or rec.get("email") or "") if retried else pick("email", "email")
+    phone = str(inputs.get("phone") or rec.get("phone") or "") if retried else pick("phone", "phone")
+    try:
+        enr = run_melissa_and_versium_waterfall(
+            rec.get("first_name") or "", rec.get("last_name") or "", email, phone,
+            pick("md_address1", "address"), pick("md_city", "city"), pick("md_state", "state"),
+            pick("zip5", "zip"), known=rec, unhurried=True)
+    except Exception as e:
+        log.exception("Deferred enrichment of a customer failed: %s", type(e).__name__)
+        enr = {"_versium_failed": True}
+    failed = bool(enr.get("_versium_failed"))
+    with conn, conn.cursor() as cur:
+        cur.execute("SELECT 1 FROM master_customers WHERE cluster_id = %s FOR UPDATE;", (rec["cluster_id"],))
+        cust = save_enrichment(cur, rec["cluster_id"], enr, "enrichment")  # keeps whatever was paid for
+        if failed and rec["enrich_attempts"] < ENRICH_MAX_ATTEMPTS:
+            cur.execute("UPDATE master_customers SET enrich_after = NOW() + make_interval(mins => %s) "
+                        "WHERE cluster_id = %s;", (15 * rec["enrich_attempts"], rec["cluster_id"]))
+            return "retry_later"
+        cur.execute("SELECT enrich_inputs, versium_lifestyle_flags FROM master_customers WHERE cluster_id = %s;",
+                    (rec["cluster_id"],))
+        now_row = cur.fetchone()
+        strip = lambda d: {k: v for k, v in (d or {}).items() if k != "_retry"}
+        if strip(now_row["enrich_inputs"]) != strip(inputs):
+            # A webhook added details while we were looking up. If Versium found nothing, look again with
+            # them (once, as a retry); if it matched, there's nothing more to buy.
+            unmatched = not versium_matched({"versium_lifestyle_flags": now_row["versium_lifestyle_flags"]})
+            if unmatched and not (now_row["versium_lifestyle_flags"] or {}).get("_versium_retried"):
+                cur.execute("""UPDATE master_customers SET enrich_after = NOW() + INTERVAL '1 minute', enrich_attempts = 0,
+                                   enrich_inputs = enrich_inputs || '{"_retry": true}'::jsonb
+                               WHERE cluster_id = %s;""", (rec["cluster_id"],))
+                return "rerun_new_details"
+        cur.execute("UPDATE master_customers SET enrich_after = NULL, enrich_inputs = NULL, enrich_attempts = 0 "
+                    "WHERE cluster_id = %s RETURNING *;", (rec["cluster_id"],))
+        cust = rescore_customer(cur, cur.fetchone(), exact=True)
+        released = release_deferred_events(cur, cust)
+        qualified = not is_detroit_excluded(cust.get("md_city"), cust.get("zip5")) and \
+            int(cust.get("bowler_value_score") or 0) >= get_threshold(cur)
+    if qualified:
+        try:
+            sync_customer_to_meta_custom_audiences(dict(cust))
+        except Exception as e:
+            log.warning("Audience sync after enrichment failed: %s", type(e).__name__)
+    if released:
+        log.info("Deferred Meta events for a customer: %s", dict(released))
+    return "gave_up_versium" if failed else "enriched"
+
+
+def process_pending_enrichment(limit: int = ENRICH_BATCH) -> dict:
+    """Enriches up to `limit` customers whose waiting window has ended, then releases any held events left
+    for customers no longer waiting (a webhook that raced the worker)."""
+    stats = collections.Counter()
+    conn = get_conn()
+    try:
+        for _ in range(limit):
+            rec = _claim_pending(conn)
+            if not rec:
+                break
+            stats[enrich_pending_customer(conn, rec)] += 1
+        with conn, conn.cursor() as cur:
+            cur.execute("""SELECT DISTINCT l.cluster_id FROM capi_events_log l
+                           JOIN master_customers m ON m.cluster_id = l.cluster_id
+                           WHERE NOT l.sent_to_meta AND l.meta_response_status = 'DEFERRED_ENRICHMENT'
+                             AND m.enrich_after IS NULL LIMIT 50;""")
+            for r in cur.fetchall():
+                cur.execute("SELECT * FROM master_customers WHERE cluster_id = %s;", (r["cluster_id"],))
+                stats.update(release_deferred_events(cur, cur.fetchone()))
+    finally:
+        conn.close()
+    if stats:
+        log.info("Deferred enrichment: %s", dict(stats))
+    return dict(stats)
 
 
 # ---------------------------------------------------------------------------
@@ -3151,7 +3389,8 @@ OA_UNCLAIMED = ("(COALESCE(versium_online_audience, '{}'::jsonb) = '{}'::jsonb O
                 "(versium_online_audience->>'_pending')::float < extract(epoch FROM now()) - 3600))")
 
 
-VERSIUM_UNCHECKED = ("(versium_lifestyle_flags IS NULL OR (NOT versium_lifestyle_flags ? '_source' AND "
+VERSIUM_UNCHECKED = ("enrich_after IS NULL AND "  # customers waiting for deferred enrichment belong to the worker
+                     "(versium_lifestyle_flags IS NULL OR (NOT versium_lifestyle_flags ? '_source' AND "
                      "NOT versium_lifestyle_flags ? '_versium_checked' AND "
                      "(NOT versium_lifestyle_flags ? '_versium_pending' OR "
                      "(versium_lifestyle_flags->>'_versium_pending')::float < extract(epoch FROM now()) - 3600)))")

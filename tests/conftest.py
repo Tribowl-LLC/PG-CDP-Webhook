@@ -23,6 +23,7 @@ os.environ.update({
     "CRON_SECRET": "test-cron-secret",
     "PARTYWIRKS_API_KEY": "test-partywirks-key",
     "MELISSA_LIVE": "true",  # most flows exercise Melissa; tests of the default (off) set it explicitly
+    "ENRICH_DELAY_MINUTES": "0",  # most flows enrich inside the webhook; deferred tests set it explicitly
 })
 os.environ.pop("VERSIUM_API_KEY", None)
 

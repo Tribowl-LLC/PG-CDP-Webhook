@@ -691,3 +691,20 @@ def test_versium_address_conflicting_city_state_not_merged(monkeypatch):
                                                 "Zip+4": ""})
     r = main.run_melissa_and_versium_waterfall("Ann", "Lee", "ann@example.test", "", city="Novi", state="MI")
     assert not r.get("md_address1") and r["md_city"] == "Novi" and not r.get("zip5")
+
+
+def test_enrichment_plan():
+    plan = main.enrichment_plan
+    assert plan(None, "a@b.com", "", {}) == "new"
+    assert plan(None, "", "", {}) is None
+    assert plan({"enrich_after": "soon"}, "a@b.com", "", {}) == "pending"
+    nomatch = {"email": "a@b.com", "md_results": "MELISSA_OFF", "md_city": "Novi", "zip5": "48375",
+               "versium_lifestyle_flags": {"_versium_checked": "2026-11-18"}}
+    assert plan(nomatch, "a@b.com", "", {}) is None                       # nothing new
+    assert plan(nomatch, "new@b.com", "", {}) == "retry"
+    assert plan(nomatch, "a@b.com", "2485550100", {}) == "retry"
+    assert plan({**nomatch, "versium_lifestyle_flags": {"_versium_checked": "x", "_versium_retried": "x"}},
+                "new@b.com", "", {}) is None                              # only one retry
+    matched = {**nomatch, "versium_lifestyle_flags": {"_versium_checked": "x", "pets": "Y"}}
+    assert plan(matched, "new@b.com", "", {}) is None                      # matched: never bought twice
+    assert plan({**nomatch, "md_city": "Detroit", "zip5": "48226"}, "new@b.com", "", {}) is None

@@ -193,3 +193,26 @@ def test_slow_lookups_skip_online_audience(monkeypatch):
     monkeypatch.setattr(main, "VERSIUM_ONLINE_BUDGET_SECONDS", -1)
     main.run_melissa_and_versium_waterfall("A", "B", "a@b.com", "", "1 Main", "Novi", "MI", "48375")
     assert any("/v2/contact" in u for u in calls) and not any("onlineAudience" in u for u in calls)
+
+
+def test_online_audience_not_bought_again_for_checked_customer(monkeypatch):
+    calls = _fake_versium(monkeypatch)
+    for stored in ({"_checked": "2026-11-18"}, {"facebook": {"email": [H1]}, "_checked": "2026-11-18"}):
+        calls.clear()
+        main.run_melissa_and_versium_waterfall("A", "B", "a@b.com", "", "1 Main", "Novi", "MI", "48375",
+                                               known={"versium_online_audience": stored})
+        assert any("/v2/contact" in u for u in calls) and not any("onlineAudience" in u for u in calls)
+
+
+def test_unreadable_online_audience_answer_stays_retryable(monkeypatch):
+    class Bad:
+        status_code = 200
+        text = "<html>"
+
+        def json(self):
+            raise ValueError("not json")
+    monkeypatch.setattr(main.requests, "get", lambda url, **kw: Bad())
+    assert main.fetch_versium_online_audience({}, {}) is None
+    from conftest import FakeResponse
+    monkeypatch.setattr(main.requests, "get", lambda url, **kw: FakeResponse(200, ["unexpected"]))
+    assert main.fetch_versium_online_audience({}, {}) is None

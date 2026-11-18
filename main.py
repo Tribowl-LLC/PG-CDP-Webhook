@@ -251,8 +251,12 @@ def fetch_versium_online_audience(v_headers: dict, v_input: dict, timeout: float
     try:
         body = resp.json()
     except ValueError:
-        body = {}
+        body = None
+    if resp.status_code == 200 and not isinstance(body, dict):
+        log.error("Versium online audience returned an unreadable answer (HTTP 200)")
+        return None  # stays retryable; never recorded as a no-match
     if resp.status_code != 200:
+        body = body if isinstance(body, dict) else {}
         err = body.get("errors") or body.get("error") or body.get("message") if isinstance(body, dict) else None
         log.error("Versium online audience rejected (HTTP %s): %s", resp.status_code, str(err)[:300])
         return None
@@ -552,7 +556,9 @@ def run_melissa_and_versium_waterfall(first_name: str, last_name: str, email: st
         # Online audience append (Meta / LinkedIn / TikTok IDs): local, advertisable customers only.
         # Enrichment runs inside the webhook request, so it is skipped when the earlier lookups were
         # already slow. Skipped or failed calls leave the column empty for /cron/versium-online-audience.
-        if versium_online_append_eligible(gate_city, gate_state, gate_zip) and \
+        # Already bought (or checked with no match) for this customer: never pay again.
+        if not known.get("versium_online_audience") and \
+                versium_online_append_eligible(gate_city, gate_state, gate_zip) and \
                 time.monotonic() - started < VERSIUM_ONLINE_BUDGET_SECONDS:
             try:
                 result["online_audience"] = fetch_versium_online_audience(v_headers, v_input) or {}

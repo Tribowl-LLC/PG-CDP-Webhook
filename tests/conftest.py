@@ -22,6 +22,7 @@ os.environ.update({
     "WEBHOOK_SECRET": "test-webhook-secret",
     "CRON_SECRET": "test-cron-secret",
     "PARTYWIRKS_API_KEY": "test-partywirks-key",
+    "MELISSA_LIVE": "true",  # most flows exercise Melissa; tests of the default (off) set it explicitly
 })
 os.environ.pop("VERSIUM_API_KEY", None)
 
@@ -71,6 +72,8 @@ class FakeHTTP:
             return self._census(kw["params"])
         if "app.partywirks.com/api/v1" in url:
             return self._partywirks(url, kw)
+        if "api.versium.com/v2/" in url:
+            return self._versium(url, kw.get("params") or {})
         if "connect.squareup.com/v2/customers/" in url:
             sq_id = url.rsplit("/", 1)[1]
             prof = self.square_customers.get(sq_id, "missing")
@@ -148,6 +151,27 @@ class FakeHTTP:
             "activity": {"id": 1, "name": package}, "created_at": created_at, "updated_at": created_at,
         }
         return {"event": "reservation.created", "data": self.pw_reservations[order_id]}
+
+    def _versium(self, url, params):
+        """Display-name answers, like the live API. Emails containing "vdown" fail; "vnomatch" match nothing."""
+        email = params.get("email") or ""
+        if "vdown" in email:
+            return FakeResponse(503, {"versium": {"errors": ["down"]}})
+        if "vnomatch" in email:
+            return FakeResponse(200, {"versium": {"results": []}})
+        tag = email.split("@")[0]
+        if "/v2/contact" in url:
+            res = {"Phone": "248555" + str(abs(hash(tag)) % 10000).zfill(4)}
+            if "address" in params.get("output[]", []):
+                res.update({"Postal Address": "500 Versium Way", "City": "Novi", "State": "MI", "Zip": "48375",
+                            "Zip+4": "48375-0001"})
+            return FakeResponse(200, {"versium": {"results": [res]}})
+        if "/v2/demographic" in url:
+            return FakeResponse(200, {"versium": {"results": [{"Presence of Children": "Yes", "Religion": "X",
+                                                               "Estimated Net Worth": "$100,000 - $249,999"}]}})
+        if "onlineAudience" in url:
+            return FakeResponse(200, {"versium": {"results": []}})
+        raise AssertionError(f"unexpected Versium GET {url}")
 
     @staticmethod
     def _census(params):

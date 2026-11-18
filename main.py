@@ -3585,8 +3585,8 @@ MELISSA_UPLOAD_ELIGIBLE = """
     AND COALESCE(TRIM(first_name), '') <> '' AND COALESCE(TRIM(last_name), '') <> ''
     AND (COALESCE(TRIM(email), '') <> '' OR COALESCE(TRIM(phone), '') <> '')
     AND COALESCE(versium_lifestyle_flags ? '_versium_checked' OR versium_lifestyle_flags ? '_source', FALSE)
-    AND NOT COALESCE(versium_lifestyle_flags ?| ARRAY['household_income', 'age', 'individual_level_match',
-                                                     'presence_of_children'], FALSE)
+    AND NOT EXISTS (SELECT 1 FROM jsonb_object_keys(COALESCE(versium_lifestyle_flags, '{}'::jsonb)) AS k
+                    WHERE left(k, 1) <> '_')  -- any Versium field counts as a match (see versium_matched)
     AND COALESCE(TRIM(md_household_income), '') = '' AND COALESCE(TRIM(md_date_of_birth), '') = ''
     AND COALESCE(TRIM(md_demographic_results), '') = ''
 """

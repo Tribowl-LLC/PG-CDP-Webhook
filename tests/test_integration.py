@@ -1258,6 +1258,8 @@ def test_melissa_batch_leaves_out_matched_unnamed_waiting_and_prior(client, db, 
     monkeypatch.setattr(main, "MELISSA_BATCH_SIZE", 1)
     _melissa_isolate(db)
     matched = _melissa_ready(db, uid + "m", 1, flags={"_versium_checked": "x", "household_income": "$1"})[0]
+    net_worth_only = _melissa_ready(db, uid + "w", 1, flags={"_versium_checked": "x",
+                                                            "estimated_net_worth": "$1"})[0]
     unchecked = _melissa_ready(db, uid + "u", 1, flags={})[0]
     nameless, waiting, melissa_demo, prior = _melissa_ready(db, uid, 4)
     db.execute("UPDATE master_customers SET last_name = NULL WHERE cluster_id = %s", (nameless,))
@@ -1267,7 +1269,7 @@ def test_melissa_batch_leaves_out_matched_unnamed_waiting_and_prior(client, db, 
     db.execute("UPDATE master_customers SET melissa_upload_status = 'prior' WHERE cluster_id = %s", (prior,))
     assert client.post("/cron/melissa-batch", headers=CRON).json() == {"ready": False, "waiting": 0,
                                                                        "batch_size": 1}
-    for cid in (matched, unchecked, nameless, waiting, melissa_demo):
+    for cid in (matched, net_worth_only, unchecked, nameless, waiting, melissa_demo):
         assert customer_row(db, cid)["melissa_upload_status"] is None
     db.execute("UPDATE master_customers SET enrich_after = NULL WHERE cluster_id = %s", (waiting,))
 

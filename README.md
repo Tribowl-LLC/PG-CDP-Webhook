@@ -163,6 +163,8 @@ Calls PostgreSQL function `adjust_meta_capi_thermostat()` nightly at 3:00 AM via
 Paginates through Square `/v2/catalog/list` (`ITEM,CATEGORY`), classifies items into Perfect Game departments, and upserts all variations into `square_catalog_items`.
 `POST /cron/enrich-partywirks`
 Batch-enriches any `in_partywirks = 1` rows missing `md_address1` via Melissa Personator and recalculates their persona and `bowler_value_score`.
+`POST /cron/versium-online-audience?limit=100`
+Versium online audience append (Meta / LinkedIn / TikTok IDs) for eligible customers (`versium_online_append_eligible`) that don't have it yet: never checked, or the live call was skipped (slow lookups) or failed. Highest scores first, at most `limit` paid lookups per call (max 500); stops after 3 rejections in a row. No-match customers are marked `_checked` so they aren't bought again.
 `POST /cron/recover-square-avs-zips`
 Finds card billing ZIPs for Square profiles with no address and enriches them via Melissa.
 All `/cron/*` endpoints require `CRON_SECRET` (when set). The cron-job.org jobs must send it.

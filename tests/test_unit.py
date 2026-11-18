@@ -158,6 +158,7 @@ def test_waterfall_skips_online_audience_out_of_state_and_excluded(monkeypatch):
     calls = _fake_versium(monkeypatch)
     r = main.run_melissa_and_versium_waterfall("A", "B", "a@b.com", "", "1 Main", "Toledo", "OH", "43604")
     assert not any("onlineAudience" in u for u in calls) and r["online_audience"] == {}
+    assert main.fetch_versium_online_audience({}, {})["_checked"]                # no-match/match marked checked
     assert any("/v2/contact" in u for u in calls)          # regular Versium append still runs
     calls.clear()
     main.run_melissa_and_versium_waterfall("A", "B", "a@b.com", "", "1 Main", "Detroit", "MI", "48226")
@@ -183,7 +184,7 @@ def test_rejected_online_audience_call_is_logged(monkeypatch, caplog):
     monkeypatch.setattr(main.requests, "get",
                         lambda url, **kw: FakeResponse(400, {"errors": ["Invalid rcfg_oa_services value"]}))
     with caplog.at_level("ERROR", logger="pg_cdp"):
-        assert main.fetch_versium_online_audience({}, {"email": "a@b.com"}) == {}
+        assert main.fetch_versium_online_audience({}, {"email": "a@b.com"}) is None
     assert "online audience rejected (HTTP 400)" in caplog.text and "a@b.com" not in caplog.text
 
 

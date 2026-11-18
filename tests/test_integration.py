@@ -640,7 +640,7 @@ def test_existing_customer_gaining_a_square_id_gets_no_history_credit(client, db
 def test_docs_shows_key_box_on_cron_endpoints(client):
     spec = client.get("/openapi.json").json()
     for path in ("/cron/adjust-thermostat", "/cron/sync-square-catalog", "/cron/enrich-partywirks",
-                 "/cron/recover-square-avs-zips", "/cron/sync-partywirks"):
+                 "/cron/recover-square-avs-zips", "/cron/sync-partywirks", "/cron/versium-online-audience"):
         params = spec["paths"][path]["post"].get("parameters", [])
         assert any(p["name"] == "key" and p["in"] == "query" for p in params), path
 
@@ -656,7 +656,7 @@ def test_endpoints_reject_missing_or_wrong_credentials(client, fake):
         assert client.post(path, json={}).status_code == 401
         assert client.post(path, json={}, headers={"X-CDP-Key": "wrong"}).status_code == 401
     for path in ("/cron/enrich-partywirks", "/cron/recover-square-avs-zips", "/cron/adjust-thermostat",
-                 "/cron/sync-square-catalog", "/cron/sync-partywirks"):
+                 "/cron/sync-square-catalog", "/cron/sync-partywirks", "/cron/versium-online-audience"):
         assert client.post(path).status_code == 401
         assert client.post(path, headers=WH).status_code == 401  # webhook key doesn't open cron endpoints
     assert fake.calls == []
@@ -664,3 +664,39 @@ def test_endpoints_reject_missing_or_wrong_credentials(client, fake):
 
 def test_query_param_key_works_for_vendor_webhooks(client, fake):
     assert client.post("/webhooks/webres?key=test-webhook-secret", json={}).status_code == 200
+
+
+# --- Versium online audience catch-up -------------------------------------------------------------
+
+def test_online_audience_catch_up_buys_once_and_marks_no_match(client, db, monkeypatch, uid):
+    from conftest import FakeResponse
+    h = "e" * 64
+    ids = {}
+    for tag, state, score in (("hit", "MI", 10**6 + 2), ("miss", None, 10**6 + 1), ("ohio", "OH", 10**6 + 3)):
+        db.execute("INSERT INTO master_customers (cluster_id, email, md_state, bowler_value_score) "
+                   "VALUES (nextval('master_cluster_id_seq'), %s, %s, %s) RETURNING cluster_id",
+                   (f"{tag}-{uid}@example.test", state, score))
+        ids[tag] = db.fetchone()["cluster_id"]
+    asked = []
+
+    def get(url, **kw):
+        asked.append(kw["params"].get("email"))
+        hit = kw["params"].get("email", "").startswith("hit-")
+        return FakeResponse(200, {"versium": {"results": [{"facebook": [{"email": [h]}]}] if hit else []}})
+    monkeypatch.setattr(main, "VERSIUM_API_KEY", "test-versium-key")
+    monkeypatch.setattr(main.requests, "get", get)
+    try:
+        out = client.post("/cron/versium-online-audience?limit=2", headers={"X-CDP-Key": "test-cron-secret"}).json()
+        assert (out["matched"], out["no_match"], out["failed_retry_later"]) == (1, 1, 0)
+        assert not any(e and e.startswith("ohio-") for e in asked)          # out of state: never bought
+        db.execute("SELECT cluster_id, versium_online_audience v FROM master_customers WHERE cluster_id = ANY(%s)",
+                   (list(ids.values()),))
+        v = {r["cluster_id"]: r["v"] for r in db.fetchall()}
+        assert v[ids["hit"]]["facebook"]["email"] == [h] and v[ids["hit"]]["_checked"]
+        assert set(v[ids["miss"]]) == {"_checked"} and v[ids["ohio"]] == {}
+        assert main.build_meta_user_identifiers({"cluster_id": 1, "versium_online_audience": v[ids["hit"]]})["em"] == [h]
+        asked.clear()
+        client.post("/cron/versium-online-audience?limit=2", headers={"X-CDP-Key": "test-cron-secret"})
+        assert not any(e and (e.startswith("hit-") or e.startswith("miss-")) for e in asked)  # not bought twice
+    finally:
+        db.execute("DELETE FROM master_customers WHERE cluster_id = ANY(%s)", (list(ids.values()),))

@@ -1,5 +1,7 @@
 import os
 import re
+import io
+import csv
 import hmac
 import math
 import time
@@ -3570,6 +3572,100 @@ def sync_square_catalog(request: Request, key: Optional[str] = CRON_KEY_PARAM):
     """Manual or scheduled trigger to sync Square Catalog into Neon."""
     require_cron_key(request)
     return run_square_catalog_sync()
+
+
+# ---------------------------------------------------------------------------
+# Manual Melissa.com uploads (migrations/009)
+# ---------------------------------------------------------------------------
+
+# Waiting for a Melissa.com upload: a name and an email or phone, Versium answered but found no demographics,
+# no Melissa demographics, not still waiting for deferred enrichment, never uploaded (or marked 'prior').
+MELISSA_UPLOAD_ELIGIBLE = """
+    melissa_upload_status IS NULL AND enrich_after IS NULL
+    AND COALESCE(TRIM(first_name), '') <> '' AND COALESCE(TRIM(last_name), '') <> ''
+    AND (COALESCE(TRIM(email), '') <> '' OR COALESCE(TRIM(phone), '') <> '')
+    AND COALESCE(versium_lifestyle_flags ? '_versium_checked' OR versium_lifestyle_flags ? '_source', FALSE)
+    AND NOT COALESCE(versium_lifestyle_flags ?| ARRAY['household_income', 'age', 'individual_level_match',
+                                                     'presence_of_children'], FALSE)
+    AND COALESCE(TRIM(md_household_income), '') = '' AND COALESCE(TRIM(md_date_of_birth), '') = ''
+    AND COALESCE(TRIM(md_demographic_results), '') = ''
+"""
+MELISSA_BATCH_SIZE = max(1, int(os.getenv("MELISSA_BATCH_SIZE", "100")))
+MELISSA_CSV_COLUMNS = ["RecordID", "First Name", "Last Name", "Address", "City", "State", "Zip", "Email", "Phone"]
+
+
+def melissa_batch_csv(cur, batch_id: int) -> str:
+    """The batch as a CSV for Melissa.com. RecordID is our customer number, so results can be matched back."""
+    cur.execute("""SELECT cluster_id, first_name, last_name, md_address1, md_city, md_state, zip5, email, phone
+                   FROM master_customers WHERE melissa_batch_id = %s ORDER BY cluster_id;""", (batch_id,))
+    out = io.StringIO()
+    w = csv.writer(out, lineterminator="\r\n")
+    w.writerow(MELISSA_CSV_COLUMNS)
+    for r in cur.fetchall():
+        digits = re.sub(r"\D", "", str(r.get("phone") or ""))
+        if len(digits) == 11 and digits.startswith("1"):
+            digits = digits[1:]
+        w.writerow([r["cluster_id"]] + [str(r.get(k) or "").strip() for k in
+                    ("first_name", "last_name", "md_address1", "md_city", "md_state", "zip5", "email")] + [digits])
+    return out.getvalue()
+
+
+def _melissa_batch_payload(cur, batch: dict) -> dict:
+    created = batch["created_at"]
+    return {"ready": True, "batch_id": batch["batch_id"], "customers": batch["customer_count"],
+            "filename": f"melissa-batch-{batch['batch_id']:03d}-{created:%Y-%m-%d}.csv",
+            "csv": melissa_batch_csv(cur, batch["batch_id"])}
+
+
+@app.post("/cron/melissa-batch")
+def melissa_batch(request: Request, key: Optional[str] = CRON_KEY_PARAM):
+    """For the Gmail Apps Script: once MELISSA_BATCH_SIZE customers are waiting for a Melissa.com upload, makes
+    the next batch and returns it as a CSV to email. A batch not yet confirmed as emailed
+    (/cron/melissa-batch/{id}/emailed) is returned again, so a failed email never loses one."""
+    require_cron_key(request)
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("SELECT pg_advisory_xact_lock(hashtext('melissa_batch'));")  # one batch at a time
+            cur.execute("SELECT * FROM melissa_batches WHERE emailed_at IS NULL ORDER BY batch_id LIMIT 1;")
+            pending = cur.fetchone()
+            if pending:
+                return _melissa_batch_payload(cur, pending)
+            cur.execute(f"SELECT count(*) AS n FROM master_customers WHERE {MELISSA_UPLOAD_ELIGIBLE};")
+            waiting = cur.fetchone()["n"]
+            if waiting < MELISSA_BATCH_SIZE:
+                return {"ready": False, "waiting": waiting, "batch_size": MELISSA_BATCH_SIZE}
+            cur.execute("INSERT INTO melissa_batches (customer_count) VALUES (0) RETURNING *;")
+            batch = cur.fetchone()
+            cur.execute(f"""UPDATE master_customers SET melissa_upload_status = 'sent', melissa_batch_id = %s
+                            WHERE cluster_id IN (SELECT cluster_id FROM master_customers
+                                                 WHERE {MELISSA_UPLOAD_ELIGIBLE}
+                                                 ORDER BY cluster_id LIMIT %s FOR UPDATE SKIP LOCKED);""",
+                        (batch["batch_id"], MELISSA_BATCH_SIZE))
+            batch["customer_count"] = cur.rowcount
+            cur.execute("UPDATE melissa_batches SET customer_count = %s WHERE batch_id = %s;",
+                        (batch["customer_count"], batch["batch_id"]))
+            log.info("Melissa upload batch %s made with %s customers", batch["batch_id"], batch["customer_count"])
+            return _melissa_batch_payload(cur, batch)
+    finally:
+        conn.close()
+
+
+@app.post("/cron/melissa-batch/{batch_id}/emailed")
+def melissa_batch_emailed(batch_id: int, request: Request, key: Optional[str] = CRON_KEY_PARAM):
+    """The Gmail Apps Script confirms it emailed the batch, so the next call can make a new one."""
+    require_cron_key(request)
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("UPDATE melissa_batches SET emailed_at = COALESCE(emailed_at, NOW()) WHERE batch_id = %s "
+                        "RETURNING batch_id, emailed_at;", (batch_id,))
+            row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="No such batch")
+        return {"status": "emailed", "batch_id": row["batch_id"], "emailed_at": row["emailed_at"].isoformat()}
+    finally:
+        conn.close()
 
 
 @app.get("/health")

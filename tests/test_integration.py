@@ -1,4 +1,6 @@
 """End-to-end webhook tests against a disposable database copy (see conftest.py)."""
+import csv
+import io
 import json
 import threading
 
@@ -1207,3 +1209,71 @@ def test_melissa_household_key_still_merges_in_deferred_mode(client, db, fake, u
                                                                   "md_results": "AS01"})
     r = client.post("/webhooks/partywirks", headers=WH, json=fake.add_partywirks(uid, f"26{int(uid, 16)}"))
     assert r.json().get("cluster_id") == owner
+
+
+# --- Manual Melissa.com upload batches ----------------------------------------------------------
+
+def _melissa_ready(db, uid, n, **over):
+    """n customers Versium found nothing for (name + email/phone, no demographics), ready for Melissa."""
+    ids = []
+    for i in range(n):
+        cid = _new_customer(db, uid, f"mq{i}-{uid}@example.test",
+                            flags=over.get("flags", {"_versium_checked": "2026-11-18"}))
+        db.execute("UPDATE master_customers SET phone = %s, md_results = 'MELISSA_OFF' WHERE cluster_id = %s",
+                   (f"+1 (248) 555-{i:04d}", cid))
+        ids.append(cid)
+    return ids
+
+
+def _melissa_isolate(db):
+    """The test database is a copy of production: park its real queue and batches so only this test's count."""
+    db.execute(f"UPDATE master_customers SET melissa_upload_status = 'prior' WHERE {main.MELISSA_UPLOAD_ELIGIBLE}")
+    db.execute("UPDATE melissa_batches SET emailed_at = NOW() WHERE emailed_at IS NULL")
+
+
+def test_melissa_batch_waits_for_a_full_batch_then_emails_it_once(client, db, uid, monkeypatch):
+    monkeypatch.setattr(main, "MELISSA_BATCH_SIZE", 3)
+    _melissa_isolate(db)
+    first = _melissa_ready(db, uid, 2)
+    r = client.post("/cron/melissa-batch", headers=CRON).json()
+    assert r == {"ready": False, "waiting": 2, "batch_size": 3}
+    extra = _melissa_ready(db, uid + "b", 2)
+    r = client.post("/cron/melissa-batch", headers=CRON).json()
+    assert r["ready"] and r["customers"] == 3 and r["filename"].startswith(f"melissa-batch-{r['batch_id']:03d}-")
+    rows = list(csv.DictReader(io.StringIO(r["csv"])))
+    assert [int(x["RecordID"]) for x in rows] == sorted(first + extra)[:3]  # oldest first
+    assert rows[0]["Phone"] == "2485550000" and rows[0]["Email"] == f"mq0-{uid}@example.test"
+    assert rows[0]["First Name"] == "Vee" and rows[0]["Address"] == ""
+    # Not confirmed as emailed: the same batch comes back, nothing new is made.
+    again = client.post("/cron/melissa-batch", headers=CRON).json()
+    assert again["batch_id"] == r["batch_id"] and again["csv"] == r["csv"]
+    done = client.post(f"/cron/melissa-batch/{r['batch_id']}/emailed", headers=CRON).json()
+    assert done["status"] == "emailed"
+    r = client.post("/cron/melissa-batch", headers=CRON).json()
+    assert r == {"ready": False, "waiting": 1, "batch_size": 3}  # the 4th waits for the next batch
+    assert customer_row(db, sorted(first + extra)[0])["melissa_upload_status"] == "sent"
+
+
+def test_melissa_batch_leaves_out_matched_unnamed_waiting_and_prior(client, db, uid, monkeypatch):
+    monkeypatch.setattr(main, "MELISSA_BATCH_SIZE", 1)
+    _melissa_isolate(db)
+    matched = _melissa_ready(db, uid + "m", 1, flags={"_versium_checked": "x", "household_income": "$1"})[0]
+    unchecked = _melissa_ready(db, uid + "u", 1, flags={})[0]
+    nameless, waiting, melissa_demo, prior = _melissa_ready(db, uid, 4)
+    db.execute("UPDATE master_customers SET last_name = NULL WHERE cluster_id = %s", (nameless,))
+    db.execute("UPDATE master_customers SET enrich_after = NOW() WHERE cluster_id = %s", (waiting,))
+    db.execute("UPDATE master_customers SET md_household_income = '$60,001-$75,000' WHERE cluster_id = %s",
+               (melissa_demo,))
+    db.execute("UPDATE master_customers SET melissa_upload_status = 'prior' WHERE cluster_id = %s", (prior,))
+    assert client.post("/cron/melissa-batch", headers=CRON).json() == {"ready": False, "waiting": 0,
+                                                                       "batch_size": 1}
+    for cid in (matched, unchecked, nameless, waiting, melissa_demo):
+        assert customer_row(db, cid)["melissa_upload_status"] is None
+    db.execute("UPDATE master_customers SET enrich_after = NULL WHERE cluster_id = %s", (waiting,))
+
+
+def test_melissa_batch_endpoints_need_the_cron_key(client):
+    for path in ("/cron/melissa-batch", "/cron/melissa-batch/1/emailed"):
+        assert client.post(path).status_code == 401
+        assert client.post(path, headers=WH).status_code == 401
+    assert client.post("/cron/melissa-batch/999999999/emailed", headers=CRON).status_code == 404

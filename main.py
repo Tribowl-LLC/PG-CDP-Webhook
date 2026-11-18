@@ -435,8 +435,8 @@ def save_order_items(cur, txn_id: str, order: dict, square_customer_id: str = No
     )
 
 
-# GrpCensus/GrpCensus2 made Melissa answer with an all-blank record (Nov 18), so they stay off until
-# that's sorted out. The census/school fields are still mapped, for when they come back.
+# GrpCensus/GrpCensus2 are off until confirmed for this account (Nov 18 test answers came back blank).
+# The census/school fields are still mapped, for when they come back.
 MELISSA_COLS = "GrpAddressDetails,GrpGeo,GrpDemographicBasic"
 
 
@@ -474,10 +474,10 @@ def melissa_lookup(first_name: str, last_name: str, email: str, phone: str,
     # Melissa pads missing values with spaces; never let a blank overwrite real data.
     rec = {k: (v.strip() if isinstance(v, str) else v) for k, v in (rec or {}).items()}
     rec = {k: v for k, v in rec.items() if v not in ("", None)}
-    if not rec.get("Results"):
-        # No result codes = Melissa rejected the request (see TransmissionResults); retry later.
-        log.error("Melissa returned no result codes (TransmissionResults=%s)",
-                  str(body.get("TransmissionResults"))[:100])
+    transmission = str((body or {}).get("TransmissionResults") or "").strip()
+    if transmission:
+        # Melissa rejected the request itself (bad parameter, license, credits): not an answer; retry later.
+        log.error("Melissa rejected the request (TransmissionResults=%s)", transmission[:100])
         return {}
     has_street = bool((rec.get("AddressLine1") or address or "").strip())
     lat = to_float(rec.get("Latitude")) if has_street else 0.0

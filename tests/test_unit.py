@@ -317,3 +317,17 @@ def test_unaskable_census_address_is_not_marked_checked(monkeypatch):
     monkeypatch.setattr(main.requests, "get", lambda url, **kw: calls.append(url))
     r = main.run_melissa_and_versium_waterfall("A", "B", "a@b.com", "", "1 Main St")
     assert calls == [] and "census_checked_at" not in r
+
+
+def test_tripleseat_field_log_has_names_and_money_presence_but_no_values(caplog):
+    raw = {"event": {"id": 99, "grand_total": "1234.50", "amount_due": "0.00", "name": "Smith Party",
+                     "contact": {"email_addresses": [{"address": "secret@example.test"}]},
+                     "payments": [{"amount": 200, "payment_method": "Check"}]}}
+    with caplog.at_level("INFO", logger="pg_cdp"):
+        main.log_tripleseat_fields(raw)
+    text = caplog.text
+    assert "event.grand_total" in text and "event.contact.email_addresses[].address" in text
+    assert "filled: event.grand_total" in text and "event.payments[].amount" in text
+    assert "empty: event.amount_due" in text
+    for secret in ("secret@example.test", "Smith Party", "1234.50", "Check"):
+        assert secret not in text

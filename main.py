@@ -8,7 +8,7 @@ import base64
 import hashlib
 import logging
 import collections
-from datetime import date
+from datetime import date, datetime, timezone
 from typing import Optional
 
 import requests
@@ -435,9 +435,61 @@ def save_order_items(cur, txn_id: str, order: dict, square_customer_id: str = No
     )
 
 
-# GrpCensus/GrpCensus2 are off until confirmed for this account (Nov 18 test answers came back blank).
-# The census/school fields are still mapped, for when they come back.
-MELISSA_COLS = "GrpAddressDetails,GrpGeo,GrpDemographicBasic"
+# Melissa is used for address work only: verification, geocode, carrier route, household keys.
+# The account is on a credit license, which rejects demographic groups with GE29 ("Not Available for
+# Credit License"); demographics come from Versium. Census/school fields come from the free Census
+# Geocoder. Override with the MELISSA_COLS env var (e.g. after a subscription upgrade).
+MELISSA_COLS = os.getenv("MELISSA_COLS", "GrpAddressDetails,GrpGeo")
+CENSUS_GEOCODER_URL = "https://geocoding.geo.census.gov/geocoder/geographies/address"
+CENSUS_BUDGET_SECONDS = 6
+
+
+def census_geocode(address: str, city: str = "", state: str = "", zip_code: str = ""):
+    """US Census Geocoder (free, no key): coordinates, distance, census tract/block, county and school
+    districts for a street address. Only the address is sent. Returns {} when the Census answered with no
+    match, or None when it wasn't asked (not enough address) or the call failed, so it stays retryable."""
+    address = (address or "").strip()
+    if not address or not ((zip_code or "").strip() or ((city or "").strip() and (state or "").strip())):
+        return None
+    try:
+        resp = requests.get(CENSUS_GEOCODER_URL, params={
+            "street": address, "city": city or "", "state": state or "", "zip": (zip_code or "")[:5],
+            "benchmark": "Public_AR_Current", "vintage": "Current_Current", "layers": "all", "format": "json",
+        }, timeout=5)
+        resp.raise_for_status()
+        matches = ((resp.json() or {}).get("result") or {}).get("addressMatches") or []
+    except Exception as e:
+        log.warning("Census geocoder failed: %s", type(e).__name__)
+        return None
+    if not matches:
+        return {}
+    m = matches[0]
+    geo = m.get("geographies") or {}
+    first = lambda layer, field: ((geo.get(layer) or [{}])[0] or {}).get(field) or None
+    lat, lon = to_float((m.get("coordinates") or {}).get("y")), to_float((m.get("coordinates") or {}).get("x"))
+    block_layer = next((k for k in geo if k.endswith("Census Blocks")), "2020 Census Blocks")
+    return {
+        "md_latitude": lat or None,
+        "md_longitude": lon or None,
+        "distance_miles": haversine_miles(ALLEY_LAT, ALLEY_LON, lat, lon) if (lat and lon) else None,
+        "md_census_tract": first("Census Tracts", "TRACT"),
+        "md_census_block": first(block_layer, "BLOCK"),
+        "md_county_name": first("Counties", "BASENAME"),
+        "md_unified_school_district_name": first("Unified School Districts", "NAME"),
+        "md_elementary_school_district_name": first("Elementary School Districts", "NAME"),
+    }
+
+
+def apply_census(result: dict, census: dict) -> dict:
+    """Census fills the census/school fields, and coordinates only when Melissa had none."""
+    if not census:
+        return result
+    has_coords = bool(result.get("md_latitude"))
+    for k, v in census.items():
+        if v is None or (has_coords and k in ("md_latitude", "md_longitude", "distance_miles")):
+            continue
+        result[k] = v
+    return result
 
 
 def melissa_lookup(first_name: str, last_name: str, email: str, phone: str,
@@ -547,6 +599,15 @@ def run_melissa_and_versium_waterfall(first_name: str, last_name: str, email: st
 
     # --- STEP 1: MELISSA PERSONATOR ---
     result.update(melissa_lookup(first_name, last_name, email, phone, address, city, state, zip_code))
+
+    # --- STEP 1b: US CENSUS GEOCODER (free): census/school fields, coordinates when Melissa had none ---
+    street = result.get("md_address1") or address
+    if street and not result.get("md_census_tract") and time.monotonic() - started < CENSUS_BUDGET_SECONDS:
+        census = census_geocode(street, result.get("md_city") or city,
+                                result.get("md_state") or state, result.get("zip5") or zip_code)
+        apply_census(result, census or {})
+        if census is not None:
+            result["census_checked_at"] = datetime.now(timezone.utc).isoformat()
 
     # --- STEP 2: VERSIUM REACH (When API Key is active) ---
     known = known or {}
@@ -1027,7 +1088,7 @@ ENRICHMENT_FIELDS = [
     "md_household_size", "md_length_of_residence", "md_education", "md_occupation",
     "md_date_of_birth", "md_gender", "md_delivery_indicator", "md_mik", "md_mak", "md_results",
     "md_census_tract", "md_census_block", "md_county_name", "md_unified_school_district_name",
-    "md_elementary_school_district_name",
+    "md_elementary_school_district_name", "census_checked_at",
     "versium_net_worth", "versium_home_market_value", "versium_auto_make_model",
 ]
 JSONB_FIELDS = {"versium_alt_emails", "versium_alt_phones", "versium_lifestyle_flags", "versium_online_audience"}
@@ -2225,12 +2286,60 @@ def recover_square_avs_zips(request: Request, limit: int = 150, scan_payment_pag
         conn.close()
 
 
+@app.post("/cron/census-geocode")
+def census_geocode_catch_up(request: Request, limit: int = 200, key: Optional[str] = CRON_KEY_PARAM):
+    """Free US Census Geocoder for customers with a street address but no census tract or no coordinates:
+    census tract/block, county, school districts, and coordinates/distance when Melissa had none. Then
+    rescores them. Each address is asked once (census_checked_at); a Census outage retries next run."""
+    require_cron_key(request)
+    limit = max(1, min(int(limit), 1000))
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT cluster_id FROM master_customers
+                WHERE census_checked_at IS NULL AND (md_census_tract IS NULL OR md_latitude IS NULL)
+                  AND COALESCE(TRIM(md_address1), '') <> ''
+                  AND (COALESCE(TRIM(zip5), '') <> '' OR (COALESCE(TRIM(md_city), '') <> ''
+                                                         AND COALESCE(TRIM(md_state), '') <> ''))
+                ORDER BY bowler_value_score DESC NULLS LAST, true_lifetime_spend DESC NULLS LAST, cluster_id
+                LIMIT %s;
+                """, (limit,))
+            ids = [r["cluster_id"] for r in cur.fetchall()]
+        matched = coords_added = no_match = failures = 0
+        for cid in ids:
+            with conn, conn.cursor() as cur:
+                cur.execute("SELECT * FROM master_customers WHERE cluster_id = %s AND census_checked_at IS NULL "
+                            "FOR UPDATE SKIP LOCKED;", (cid,))
+                r = cur.fetchone()
+                if not r:
+                    continue
+                census = census_geocode(r.get("md_address1"), r.get("md_city"), r.get("md_state"), r.get("zip5"))
+                if census is None:
+                    failures += 1
+                    continue
+                enr = apply_census({"md_latitude": r.get("md_latitude")}, census)
+                enr["census_checked_at"] = datetime.now(timezone.utc).isoformat()
+                if census:
+                    matched += 1
+                    coords_added += int(not r.get("md_latitude") and bool(census.get("md_latitude")))
+                else:
+                    no_match += 1
+                cust = save_enrichment(cur, cid, enr, "Census")
+                rescore_customer(cur, cust)
+        return {"status": "census_geocode", "matched": matched, "coordinates_added": coords_added,
+                "no_match": no_match, "failed_retry_later": failures}
+    finally:
+        conn.close()
+
+
 @app.post("/cron/melissa-geocode")
 def melissa_geocode_catch_up(request: Request, limit: int = 100, key: Optional[str] = CRON_KEY_PARAM):
-    """Runs customers who have a street address + ZIP but no coordinates (e.g. addresses that came from a
-    Versium CSV) through Melissa, so they get a verified address, distance from the venue, census and
-    school-district fields. Highest scores first; `limit` paid lookups per call (max 500). Each customer is
-    tried once (marked GEO_TRIED); a Melissa outage leaves them for the next run."""
+    """Runs customers who have a street address + ZIP but no Melissa address work yet (no coordinates or no
+    carrier route, e.g. addresses that came from a Versium CSV) through Melissa: verified address,
+    coordinates/distance, carrier route, household key. Highest scores first; `limit` paid lookups per call
+    (max 500). Each customer is tried once (marked GEO_TRIED); a Melissa rejection leaves them for the next run."""
     require_cron_key(request)
     if not MELISSA_API_KEY:
         return {"status": "error", "message": "Missing MELISSA_API_KEY"}
@@ -2241,7 +2350,7 @@ def melissa_geocode_catch_up(request: Request, limit: int = 100, key: Optional[s
             cur.execute(
                 """
                 SELECT * FROM master_customers
-                WHERE md_latitude IS NULL
+                WHERE (md_latitude IS NULL OR md_carrier_route IS NULL)
                   AND COALESCE(TRIM(md_address1), '') <> '' AND COALESCE(TRIM(zip5), '') <> ''
                   AND COALESCE(md_results, '') NOT LIKE '%%GEO_TRIED%%'
                 ORDER BY bowler_value_score DESC NULLS LAST, true_lifetime_spend DESC NULLS LAST, cluster_id
@@ -2256,7 +2365,7 @@ def melissa_geocode_catch_up(request: Request, limit: int = 100, key: Optional[s
                 cur.execute(
                     """
                     SELECT * FROM master_customers
-                    WHERE cluster_id = %s AND md_latitude IS NULL
+                    WHERE cluster_id = %s AND (md_latitude IS NULL OR md_carrier_route IS NULL)
                       AND COALESCE(md_results, '') NOT LIKE '%%GEO_TRIED%%'
                     FOR UPDATE SKIP LOCKED;
                     """, (cand["cluster_id"],))

@@ -163,7 +163,7 @@ def test_waterfall_skips_online_audience_out_of_state_and_excluded(monkeypatch):
     assert any("/v2/contact" in u for u in calls)          # regular Versium append still runs
     calls.clear()
     main.run_melissa_and_versium_waterfall("A", "B", "a@b.com", "", "1 Main", "Detroit", "MI", "48226")
-    assert calls == []                                      # excluded: no Versium at all
+    assert not any("versium.com" in c for c in calls)        # excluded: no Versium at all
 
 
 def test_stored_geography_gates_versium_when_webhook_has_no_address(monkeypatch):
@@ -261,3 +261,58 @@ def test_blank_melissa_answer_is_a_failure_not_data(monkeypatch, caplog):
     monkeypatch.setattr(main.requests, "get", lambda url, **kw: FakeResponse(200, padded))
     out = main.melissa_lookup("A", "B", "a@b.com", "")
     assert out["md_household_income"] is None and out["md_mik"] is None and out["md_results"] == "AS01"
+
+
+CENSUS_BODY = {"result": {"addressMatches": [{
+    "coordinates": {"x": -83.4757, "y": 42.4806},
+    "geographies": {"Census Tracts": [{"TRACT": "141000"}], "2020 Census Blocks": [{"BLOCK": "2001"}],
+                    "Counties": [{"BASENAME": "Oakland", "NAME": "Oakland County"}],
+                    "Unified School Districts": [{"NAME": "Novi Community School District"}]}}]}}
+
+
+def test_census_geocode_parses_and_handles_no_match_and_failure(monkeypatch):
+    from conftest import FakeResponse
+    sent = {}
+    def get(url, params=None, **kw):
+        sent.update(params); return FakeResponse(200, CENSUS_BODY)
+    monkeypatch.setattr(main.requests, "get", get)
+    out = main.census_geocode("1 Main St", "Novi", "MI", "48375")
+    assert (out["md_census_tract"], out["md_census_block"], out["md_county_name"]) == ("141000", "2001", "Oakland")
+    assert out["md_unified_school_district_name"] == "Novi Community School District"
+    assert 3 < out["distance_miles"] < 6 and set(sent) >= {"street", "zip"} and "email" not in sent
+    assert main.census_geocode("", "Novi", "MI", "48375") is None          # no street: not asked
+    assert main.census_geocode("1 Main St", "", "", "") is None            # no ZIP or city/state: not asked
+    monkeypatch.setattr(main.requests, "get", lambda url, **kw: FakeResponse(200, {"result": {"addressMatches": []}}))
+    assert main.census_geocode("1 Main St", "Novi", "MI", "48375") == {}
+    def boom(url, **kw):
+        raise main.requests.Timeout("x")
+    monkeypatch.setattr(main.requests, "get", boom)
+    assert main.census_geocode("1 Main St", "Novi", "MI", "48375") is None
+
+
+def test_census_coordinates_only_fill_when_melissa_had_none():
+    census = {"md_latitude": 1.0, "md_longitude": 2.0, "distance_miles": 3.0, "md_census_tract": "141000"}
+    assert main.apply_census({"md_latitude": 42.4}, dict(census)) == {"md_latitude": 42.4, "md_census_tract": "141000"}
+    assert main.apply_census({}, dict(census))["md_latitude"] == 1.0
+
+
+def test_melissa_is_address_only_by_default():
+    assert "Demographic" not in main.MELISSA_COLS and "GrpGeo" in main.MELISSA_COLS
+
+
+def test_waterfall_adds_census_after_melissa(monkeypatch):
+    from conftest import FakeResponse
+    monkeypatch.setattr(main, "MELISSA_API_KEY", None)
+    monkeypatch.setattr(main, "VERSIUM_API_KEY", None)
+    monkeypatch.setattr(main.requests, "get", lambda url, **kw: FakeResponse(200, CENSUS_BODY))
+    r = main.run_melissa_and_versium_waterfall("A", "B", "a@b.com", "", "1 Main St", "Novi", "MI", "48375")
+    assert r["md_census_tract"] == "141000" and r["census_checked_at"] and r["distance_miles"]
+
+
+def test_unaskable_census_address_is_not_marked_checked(monkeypatch):
+    calls = []
+    monkeypatch.setattr(main, "MELISSA_API_KEY", None)
+    monkeypatch.setattr(main, "VERSIUM_API_KEY", None)
+    monkeypatch.setattr(main.requests, "get", lambda url, **kw: calls.append(url))
+    r = main.run_melissa_and_versium_waterfall("A", "B", "a@b.com", "", "1 Main St")
+    assert calls == [] and "census_checked_at" not in r

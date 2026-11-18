@@ -67,6 +67,8 @@ class FakeHTTP:
         self.calls.append(("GET", url, kw))
         if "personator.melissadata.net" in url:
             return self._melissa(kw["params"])
+        if "geocoding.geo.census.gov" in url:
+            return self._census(kw["params"])
         if "app.partywirks.com/api/v1" in url:
             return self._partywirks(url, kw)
         if "connect.squareup.com/v2/customers/" in url:
@@ -146,6 +148,21 @@ class FakeHTTP:
             "activity": {"id": 1, "name": package}, "created_at": created_at, "updated_at": created_at,
         }
         return {"event": "reservation.created", "data": self.pw_reservations[order_id]}
+
+    @staticmethod
+    def _census(params):
+        street = params.get("street") or ""
+        if "nomatch" in street.lower():
+            return FakeResponse(200, {"result": {"addressMatches": []}})
+        if "censusdown" in street.lower():
+            raise requests.Timeout("census down")
+        return FakeResponse(200, {"result": {"addressMatches": [{
+            "coordinates": {"x": -83.3925, "y": 42.4690},
+            "geographies": {
+                "Census Tracts": [{"TRACT": "167000"}], "2020 Census Blocks": [{"BLOCK": "5009"}],
+                "Counties": [{"BASENAME": "Oakland"}],
+                "Unified School Districts": [{"NAME": "Farmington Public School District"}],
+            }}]}})
 
     @staticmethod
     def _melissa(params):

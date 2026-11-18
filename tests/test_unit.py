@@ -102,3 +102,63 @@ def test_blocked_versium_fields_are_stripped():
     kept = main.strip_blocked_versium_fields(raw)
     assert set(kept) == {"net_worth", "presence_of_children", "credit_card_holder_bank", "donor_childrens_causes"}
     assert main.strip_blocked_versium_fields(None) == {}
+
+
+H1, H2, H3 = "a" * 64, "b" * 64, "c" * 64
+OA_BODY = {"versium": {"results": [{
+    "facebook": [{"email": [H1, H2], "phone": [H3], "zip": ["48335"]}, {"email": [H2.upper()]}],
+    "linkedin": [{"email": [H1], "jobtitle": ["Office Manager"], "employeecompany": ["Acme"]}],
+    "tiktok": [{"email": [H1], "phone": [H3]}],
+    "google": [{"Email": [H1]}],
+    "adroll": [{"email": ["d41d8cd98f00b204e9800998ecf8427e"]}],
+}]}}
+
+
+def test_online_audience_parse_keeps_only_meta_linkedin_tiktok():
+    oa = main.parse_versium_online_audience(OA_BODY)
+    assert set(oa) == {"facebook", "linkedin", "tiktok"}
+    assert oa["facebook"]["email"] == [H1, H2, H2.upper()]
+    assert oa["linkedin"]["jobtitle"] == ["Office Manager"]
+    assert main.parse_versium_online_audience({}) == {}
+    assert main.parse_versium_online_audience(None) == {}
+
+
+def test_versium_facebook_hashes_join_capi_identifiers():
+    cust = {"cluster_id": 1, "email": "a@b.com", "phone": "2485550100",
+            "versium_online_audience": main.parse_versium_online_audience(OA_BODY)}
+    cust["versium_online_audience"]["facebook"]["phone"].append("not-a-hash")
+    ud = main.build_meta_user_identifiers(cust)
+    assert {H1, H2, main.sha256_hash("a@b.com")} <= set(ud["em"]) and len(ud["em"]) == 3
+    assert H3 in ud["ph"] and "not-a-hash" not in ud["ph"]
+
+
+def _fake_versium(monkeypatch):
+    from conftest import FakeResponse
+    calls = []
+
+    def get(url, **kw):
+        calls.append(url)
+        if "onlineAudience" in url:
+            return FakeResponse(200, OA_BODY)
+        return FakeResponse(200, {"versium": {"results": [{}]}})
+    monkeypatch.setattr(main, "VERSIUM_API_KEY", "test-versium-key")
+    monkeypatch.setattr(main, "MELISSA_API_KEY", None)
+    monkeypatch.setattr(main.requests, "get", get)
+    return calls
+
+
+def test_waterfall_calls_online_audience_for_michigan(monkeypatch):
+    calls = _fake_versium(monkeypatch)
+    r = main.run_melissa_and_versium_waterfall("A", "B", "a@b.com", "", "1 Main", "Novi", "MI", "48375")
+    assert any("onlineAudience" in u for u in calls)
+    assert r["online_audience"]["facebook"]["email"][0] == H1
+
+
+def test_waterfall_skips_online_audience_out_of_state_and_excluded(monkeypatch):
+    calls = _fake_versium(monkeypatch)
+    r = main.run_melissa_and_versium_waterfall("A", "B", "a@b.com", "", "1 Main", "Toledo", "OH", "43604")
+    assert not any("onlineAudience" in u for u in calls) and r["online_audience"] == {}
+    assert any("/v2/contact" in u for u in calls)          # regular Versium append still runs
+    calls.clear()
+    main.run_melissa_and_versium_waterfall("A", "B", "a@b.com", "", "1 Main", "Detroit", "MI", "48226")
+    assert calls == []                                      # excluded: no Versium at all

@@ -215,6 +215,45 @@ def strip_blocked_versium_fields(fields: dict) -> dict:
             if not any(part in norm(k) for part in VERSIUM_BLOCKED_FIELD_PARTS)}
 
 
+VERSIUM_ONLINE_AUDIENCE_SERVICES = ("facebook", "linkedin", "tiktok")
+_SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
+
+
+def parse_versium_online_audience(body: dict) -> dict:
+    """Versium /v2/onlineAudience answer -> {service: {field: [values]}} for the services we use.
+    Each service holds a list of objects whose fields are lists; they are merged and de-duplicated."""
+    res = ((body or {}).get("versium") or {}).get("results") or []
+    out = {}
+    for rec in res if isinstance(res, list) else []:
+        for svc in VERSIUM_ONLINE_AUDIENCE_SERVICES:
+            for obj in (rec or {}).get(svc) or []:
+                for field, vals in (obj or {}).items():
+                    vals = vals if isinstance(vals, list) else [vals]
+                    bucket = out.setdefault(svc, {}).setdefault(str(field).lower(), [])
+                    for v in vals:
+                        v = str(v).strip()
+                        if v and v not in bucket:
+                            bucket.append(v)
+    return out
+
+
+def fetch_versium_online_audience(v_headers: dict, v_input: dict) -> dict:
+    vo = requests.get(
+        "https://api.versium.com/v2/onlineAudience",
+        headers=v_headers,
+        params={**v_input, "rcfg_oa_services[]": list(VERSIUM_ONLINE_AUDIENCE_SERVICES)},
+        timeout=5,
+    ).json()
+    return parse_versium_online_audience(vo)
+
+
+def versium_meta_hashes(cust: dict) -> tuple:
+    """Versium's pre-hashed (SHA-256) Facebook emails and phones for this customer."""
+    fb = (cust.get("versium_online_audience") or {}).get("facebook") or {}
+    ok = lambda vals: [v.lower() for v in vals or [] if _SHA256_HEX.match(str(v).lower())]
+    return ok(fb.get("email")), ok(fb.get("phone"))
+
+
 def get_threshold(cur) -> int:
     cur.execute("SELECT current_score_threshold FROM cdp_thermostat_config WHERE id = 1;")
     return int(cur.fetchone()["current_score_threshold"])
@@ -384,6 +423,7 @@ def run_melissa_and_versium_waterfall(first_name: str, last_name: str, email: st
         "alt_emails": [],
         "alt_phones": [],
         "lifestyle_flags": {},
+        "online_audience": {},
         # What we were given, so the geo gate still works if Melissa is unavailable.
         "md_city": city or None,
         "md_state": state or None,
@@ -487,6 +527,14 @@ def run_melissa_and_versium_waterfall(first_name: str, last_name: str, email: st
         except Exception as e:
             log.warning("Versium lookup failed: %s", type(e).__name__)
 
+        # Online audience append (Meta / LinkedIn / TikTok IDs): local, advertisable customers only.
+        if versium_online_append_eligible(result.get("md_city") or city, result.get("md_state") or state,
+                                          result.get("zip5") or zip_code):
+            try:
+                result["online_audience"] = fetch_versium_online_audience(v_headers, v_input)
+            except Exception as e:
+                log.warning("Versium online audience lookup failed: %s", type(e).__name__)
+
     return result
 
 
@@ -584,6 +632,9 @@ def build_meta_user_identifiers(cust: dict) -> dict:
     phones = [cust.get("phone")] + list(cust.get("versium_alt_phones") or [])
     hashed_emails = sorted({sha256_hash(e) for e in emails if e})
     hashed_phones = sorted({sha256_hash(meta_phone(p)) for p in phones if meta_phone(p)})
+    v_em, v_ph = versium_meta_hashes(cust)
+    hashed_emails = sorted(set(hashed_emails) | set(v_em))
+    hashed_phones = sorted(set(hashed_phones) | set(v_ph))
     city = meta_city(cust.get("md_city"))
     state = meta_state(cust.get("md_state"))
 
@@ -909,7 +960,7 @@ ENRICHMENT_FIELDS = [
     "md_date_of_birth", "md_gender", "md_delivery_indicator", "md_mik", "md_mak", "md_results",
     "versium_net_worth", "versium_home_market_value", "versium_auto_make_model",
 ]
-JSONB_FIELDS = {"versium_alt_emails", "versium_alt_phones", "versium_lifestyle_flags"}
+JSONB_FIELDS = {"versium_alt_emails", "versium_alt_phones", "versium_lifestyle_flags", "versium_online_audience"}
 
 _MC = "master_customers"
 
@@ -973,6 +1024,7 @@ UPSERT_UPDATE_RULES = {
     "versium_alt_emails": _jsonb("versium_alt_emails", "[]"),
     "versium_alt_phones": _jsonb("versium_alt_phones", "[]"),
     "versium_lifestyle_flags": _jsonb("versium_lifestyle_flags", "{}"),
+    "versium_online_audience": _jsonb("versium_online_audience", "{}"),
     "ts_lead_status": _keep("ts_lead_status"),
     "ts_max_guests": f"GREATEST(COALESCE({_MC}.ts_max_guests, 0), COALESCE(EXCLUDED.ts_max_guests, 0))",
     "ts_last_event_date": _keep("ts_last_event_date"),
@@ -1147,6 +1199,7 @@ def upsert_and_enrich_customer(cur, data: dict) -> tuple:
         "versium_alt_emails": json.dumps(enriched.get("alt_emails") or []),
         "versium_alt_phones": json.dumps(enriched.get("alt_phones") or []),
         "versium_lifestyle_flags": json.dumps(enriched.get("lifestyle_flags") or {}),
+        "versium_online_audience": json.dumps(enriched.get("online_audience") or {}),
         "ts_lead_status": data.get("ts_lead_status"),
         "ts_max_guests": int(data.get("ts_max_guests") or 0) or None,
         "ts_last_event_date": data.get("ts_last_event_date"),
@@ -1201,7 +1254,11 @@ def save_enrichment(cur, cluster_id: int, enr: dict, source: str, extra: dict = 
         sets.append("versium_alt_phones = %(alt_p)s::jsonb")
     if flags:
         sets.append("versium_lifestyle_flags = %(flags)s::jsonb")
+    online = enr.get("online_audience") or {}
+    if online:
+        sets.append("versium_online_audience = %(online)s::jsonb")
     vals.update({"alt_e": json.dumps(alt_e), "alt_p": json.dumps(alt_p), "flags": json.dumps(flags),
+                 "online": json.dumps(online),
                  "cid": cluster_id})
     cur.execute(f"UPDATE master_customers SET {', '.join(sets)}, updated_at = NOW() "
                 f"WHERE cluster_id = %(cid)s RETURNING *;", vals)

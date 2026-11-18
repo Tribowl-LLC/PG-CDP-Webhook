@@ -43,7 +43,7 @@ Application Server: FastAPI (`main.py`) hosted on Render (`https://pg-cdp-webhoo
 Database: Serverless PostgreSQL hosted on Neon (`customer_database`)
 Enrichment Providers:
 Melissa Data Personator API (`/v3/WEB/ContactVerify/doContactVerify`): Address verification, geocoding (`GrpGeo`), household demographics (`GrpDemographicBasic`), and persistent identity keys (`MelissaIdentityKey` / `md_mik` and `MelissaAddressKey` / `md_mak`).
-Versium REACH API (`/v2/contact`, `/v2/demographic`): Multi-email/phone identity graph (`email_1..5`, `phone_1..5`), wealth/home value signals, and B2B company/title matching.
+Versium REACH API (`/v2/contact`, `/v2/demographic`, `/v2/onlineAudience`): Multi-email/phone identity graph (`email_1..5`, `phone_1..5`), wealth/home value signals, B2B company/title matching, and platform-ready online audience IDs for Meta, LinkedIn and TikTok (only for customers passing `versium_online_append_eligible`). Versium's hashed Facebook emails/phones are added to every CAPI event's `em`/`ph`.
 Ad Destination: Meta Graph API `v21.0` (Server-Side Conversions API + Real-Time Custom Audience API).
 Required Environment Variables (Render Dashboard)
 Variable	Purpose
@@ -81,7 +81,7 @@ Revenue & Activity (De-duplicated):
 Tripleseat Event Tracking: `ts_account` (company name), `ts_lead_status` (`PROSPECT`, `TENTATIVE`, `DEFINITE`, `CLOSED`, `LOST`, `TURNED_DOWN`), `ts_max_guests`, `ts_last_event_date`, `ts_turned_down_reason`
 Partywirks Birthday Tracking: `pw_bookings`, `pw_last_package` (`BIRTHDAY EXTRAVAGANZA`, `BOWLING PARTY`, `TEEN PARTY`), `pw_last_party_date` (`DATE`)
 Melissa Demographic & Geo Columns: `md_address1`, `md_city`, `md_state`, `zip5`, `md_plus4`, `md_carrier_route`, `md_latitude`, `md_longitude`, `distance_miles` (Haversine distance from `42.4705, -83.3932`), `md_household_income`, `md_presence_of_children`, `md_children_age_range`, `md_own_rent`, `md_marital_status`, `md_household_size`, `md_length_of_residence`, `md_education`, `md_occupation`, `md_date_of_birth`, `md_gender`, `md_delivery_indicator` (`B` = Business, `R` = Residential), `md_mik` (Melissa Identity Key), `md_mak` (Melissa Address Key), `md_results`
-Versium REACH Columns: `versium_net_worth`, `versium_home_market_value`, `versium_auto_make_model`, `versium_b2b_company`, `versium_alt_emails` (`JSONB` array), `versium_alt_phones` (`JSONB` array), `versium_lifestyle_flags` (`JSONB`)
+Versium REACH Columns: `versium_net_worth`, `versium_home_market_value`, `versium_auto_make_model`, `versium_b2b_company`, `versium_alt_emails` (`JSONB` array), `versium_alt_phones` (`JSONB` array), `versium_lifestyle_flags` (`JSONB`), `versium_online_audience` (`JSONB`: Versium online audience append, `{"facebook"|"linkedin"|"tiktok": {field: [values]}}`; Facebook/TikTok emails and phones are SHA-256 hashed by Versium; requires `migrations/004`)
 Segmentation & Scoring: `pg_mosaic_persona` (`TEXT`), `bowler_value_score` (`INT` `0–100`)
 3.2 `customer_identities` (Cross-Channel Identity Graph)
 Maps every known identifier (`email`, `phone`, `sq_id`, `md_mik`) to a `cluster_id`.

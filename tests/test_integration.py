@@ -863,3 +863,82 @@ def test_credit_license_skips_melissa_without_a_street(client, db, fake, monkeyp
         db.execute("DELETE FROM unified_transactions WHERE cluster_id = %s", (row["cluster_id"],))
         db.execute("DELETE FROM customer_identities WHERE cluster_id = %s", (row["cluster_id"],))
         db.execute("DELETE FROM master_customers WHERE cluster_id = %s", (row["cluster_id"],))
+
+
+def ts_booking(uid, bid, eid, status="DEFINITE", created="2026-11-01T10:00:00Z", payments=None):
+    return {
+        "id": bid, "name": "Holiday Party", "status": status, "start_date": "2026-12-12",
+        "created_at": created, "updated_at": "2026-11-10T10:00:00Z",
+        "contact": {"first_name": "Corp", "last_name": f"Booker{uid}",
+                    "email_addresses": [{"address": f"tsbook-{uid}@example.test"}]},
+        "account": {"name": "Booking Co"},
+        "events": [{"id": eid, "status": status, "event_start_iso8601": "2026-12-12T18:00:00-05:00",
+                    "guest_count": 60, "grand_total": "2,400.00", "amount_due": "0.00"}],
+        "payment_sets": payments if payments is not None else [{"amount_due": 0, "payments": [
+            {"id": 1, "amount": 2000, "state": "paid", "payment_method": "Credit Card", "credit_card_type": "Visa"},
+            {"id": 2, "amount": 400, "state": "paid", "payment_method": "Check"}]}],
+    }
+
+
+def test_tripleseat_sync_booking_counts_once_and_keeps_money_out_of_spend(db, fake, uid):
+    bid, eid = int(uid[:8], 16), int(uid[4:12], 16)
+    with main.get_conn() as conn, conn.cursor() as cur:
+        res = main.ingest_tripleseat_booking(cur, ts_booking(uid, bid, eid), count_it=True)
+    assert res["status"] == "created"
+    db.execute("SELECT * FROM tripleseat_bookings WHERE booking_id = %s", (bid,))
+    b = db.fetchone()
+    assert float(b["paid_total"]) == 2400.0 and float(b["paid_not_card"]) == 400.0
+    db.execute("SELECT * FROM tripleseat_events WHERE event_id = %s", (eid,))
+    e = db.fetchone()
+    assert float(e["grand_total"]) == 2400.0 and e["cluster_id"] == b["cluster_id"] and e["guest_count"] == 60
+    c = customer_row(db, b["cluster_id"])
+    assert c["in_tripleseat"] == 1 and c["ts_events"] == 1 and c["ts_account"] == "Booking Co"
+    assert c["ts_max_guests"] == 60 and str(c["ts_last_event_date"])[:10] == "2026-12-12"
+    assert float(c["true_lifetime_spend"] or 0) == 0.0
+    # Re-reading the same booking (nightly overlap) changes nothing and never fires Meta.
+    with main.get_conn() as conn, conn.cursor() as cur:
+        assert main.ingest_tripleseat_booking(cur, ts_booking(uid, bid, eid), count_it=True)["status"] == "matched"
+    assert customer_row(db, b["cluster_id"])["ts_events"] == 1
+    assert fake.meta_events() == []
+
+
+def test_tripleseat_sync_skips_count_when_webhook_saw_the_event(client, db, fake, uid):
+    bid, eid = int(uid[:8], 16) + 1, int(uid[4:12], 16) + 1
+    hook = {"event": {"id": eid, "first_name": "Corp", "last_name": f"Booker{uid}", "status": "definite",
+                      "email_address": f"tsbook-{uid}@example.test", "event_date": "2026-12-12"}}
+    cid = client.post("/webhooks/tripleseat", headers=WH, json=hook).json()["cluster_id"]
+    assert customer_row(db, cid)["ts_events"] == 1
+    with main.get_conn() as conn, conn.cursor() as cur:
+        main.ingest_tripleseat_booking(cur, ts_booking(uid, bid, eid), count_it=True)
+    assert customer_row(db, cid)["ts_events"] == 1
+
+
+def test_tripleseat_history_is_recorded_without_counting(db, fake, uid):
+    bid, eid = int(uid[:8], 16) + 2, int(uid[4:12], 16) + 2
+    with main.get_conn() as conn, conn.cursor() as cur:
+        main.ingest_tripleseat_booking(cur, ts_booking(uid, bid, eid, created="2021-03-01T00:00:00Z",
+                                                       payments=[]), count_it=False)
+    db.execute("SELECT cluster_id, payments, paid_total FROM tripleseat_bookings WHERE booking_id = %s", (bid,))
+    b = db.fetchone()
+    assert b["payments"] == [] and float(b["paid_total"]) == 0.0
+    assert (customer_row(db, b["cluster_id"])["ts_events"] or 0) == 0
+
+
+def test_tripleseat_lead_stored_with_campaign_and_dry_run_writes_nothing(db, fake, uid):
+    lid = int(uid[:8], 16) + 3
+    lead = {"id": lid, "first_name": "Lead", "last_name": f"Person{uid}", "email_address": f"tslead-{uid}@example.test",
+            "company": "Lead Co", "guest_count": 25, "event_date": "12/20/2026", "campaign_source": "google",
+            "campaign_medium": "cpc", "selected_lead_sources": [{"lead_source": {"name": "Website"}}],
+            "created_at": "2026-11-15T12:00:00Z"}
+    with main.get_conn() as conn, conn.cursor() as cur:
+        assert main.ingest_tripleseat_lead(cur, lead, apply=False)["status"] == "would_created"
+    db.execute("SELECT 1 FROM tripleseat_leads WHERE lead_id = %s", (lid,))
+    assert db.fetchone() is None
+    with main.get_conn() as conn, conn.cursor() as cur:
+        assert main.ingest_tripleseat_lead(cur, lead)["status"] == "created"
+    db.execute("SELECT * FROM tripleseat_leads WHERE lead_id = %s", (lid,))
+    row = db.fetchone()
+    assert row["campaign"] == {"source": "google", "medium": "cpc"} and row["lead_sources"] == ["Website"]
+    assert str(row["event_date"]) == "2026-12-20"
+    c = customer_row(db, row["cluster_id"])
+    assert c["ts_lead_status"] == "PROSPECT" and (c["ts_events"] or 0) == 0

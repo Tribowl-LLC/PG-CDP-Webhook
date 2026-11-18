@@ -2115,6 +2115,331 @@ def tripleseat_status(request: Request, check: bool = False, key: Optional[str] 
     return out
 
 
+# ---------------------------------------------------------------------------
+# Tripleseat API sync: bookings (with their events and payments) and leads. Links each to a customer
+# (in_tripleseat, ts_* fields) and stores the records in tripleseat_bookings / _events / _leads
+# (migrations/007). Never changes lifetime spend and never sends Meta events: Tripleseat money mostly
+# settles through Square, and history isn't a live signal.
+# ---------------------------------------------------------------------------
+TRIPLESEAT_DATE_FORMAT = os.getenv("TRIPLESEAT_DATE_FORMAT", "%m/%d/%Y")  # search filter dates
+TRIPLESEAT_PAGE_PAUSE = 0.15  # seconds between API pages (limit is 10 requests/second)
+
+
+def ts_money(val) -> Optional[float]:
+    if val in (None, ""):
+        return None
+    try:
+        return round(float(str(val).replace(",", "").replace("$", "").strip()), 2)
+    except ValueError:
+        return None
+
+
+def ts_date(val) -> Optional[str]:
+    """ISO 'YYYY-MM-DD' from Tripleseat's ISO timestamps or 'MM/DD/YYYY' dates."""
+    if not val or not isinstance(val, str):
+        return None
+    v = val.strip()
+    if re.match(r"^\d{4}-\d{2}-\d{2}", v):
+        return v[:10]
+    m = re.match(r"^(\d{1,2})/(\d{1,2})/(\d{4})", v)
+    return f"{m.group(3)}-{int(m.group(1)):02d}-{int(m.group(2)):02d}" if m else None
+
+
+def ts_timestamp(val) -> Optional[str]:
+    return val if isinstance(val, str) and re.match(r"^\d{4}-\d{2}-\d{2}", val.strip()) else None
+
+
+def ts_contact_identity(contact: dict, account: dict, fallback: dict = None) -> dict:
+    """Name / email / phone / address from a Tripleseat contact (falling back to a lead's own fields)."""
+    contact = contact if isinstance(contact, dict) else {}
+    account = account if isinstance(account, dict) else {}
+    fb = fallback or {}
+    emails = [e.get("address") for e in contact.get("email_addresses") or [] if isinstance(e, dict) and e.get("address")]
+    phones = [p.get("number") for p in contact.get("phone_numbers") or [] if isinstance(p, dict) and p.get("number")]
+    addrs = [a for a in contact.get("addresses") or [] if isinstance(a, dict)]
+    a = addrs[0] if addrs else {}
+    return {
+        "first_name": contact.get("first_name") or fb.get("first_name") or "",
+        "last_name": contact.get("last_name") or fb.get("last_name") or "",
+        "email": (emails[0] if emails else "") or fb.get("email_address") or "",
+        "phone": (phones[0] if phones else "") or fb.get("phone_number") or "",
+        "address": a.get("address1"), "city": a.get("city"), "state": a.get("state"),
+        "zip": a.get("zip_code") or a.get("zip"),
+        "ts_account": account.get("name") or fb.get("company") or None,
+    }
+
+
+def ts_payment_summary(payment_sets) -> dict:
+    """Totals from a booking's payment_sets. Card payments go through Square (already in spend);
+    paid_not_card is what was paid some other way (check, ACH, cash)."""
+    if not isinstance(payment_sets, list):
+        return {"payments": None, "paid_total": None, "paid_not_card": None, "refunded_total": None,
+                "amount_due": None}
+    payments, paid = [], 0.0
+    not_card = refunded = due = 0.0
+    for ps in payment_sets:
+        if not isinstance(ps, dict):
+            continue
+        due += ts_money(ps.get("amount_due")) or 0.0
+        for pay in ps.get("payments") or []:
+            if not isinstance(pay, dict):
+                continue
+            amount = ts_money(pay.get("amount")) or 0.0
+            back = ts_money(pay.get("amount_refunded")) or 0.0
+            state = str(pay.get("state") or "").lower()
+            method = str(pay.get("payment_method") or "")
+            is_card = bool(pay.get("credit_card_type")) or "card" in method.lower()
+            if state in ("paid", "refunded", "partially_refunded") or pay.get("paid_at"):
+                net = max(amount - back, 0.0)
+                paid += net
+                refunded += back
+                if not is_card:
+                    not_card += net
+            # Only what's needed to match payments later; no notes, references or payer names.
+            payments.append({"id": pay.get("id"), "amount": amount, "state": state or None,
+                             "paid_at": pay.get("paid_at"), "method": method or None, "card": is_card,
+                             "refunded": back or None})
+    return {"payments": payments, "paid_total": round(paid, 2), "paid_not_card": round(not_card, 2),
+            "refunded_total": round(refunded, 2), "amount_due": round(due, 2)}
+
+
+def _ts_lead_sources(obj: dict) -> list:
+    out = []
+    for s_ in obj.get("selected_lead_sources") or []:
+        if isinstance(s_, dict):
+            src = s_.get("lead_source") if isinstance(s_.get("lead_source"), dict) else {}
+            name = src.get("name") or s_.get("lead_source_other")
+            if name:
+                out.append(name)
+    return out
+
+
+def _ts_link_customer(cur, ident: dict, extra: dict, apply: bool) -> tuple:
+    """(customer or None, "created"|"matched"|"no_identity"). Dry runs only look the person up."""
+    if not any(ident.get(k) for k in ("email", "phone", "first_name", "last_name")):
+        return None, "no_identity"
+    found = _find_existing(cur, "", (ident["email"] or "").strip().lower(), clean_phone(ident["phone"]),
+                           ident["first_name"].strip(), ident["last_name"].strip())
+    how = "matched" if found else "created"
+    if not apply:
+        return found, how
+    cust, _ = upsert_and_enrich_customer(cur, {**ident, **extra, "in_tripleseat": 1, "source": "Tripleseat"})
+    return cust, how
+
+
+def _ts_known(cur, txn_ids: list) -> set:
+    cur.execute("SELECT transaction_id FROM unified_transactions WHERE transaction_id = ANY(%s);", (txn_ids,))
+    return {r["transaction_id"] for r in cur.fetchall()}
+
+
+def ingest_tripleseat_booking(cur, booking: dict, count_it: bool, apply: bool = True) -> dict:
+    bid = booking.get("id")
+    if not bid:
+        return {"status": "skipped_no_id"}
+    events = [e for e in booking.get("events") or [] if isinstance(e, dict) and e.get("id")]
+    status = str(booking.get("status") or "").upper() or None
+    live_events = [e for e in events if str(e.get("status") or "").upper() != "LOST" and not e.get("deleted_at")]
+    dates = [d for d in (ts_date(e.get("event_start_iso8601") or e.get("event_date")) for e in live_events) if d]
+    guests = max([to_int(e.get("guest_count") or e.get("guaranteed_guest_count")) for e in live_events] or [0])
+    lost = next((e.get("lost_reason") for e in events if e.get("lost_reason")), None) or booking.get("lost_reason")
+    lost_name = lost.get("name") if isinstance(lost, dict) else lost
+    ident = ts_contact_identity(booking.get("contact"), booking.get("account"))
+    cust, how = _ts_link_customer(cur, ident, {
+        "ts_lead_status": status, "ts_max_guests": guests or None,
+        "ts_last_event_date": max(dates) if dates else None, "ts_turned_down_reason": lost_name,
+    }, apply)
+    money = ts_payment_summary(booking.get("payment_sets"))
+    if not apply:
+        return {"status": f"would_{how}", "has_payments": money["payments"] is not None}
+    cid = cust["cluster_id"] if cust else None
+    if cust:
+        # One count per booking, and only if no webhook already recorded it or one of its events.
+        txn_ids = [f"ts_booking_{bid}"] + [f"ts_event_{e['id']}" for e in events]
+        first_time = not _ts_known(cur, txn_ids)
+        for t in txn_ids:
+            cust, _ = _count_record_once(cur, cust, t, "tripleseat", "ts_events", bump=False)
+        if first_time and count_it and status != "LOST" and live_events:
+            cur.execute("UPDATE master_customers SET ts_events = COALESCE(ts_events, 0) + 1 WHERE cluster_id = %s;",
+                        (cid,))
+    cur.execute("""
+        INSERT INTO tripleseat_bookings (booking_id, cluster_id, status, name, account_name, start_date, end_date,
+            market_segment, lead_sources, payments, paid_total, paid_not_card, refunded_total, amount_due,
+            ts_created_at, ts_updated_at, synced_at)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())
+        ON CONFLICT (booking_id) DO UPDATE SET cluster_id = COALESCE(EXCLUDED.cluster_id, tripleseat_bookings.cluster_id),
+            status = EXCLUDED.status, name = EXCLUDED.name, account_name = EXCLUDED.account_name,
+            start_date = EXCLUDED.start_date, end_date = EXCLUDED.end_date, market_segment = EXCLUDED.market_segment,
+            lead_sources = EXCLUDED.lead_sources,
+            payments = COALESCE(EXCLUDED.payments, tripleseat_bookings.payments),
+            paid_total = COALESCE(EXCLUDED.paid_total, tripleseat_bookings.paid_total),
+            paid_not_card = COALESCE(EXCLUDED.paid_not_card, tripleseat_bookings.paid_not_card),
+            refunded_total = COALESCE(EXCLUDED.refunded_total, tripleseat_bookings.refunded_total),
+            amount_due = COALESCE(EXCLUDED.amount_due, tripleseat_bookings.amount_due),
+            ts_created_at = EXCLUDED.ts_created_at, ts_updated_at = EXCLUDED.ts_updated_at, synced_at = NOW()
+    """, (bid, cid, status, booking.get("name"), ident["ts_account"], ts_date(booking.get("start_date")),
+          ts_date(booking.get("end_date")), booking.get("market_segment"), json.dumps(_ts_lead_sources(booking)),
+          json.dumps(money["payments"]) if money["payments"] is not None else None, money["paid_total"],
+          money["paid_not_card"], money["refunded_total"], money["amount_due"],
+          ts_timestamp(booking.get("created_at")), ts_timestamp(booking.get("updated_at"))))
+    for e in events:
+        lr = e.get("lost_reason")
+        cur.execute("""
+            INSERT INTO tripleseat_events (event_id, booking_id, cluster_id, status, name, event_date, guest_count,
+                event_type_id, grand_total, actual_amount, amount_due, deposit_amount, lost_reason,
+                ts_created_at, ts_updated_at, synced_at)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())
+            ON CONFLICT (event_id) DO UPDATE SET booking_id = EXCLUDED.booking_id,
+                cluster_id = COALESCE(EXCLUDED.cluster_id, tripleseat_events.cluster_id), status = EXCLUDED.status,
+                name = EXCLUDED.name, event_date = EXCLUDED.event_date, guest_count = EXCLUDED.guest_count,
+                event_type_id = EXCLUDED.event_type_id,
+                grand_total = COALESCE(EXCLUDED.grand_total, tripleseat_events.grand_total),
+                actual_amount = COALESCE(EXCLUDED.actual_amount, tripleseat_events.actual_amount),
+                amount_due = COALESCE(EXCLUDED.amount_due, tripleseat_events.amount_due),
+                deposit_amount = COALESCE(EXCLUDED.deposit_amount, tripleseat_events.deposit_amount),
+                lost_reason = EXCLUDED.lost_reason, ts_created_at = EXCLUDED.ts_created_at,
+                ts_updated_at = EXCLUDED.ts_updated_at, synced_at = NOW()
+        """, (e["id"], bid, cid, str(e.get("status") or "").upper() or None, e.get("name"),
+              ts_date(e.get("event_start_iso8601") or e.get("event_date")),
+              to_int(e.get("guest_count") or e.get("guaranteed_guest_count")) or None, e.get("event_type_id"),
+              ts_money(e.get("grand_total")), ts_money(e.get("actual_amount")), ts_money(e.get("amount_due")),
+              ts_money(e.get("deposit_amount")), lr.get("name") if isinstance(lr, dict) else lr,
+              ts_timestamp(e.get("created_at")), ts_timestamp(e.get("updated_at"))))
+    return {"status": how if cust else "stored_without_customer", "has_payments": money["payments"] is not None}
+
+
+def ingest_tripleseat_lead(cur, lead: dict, apply: bool = True) -> dict:
+    lid = lead.get("id")
+    if not lid:
+        return {"status": "skipped_no_id"}
+    ident = ts_contact_identity(lead.get("contact"), lead.get("account"), fallback=lead)
+    status = "TURNED_DOWN" if lead.get("turned_down_at") else ("CONVERTED" if lead.get("converted_at") else "PROSPECT")
+    event_date = ts_date(lead.get("event_date"))
+    cust, how = _ts_link_customer(cur, ident, {
+        "ts_max_guests": to_int(lead.get("guest_count")) or None, "ts_last_event_date": event_date,
+        # A lead never downgrades a booking's status; only an unknown status is filled in.
+        "ts_lead_status": None,
+    }, apply)
+    if not apply:
+        return {"status": f"would_{how}"}
+    cid = cust["cluster_id"] if cust else None
+    if cust:
+        cust, _ = _count_record_once(cur, cust, f"ts_lead_{lid}", "tripleseat", "ts_events", bump=False)
+        cur.execute("UPDATE master_customers SET ts_lead_status = COALESCE(ts_lead_status, %s) WHERE cluster_id = %s;",
+                    (status, cid))
+    booking = lead.get("booking") if isinstance(lead.get("booking"), dict) else {}
+    campaign = {k: lead.get(f"campaign_{k}") for k in ("source", "medium", "name", "term", "content")
+                if lead.get(f"campaign_{k}")}
+    cur.execute("""
+        INSERT INTO tripleseat_leads (lead_id, cluster_id, booking_id, company, event_description, event_date,
+            guest_count, email_opt_in, campaign, lead_sources, converted_at, turned_down_at, ts_created_at,
+            ts_updated_at, synced_at)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())
+        ON CONFLICT (lead_id) DO UPDATE SET cluster_id = COALESCE(EXCLUDED.cluster_id, tripleseat_leads.cluster_id),
+            booking_id = COALESCE(EXCLUDED.booking_id, tripleseat_leads.booking_id), company = EXCLUDED.company,
+            event_description = EXCLUDED.event_description, event_date = EXCLUDED.event_date,
+            guest_count = EXCLUDED.guest_count, email_opt_in = EXCLUDED.email_opt_in, campaign = EXCLUDED.campaign,
+            lead_sources = EXCLUDED.lead_sources, converted_at = EXCLUDED.converted_at,
+            turned_down_at = EXCLUDED.turned_down_at, ts_created_at = EXCLUDED.ts_created_at,
+            ts_updated_at = EXCLUDED.ts_updated_at, synced_at = NOW()
+    """, (lid, cid, booking.get("id"), ident["ts_account"], (lead.get("event_description") or "")[:2000] or None,
+          event_date, to_int(lead.get("guest_count")) or None, lead.get("email_opt_in"), json.dumps(campaign),
+          json.dumps(_ts_lead_sources(lead)), ts_timestamp(lead.get("converted_at")),
+          ts_timestamp(lead.get("turned_down_at")), ts_timestamp(lead.get("created_at")),
+          ts_timestamp(lead.get("updated_at"))))
+    return {"status": how if cust else "stored_without_customer"}
+
+
+def tripleseat_pages(path: str, params: dict, max_pages: int = 2000):
+    """Yields every result of a paginated Tripleseat search, oldest-updated first where supported."""
+    page = 1
+    while page <= max_pages:
+        body = tripleseat_get(path, {**params, "page": page})
+        results = body.get("results") if isinstance(body, dict) else body
+        for r in results or []:
+            yield r
+        total = body.get("total_pages") if isinstance(body, dict) else None
+        if not results or not total or page >= int(total):
+            return
+        page += 1
+        time.sleep(TRIPLESEAT_PAGE_PAUSE)
+
+
+def run_tripleseat_sync(days_back: Optional[int] = 3, count_created_since: Optional[str] = None,
+                        apply: bool = True) -> dict:
+    """Reads bookings updated in the last `days_back` days (every booking when None) and leads created in
+    that window, and stores them. A booking created before `count_created_since` (YYYY-MM-DD) is recorded
+    without adding to ts_events; the history import passes today so old bookings aren't counted as new.
+    apply=False only looks customers up and reports what it would do."""
+    stats = collections.Counter()
+    booking_params = {"show_financial": "true", "order": "updated_at", "sort_direction": "asc"}
+    lead_params = {"order": "created_at", "sort_direction": "asc"}
+    since = None
+    if days_back is not None:
+        since = date.fromordinal(date.today().toordinal() - max(0, int(days_back)))
+        booking_params["booking_updated_start_date"] = since.strftime(TRIPLESEAT_DATE_FORMAT)
+        lead_params["created_after"] = since.strftime(TRIPLESEAT_DATE_FORMAT)
+    conn = get_conn()
+    shown_fields = False
+    try:
+        for kind, path, params in (("booking", "/bookings/search.json", booking_params),
+                                   ("lead", "/leads/search.json", lead_params)):
+            for rec in tripleseat_pages(path, params):
+                if not isinstance(rec, dict):
+                    continue
+                if not shown_fields and kind == "booking":
+                    log_tripleseat_fields({"booking": rec})  # field names only, never values
+                    shown_fields = True
+                stats[f"{kind}s_read"] += 1
+                try:
+                    with conn:
+                        with conn.cursor() as cur:
+                            if kind == "booking":
+                                created = ts_date(rec.get("created_at")) or ""
+                                count_it = not count_created_since or created >= count_created_since
+                                res = ingest_tripleseat_booking(cur, rec, count_it, apply=apply)
+                                if not res.get("has_payments", True):
+                                    stats["bookings_without_payment_data"] += 1
+                            else:
+                                res = ingest_tripleseat_lead(cur, rec, apply=apply)
+                    stats[f"{kind}_{res['status']}"] += 1
+                except Exception as e:
+                    stats[f"{kind}_failed"] += 1
+                    log.error("Tripleseat %s %s not saved: %s: %s", kind, rec.get("id"), type(e).__name__, str(e)[:200])
+    finally:
+        conn.close()
+    out = {"status": "tripleseat_sync_complete" if apply else "tripleseat_sync_dry_run",
+           "since": since.isoformat() if since else "all", **stats}
+    log.info("Tripleseat sync: %s", out)
+    return out
+
+
+def _run_tripleseat_sync_logged(*args, **kwargs):
+    try:
+        run_tripleseat_sync(*args, **kwargs)
+    except TripleseatNotConnected as e:
+        log.error("Tripleseat sync skipped: %s", e)
+    except Exception as e:
+        log.exception("Tripleseat sync failed: %s", type(e).__name__)
+
+
+@app.post("/cron/sync-tripleseat")
+def sync_tripleseat(request: Request, background_tasks: BackgroundTasks, days_back: int = 3,
+                    history: bool = False, apply: bool = True, key: Optional[str] = CRON_KEY_PARAM):
+    """Nightly: bookings updated and leads created in the last days_back days. history=true reads every
+    booking and lead, without counting old bookings as new events; run it with apply=false first to see how
+    many new customers it would create. Runs in the background; the totals appear in the logs as
+    "Tripleseat sync: {...}"."""
+    require_cron_key(request)
+    if not tripleseat_enabled():
+        return {"status": "error", "message": "Tripleseat isn't set up (TRIPLESEAT_CLIENT_ID / _SECRET)"}
+    if history:
+        background_tasks.add_task(_run_tripleseat_sync_logged, None, date.today().isoformat(), apply)
+    else:
+        background_tasks.add_task(_run_tripleseat_sync_logged, max(0, min(days_back, 400)), None, apply)
+    return {"status": "tripleseat_sync_queued", "history": history, "apply": apply,
+            "days_back": None if history else days_back}
+
+
 @app.post("/webhooks/tripleseat")
 async def tripleseat_webhook(request: Request, background_tasks: BackgroundTasks):
     """Tripleseat Lead, Event, Booking, and Contact webhooks."""

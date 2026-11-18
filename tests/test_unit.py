@@ -1,3 +1,4 @@
+import json
 import main
 
 
@@ -454,3 +455,85 @@ def test_tripleseat_get_renews_once_on_401_and_waits_on_429(monkeypatch):
     assert main.tripleseat_get("/sites.json") == [{"id": 1}]
     assert seen[0] == ("https://api.tripleseat.com/v1/sites.json", "Bearer t1")
     assert [h for _u, h in seen[1:]] == ["Bearer t2", "Bearer t2"]
+
+
+def test_tripleseat_money_and_dates():
+    assert main.ts_money("1,234.50") == 1234.5 and main.ts_money("$20") == 20.0
+    assert main.ts_money("") is None and main.ts_money("n/a") is None and main.ts_money(None) is None
+    assert main.ts_date("2026-12-05T18:00:00-05:00") == "2026-12-05"
+    assert main.ts_date("3/7/2025") == "2025-03-07"
+    assert main.ts_date("soon") is None and main.ts_date(None) is None
+    assert main.ts_timestamp("2026-01-02T03:04:05Z") and main.ts_timestamp("01/02/2026") is None
+
+
+def test_tripleseat_payment_summary_separates_card_from_check_and_refunds():
+    out = main.ts_payment_summary([
+        {"amount_due": "100.00", "payments": [
+            {"id": 1, "amount": 500, "state": "paid", "payment_method": "Credit Card", "credit_card_type": "Visa",
+             "paid_by": "Jane Payer", "internal_note": "call first", "reference": "1234"},
+            {"id": 2, "amount": 300, "state": "paid", "payment_method": "Check", "paid_at": "2026-01-01"},
+            {"id": 3, "amount": 200, "state": "refunded", "payment_method": "ACH", "amount_refunded": 200},
+            {"id": 4, "amount": 900, "state": "unpaid", "payment_method": None},
+        ]}])
+    assert out["paid_total"] == 800.0 and out["paid_not_card"] == 300.0
+    assert out["refunded_total"] == 200.0 and out["amount_due"] == 100.0
+    assert [p["card"] for p in out["payments"]] == [True, False, False, False]
+    stored = json.dumps(out["payments"])
+    for private in ("Jane Payer", "call first", "1234"):
+        assert private not in stored
+    assert main.ts_payment_summary(None)["payments"] is None  # no payment data: stays unknown, not $0
+
+
+def test_tripleseat_contact_identity_prefers_contact_then_lead_fields():
+    ident = main.ts_contact_identity(
+        {"first_name": "Ann", "last_name": "Lee", "email_addresses": [{"address": "ann@example.test"}],
+         "phone_numbers": [{"number": "248-555-0100"}],
+         "addresses": [{"address1": "1 Main", "city": "Novi", "state": "MI", "zip_code": "48375"}]},
+        {"name": "Acme"})
+    assert (ident["email"], ident["phone"], ident["zip"], ident["ts_account"]) == \
+        ("ann@example.test", "248-555-0100", "48375", "Acme")
+    lead = main.ts_contact_identity(None, None, fallback={"first_name": "Bo", "email_address": "bo@example.test",
+                                                          "phone_number": "2485550101", "company": "Beta"})
+    assert (lead["first_name"], lead["email"], lead["ts_account"]) == ("Bo", "bo@example.test", "Beta")
+
+
+def test_tripleseat_pages_follow_total_pages(monkeypatch):
+    calls = []
+
+    def fake_get(path, params=None):
+        calls.append(params["page"])
+        return {"total_pages": 3, "results": [{"id": params["page"]}]}
+    monkeypatch.setattr(main, "tripleseat_get", fake_get)
+    monkeypatch.setattr(main.time, "sleep", lambda s: None)
+    assert [r["id"] for r in main.tripleseat_pages("/bookings/search.json", {})] == [1, 2, 3]
+    assert calls == [1, 2, 3]
+
+
+def test_tripleseat_sync_filters_by_window_and_never_counts_history(monkeypatch):
+    import datetime as dt
+    asked, ingested = [], []
+    monkeypatch.setattr(main, "tripleseat_pages", lambda path, params: asked.append((path, params)) or iter(
+        [{"id": 7, "created_at": "2020-05-01T00:00:00Z"}] if "bookings" in path else [{"id": 8}]))
+    monkeypatch.setattr(main, "get_conn", lambda: _FakeTokenDB(None))
+    monkeypatch.setattr(main, "ingest_tripleseat_booking",
+                        lambda cur, b, count_it, apply=True: ingested.append(("b", count_it, apply)) or
+                        {"status": "matched", "has_payments": False})
+    monkeypatch.setattr(main, "ingest_tripleseat_lead",
+                        lambda cur, l, apply=True: ingested.append(("l", None, apply)) or {"status": "created"})
+    out = main.run_tripleseat_sync(days_back=3)
+    since = (dt.date.today() - dt.timedelta(days=3)).strftime("%m/%d/%Y")
+    assert asked[0][1]["booking_updated_start_date"] == since and asked[0][1]["show_financial"] == "true"
+    assert asked[1][1]["created_after"] == since
+    assert ingested == [("b", True, True), ("l", None, True)]
+    assert out["booking_matched"] == 1 and out["lead_created"] == 1 and out["bookings_without_payment_data"] == 1
+    asked.clear(); ingested.clear()
+    out = main.run_tripleseat_sync(days_back=None, count_created_since=dt.date.today().isoformat(), apply=False)
+    assert "booking_updated_start_date" not in asked[0][1] and "created_after" not in asked[1][1]
+    assert ingested[0] == ("b", False, False) and out["status"] == "tripleseat_sync_dry_run"
+
+
+def test_tripleseat_sync_endpoint_off_without_secret(monkeypatch):
+    from fastapi.testclient import TestClient
+    monkeypatch.setattr(main, "TRIPLESEAT_CLIENT_SECRET", None)
+    r = TestClient(main.app).post("/cron/sync-tripleseat?key=test-cron-secret")
+    assert r.status_code == 200 and r.json()["status"] == "error"

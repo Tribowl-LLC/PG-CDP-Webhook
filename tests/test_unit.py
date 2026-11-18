@@ -176,3 +176,19 @@ def test_stored_geography_gates_versium_when_webhook_has_no_address(monkeypatch)
     main.run_melissa_and_versium_waterfall("A", "B", "a@b.com", "", "1 Main", "Novi", "MI", "48375",
                                            known={"md_state": "OH", "zip5": "43604"})
     assert any("onlineAudience" in u for u in calls)
+
+
+def test_rejected_online_audience_call_is_logged(monkeypatch, caplog):
+    from conftest import FakeResponse
+    monkeypatch.setattr(main.requests, "get",
+                        lambda url, **kw: FakeResponse(400, {"errors": ["Invalid rcfg_oa_services value"]}))
+    with caplog.at_level("ERROR", logger="pg_cdp"):
+        assert main.fetch_versium_online_audience({}, {"email": "a@b.com"}) == {}
+    assert "online audience rejected (HTTP 400)" in caplog.text and "a@b.com" not in caplog.text
+
+
+def test_slow_lookups_skip_online_audience(monkeypatch):
+    calls = _fake_versium(monkeypatch)
+    monkeypatch.setattr(main, "VERSIUM_ONLINE_BUDGET_SECONDS", -1)
+    main.run_melissa_and_versium_waterfall("A", "B", "a@b.com", "", "1 Main", "Novi", "MI", "48375")
+    assert any("/v2/contact" in u for u in calls) and not any("onlineAudience" in u for u in calls)

@@ -216,6 +216,7 @@ def strip_blocked_versium_fields(fields: dict) -> dict:
 
 
 VERSIUM_ONLINE_AUDIENCE_SERVICES = ("facebook", "linkedin", "tiktok")
+VERSIUM_ONLINE_BUDGET_SECONDS = 6
 _SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -237,14 +238,23 @@ def parse_versium_online_audience(body: dict) -> dict:
     return out
 
 
-def fetch_versium_online_audience(v_headers: dict, v_input: dict) -> dict:
-    vo = requests.get(
+def fetch_versium_online_audience(v_headers: dict, v_input: dict, timeout: float = 4) -> dict:
+    """A rejected call (bad parameter, no credits, auth) is logged with Versium's reason, never silent."""
+    resp = requests.get(
         "https://api.versium.com/v2/onlineAudience",
         headers=v_headers,
         params={**v_input, "rcfg_oa_services[]": list(VERSIUM_ONLINE_AUDIENCE_SERVICES)},
-        timeout=5,
-    ).json()
-    return parse_versium_online_audience(vo)
+        timeout=timeout,
+    )
+    try:
+        body = resp.json()
+    except ValueError:
+        body = {}
+    if resp.status_code != 200:
+        err = body.get("errors") or body.get("error") or body.get("message") if isinstance(body, dict) else None
+        log.error("Versium online audience rejected (HTTP %s): %s", resp.status_code, str(err)[:300])
+        return {}
+    return parse_versium_online_audience(body)
 
 
 def versium_meta_hashes(cust: dict) -> tuple:
@@ -424,6 +434,7 @@ def run_melissa_and_versium_waterfall(first_name: str, last_name: str, email: st
     arrives without an address can't make a known Detroit or out-of-state customer look "unknown".
     """
     zip_code = (zip_code or "")[:5]
+    started = time.monotonic()
     result = {
         "alt_emails": [],
         "alt_phones": [],
@@ -537,7 +548,10 @@ def run_melissa_and_versium_waterfall(first_name: str, last_name: str, email: st
             log.warning("Versium lookup failed: %s", type(e).__name__)
 
         # Online audience append (Meta / LinkedIn / TikTok IDs): local, advertisable customers only.
-        if versium_online_append_eligible(gate_city, gate_state, gate_zip):
+        # Enrichment runs inside the webhook request, so it is skipped (and retried on a later
+        # enrichment) when the earlier lookups were already slow.
+        if versium_online_append_eligible(gate_city, gate_state, gate_zip) and \
+                time.monotonic() - started < VERSIUM_ONLINE_BUDGET_SECONDS:
             try:
                 result["online_audience"] = fetch_versium_online_audience(v_headers, v_input)
             except Exception as e:

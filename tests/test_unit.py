@@ -217,3 +217,26 @@ def test_unreadable_online_audience_answer_stays_retryable(monkeypatch):
     from conftest import FakeResponse
     monkeypatch.setattr(main.requests, "get", lambda url, **kw: FakeResponse(200, ["unexpected"]))
     assert main.fetch_versium_online_audience({}, {}) is None
+
+
+def test_melissa_lookup_maps_census_fields_only_with_a_street(monkeypatch):
+    from conftest import FakeResponse
+    monkeypatch.setattr(main, "MELISSA_API_KEY", "k")
+    rec = {"AddressLine1": "1 Main", "City": "Novi", "State": "MI", "PostalCode": "48375", "Latitude": "42.48",
+           "Longitude": "-83.47", "CensusTract": "141000", "CensusBlock": "2001", "CountyName": "Oakland",
+           "UnifiedSchoolDistrictName": "Novi Community School District", "Results": "AS01"}
+    seen = {}
+    def get(url, params=None, **kw):
+        seen.update(params); return FakeResponse(200, {"Records": [rec]})
+    monkeypatch.setattr(main.requests, "get", get)
+    out = main.melissa_lookup("A", "B", "a@b.com", "")
+    assert "GrpCensus" in seen["cols"] and "GrpCensus2" in seen["cols"]
+    assert (out["md_census_tract"], out["md_county_name"], out["md_unified_school_district_name"]) == \
+        ("141000", "Oakland", "Novi Community School District")
+    assert out["distance_miles"] is not None
+    monkeypatch.setattr(main.requests, "get", lambda url, **kw: FakeResponse(200, {"Records": [{"Results": "AE01",
+                                                                                                 "CensusTract": "9"}]}))
+    out = main.melissa_lookup("A", "B", "a@b.com", "")
+    assert out["md_census_tract"] is None and out["md_results"] == "AE01"
+    monkeypatch.setattr(main, "MELISSA_API_KEY", None)
+    assert main.melissa_lookup("A", "B", "a@b.com", "") == {}

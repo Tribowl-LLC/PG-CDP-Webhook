@@ -164,6 +164,8 @@ class FakeHTTP:
             "AddressLine1": "100 Test St", "City": city, "State": "MI", "PostalCode": zip5,
             "Latitude": str(lat), "Longitude": str(lon), "Results": "AS01",
             "MelissaIdentityKey": f"MIK-{uuid.uuid4().hex}", "MelissaAddressKey": f"MAK-{uuid.uuid4().hex}",
+            "CensusTract": "152300", "CensusBlock": "1004", "CountyName": "Oakland",
+            "UnifiedSchoolDistrictName": "Farmington Public School District",
         }]})
 
 

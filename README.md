@@ -163,6 +163,8 @@ Calls PostgreSQL function `adjust_meta_capi_thermostat()` nightly at 3:00 AM via
 Paginates through Square `/v2/catalog/list` (`ITEM,CATEGORY`), classifies items into Perfect Game departments, and upserts all variations into `square_catalog_items`.
 `POST /cron/enrich-partywirks`
 Batch-enriches any `in_partywirks = 1` rows missing `md_address1` via Melissa Personator and recalculates their persona and `bowler_value_score`.
+`POST /cron/melissa-geocode?limit=100`
+Runs customers with a street address + ZIP but no coordinates (e.g. addresses from a Versium CSV) through Melissa: verified address, `distance_miles`, census tract/block, county and school districts, demographics; then rescores them. Highest scores first, at most `limit` paid lookups per call (max 500). Each customer is tried once (`md_results` gets `GEO_TRIED`); a Melissa outage leaves them for the next run.
 `POST /cron/versium-online-audience?limit=100`
 Versium online audience append (Meta / Google / LinkedIn / TikTok IDs) for eligible customers (`versium_online_append_eligible`) that don't have it yet: never checked, or the live call was skipped (slow lookups) or failed. Highest scores first, at most `limit` paid lookups per call (max 500); stops after 3 rejections in a row. No-match customers are marked `_checked` so they aren't bought again.
 `POST /cron/recover-square-avs-zips`

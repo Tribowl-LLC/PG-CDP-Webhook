@@ -640,7 +640,8 @@ def test_existing_customer_gaining_a_square_id_gets_no_history_credit(client, db
 def test_docs_shows_key_box_on_cron_endpoints(client):
     spec = client.get("/openapi.json").json()
     for path in ("/cron/adjust-thermostat", "/cron/sync-square-catalog", "/cron/enrich-partywirks",
-                 "/cron/recover-square-avs-zips", "/cron/sync-partywirks", "/cron/versium-online-audience"):
+                 "/cron/recover-square-avs-zips", "/cron/sync-partywirks", "/cron/versium-online-audience",
+                 "/cron/melissa-geocode"):
         params = spec["paths"][path]["post"].get("parameters", [])
         assert any(p["name"] == "key" and p["in"] == "query" for p in params), path
 
@@ -656,7 +657,8 @@ def test_endpoints_reject_missing_or_wrong_credentials(client, fake):
         assert client.post(path, json={}).status_code == 401
         assert client.post(path, json={}, headers={"X-CDP-Key": "wrong"}).status_code == 401
     for path in ("/cron/enrich-partywirks", "/cron/recover-square-avs-zips", "/cron/adjust-thermostat",
-                 "/cron/sync-square-catalog", "/cron/sync-partywirks", "/cron/versium-online-audience"):
+                 "/cron/sync-square-catalog", "/cron/sync-partywirks", "/cron/versium-online-audience",
+                 "/cron/melissa-geocode"):
         assert client.post(path).status_code == 401
         assert client.post(path, headers=WH).status_code == 401  # webhook key doesn't open cron endpoints
     assert fake.calls == []
@@ -749,4 +751,54 @@ def test_paid_online_audience_kept_when_melissa_fails(client, db, fake, monkeypa
         row = db.fetchone()
         assert row["md_results"] is None and row["v"]["facebook"]["email"] == [h]
     finally:
+        db.execute("DELETE FROM master_customers WHERE cluster_id = %s", (cid,))
+
+
+# --- Melissa geocode catch-up -----------------------------------------------------------------------
+
+def test_melissa_geocode_fills_distance_and_census_once(client, db, fake, uid):
+    ids = {}
+    for tag, email, score in (("ok", f"geo-{uid}@example.test", 10**6 + 2),
+                              ("det", f"detroit-{uid}@example.test", 10**6 + 1)):
+        db.execute("INSERT INTO master_customers (cluster_id, email, md_address1, md_city, md_state, zip5, "
+                   "bowler_value_score, md_results) VALUES (nextval('master_cluster_id_seq'), %s, '1 Versium Rd', "
+                   "'Farmingtn Hls', 'MI', '48335', %s, 'ES01,VS40') RETURNING cluster_id", (email, score))
+        ids[tag] = db.fetchone()["cluster_id"]
+    try:
+        out = client.post("/cron/melissa-geocode?limit=2", headers={"X-CDP-Key": "test-cron-secret"}).json()
+        assert (out["geocoded"], out["now_in_excluded_area"], out["failed_retry_later"]) == (2, 1, 0)
+        db.execute("SELECT * FROM master_customers WHERE cluster_id = ANY(%s)", (list(ids.values()),))
+        rows = {r["cluster_id"]: r for r in db.fetchall()}
+        ok, det = rows[ids["ok"]], rows[ids["det"]]
+        assert ok["md_city"] == "Farmington Hills" and float(ok["distance_miles"]) < 2
+        assert ok["md_census_tract"] == "152300" and ok["md_unified_school_district_name"] == "Farmington Public School District"
+        assert ok["md_results"].endswith(",GEO_TRIED") and "VS40" not in ok["md_results"]
+        assert det["zip5"] == "48226" and det["bowler_value_score"] == 25      # verified into an excluded area
+        before = fake.count("personator.melissadata.net")
+        client.post("/cron/melissa-geocode?limit=2", headers={"X-CDP-Key": "test-cron-secret"})
+        assert fake.count("personator.melissadata.net") - before <= 2            # ours are never re-sent
+        db.execute("SELECT count(*) n FROM master_customers WHERE cluster_id = ANY(%s) AND md_results LIKE '%%GEO_TRIED'",
+                   (list(ids.values()),))
+        assert db.fetchone()["n"] == 2
+    finally:
+        db.execute("DELETE FROM customer_identities WHERE cluster_id = ANY(%s)", (list(ids.values()),))
+        db.execute("DELETE FROM master_customers WHERE cluster_id = ANY(%s)", (list(ids.values()),))
+
+
+def test_melissa_geocode_skips_a_row_another_run_holds(client, db, fake, uid):
+    import os
+    import psycopg2
+    db.execute("INSERT INTO master_customers (cluster_id, email, md_address1, zip5, bowler_value_score) "
+               "VALUES (nextval('master_cluster_id_seq'), %s, '1 Versium Rd', '48335', %s) RETURNING cluster_id",
+               (f"locked-{uid}@example.test", 10**6 + 5))
+    cid = db.fetchone()["cluster_id"]
+    other = psycopg2.connect(os.environ["TEST_DATABASE_URL"])
+    try:
+        oc = other.cursor()
+        oc.execute("SELECT 1 FROM master_customers WHERE cluster_id = %s FOR UPDATE", (cid,))   # a run mid-lookup
+        before = fake.count("personator.melissadata.net")
+        out = client.post("/cron/melissa-geocode?limit=1", headers={"X-CDP-Key": "test-cron-secret"}).json()
+        assert out["skipped_already_handled"] == 1 and fake.count("personator.melissadata.net") == before
+    finally:
+        other.rollback(); other.close()
         db.execute("DELETE FROM master_customers WHERE cluster_id = %s", (cid,))

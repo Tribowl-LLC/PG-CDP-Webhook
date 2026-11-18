@@ -65,6 +65,9 @@ Variable	Purpose
 `PARTYWIRKS_WEBHOOK_SECRET`	Partywirks webhook signature key (HMAC-SHA256 in `X-Partywirks-Signature`). When set, every delivery is checked and the result logged.
 `PARTYWIRKS_SIGNATURE_ENFORCE`	Set to `true` to reject (401) deliveries whose signature doesn't match. Only turn on after the logs show `Partywirks signature verified` for a real booking.
 `PARTYWIRKS_API_KEY`	Partywirks REST API key (`reservations` and `customers` scopes). When set, every Partywirks webhook is verified and completed by reading the reservation back from the API.
+`TRIPLESEAT_CLIENT_ID` / `TRIPLESEAT_CLIENT_SECRET`	Tripleseat OAuth 2 app (Settings → API). The API connection stays off until both are set.
+`TRIPLESEAT_REDIRECT_URI`	Must match the app's registered Redirect URI (default `https://pg-cdp-webhook.onrender.com/oauth/tripleseat/callback`).
+`TRIPLESEAT_SCOPES`	Optional space-separated scopes; blank uses the scopes configured on the Tripleseat app.
 Each authentication check switches on as soon as its variable is set. `GET /health` shows which are on.
 ---
 3. PostgreSQL Database Schema (Neon)
@@ -155,6 +158,8 @@ Ingests online lane bookings. Fires `Purchase` (actual booking amount) AND, if `
 `POST /webhooks/tripleseat`
 Unwraps native Tripleseat payloads (`lead`, `event`, `booking`, `contact`). Extracts company name, guest count, event date, and lead status.
 If not `LOST`/`TURNED_DOWN`, not in an excluded geo, and `bowler_value_score >= threshold`, fires `Qualified_Bowler` with synthetic value `$1,000.00` (`PG-1` Corporate) or `$450.00` (Social/Birthday).
+`GET /oauth/tripleseat/login?key=<CRON_SECRET>` → `GET /oauth/tripleseat/callback`
+Connects the server to the Tripleseat API (requires `migrations/006`). Open the login link in a browser and approve access at Tripleseat; the callback stores the tokens in `oauth_tokens`. Access tokens last 2 hours and are renewed automatically with the refresh token, so the login is needed once (or again if Tripleseat revokes access). `GET /cron/tripleseat-status` shows whether it's connected; `check=true` also makes one API call.
 `POST /webhooks/partywirks`
 Ingests real-time Partywirks birthday bookings, extracts package name and party date, marks `in_partywirks = 1` and `md_presence_of_children = 'Children Present'` (without double-counting Square payment dollars), enriches via Melissa, and fires `Qualified_Bowler` (`$450.00`) for qualified suburban households.
 5.2 Maintenance & Cron Endpoints

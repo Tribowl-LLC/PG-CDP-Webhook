@@ -193,7 +193,7 @@ def is_detroit_excluded(city, zip5) -> bool:
     return z.startswith("482")
 
 
-# Versium online audience append (Meta / TikTok / LinkedIn IDs) is only for customers we can advertise to
+# Versium online audience append (Meta / Google / LinkedIn / TikTok IDs) is only for customers we can advertise to
 # locally: never excluded areas, never out of state. Unknown state is allowed so Versium can help locate them.
 def versium_online_append_eligible(city, state, zip5) -> bool:
     if is_detroit_excluded(city, zip5):
@@ -213,6 +213,69 @@ def strip_blocked_versium_fields(fields: dict) -> dict:
         return re.sub(r"[^a-z0-9]+", "_", str(k).lower()).strip("_")
     return {k: v for k, v in (fields or {}).items()
             if not any(part in norm(k) for part in VERSIUM_BLOCKED_FIELD_PARTS)}
+
+
+VERSIUM_ONLINE_AUDIENCE_SERVICES = ("facebook", "google", "linkedin", "tiktok")
+VERSIUM_ONLINE_BUDGET_SECONDS = 6
+_SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
+
+
+def parse_versium_online_audience(body: dict) -> dict:
+    """Versium /v2/onlineAudience answer -> {service: {field: [values]}} for the services we use.
+    Each service holds a list of objects whose fields are lists; they are merged and de-duplicated."""
+    res = ((body or {}).get("versium") or {}).get("results") or []
+    out = {}
+    for rec in res if isinstance(res, list) else []:
+        for svc in VERSIUM_ONLINE_AUDIENCE_SERVICES:
+            for obj in (rec or {}).get(svc) or []:
+                for field, vals in (obj or {}).items():
+                    vals = vals if isinstance(vals, list) else [vals]
+                    bucket = out.setdefault(svc, {}).setdefault(str(field).lower(), [])
+                    for v in vals:
+                        v = str(v).strip()
+                        if v and v not in bucket:
+                            bucket.append(v)
+    return out
+
+
+def fetch_versium_online_audience(v_headers: dict, v_input: dict, timeout: float = 4):
+    """Returns the parsed IDs plus `_checked` (today), `{"_checked": today}` when Versium has no match,
+    or None when the call failed or was rejected (bad parameter, no credits, auth), which is logged
+    with Versium's reason and left for /cron/versium-online-audience to retry."""
+    resp = requests.get(
+        "https://api.versium.com/v2/onlineAudience",
+        headers=v_headers,
+        params={**v_input, "rcfg_oa_services[]": list(VERSIUM_ONLINE_AUDIENCE_SERVICES)},
+        timeout=timeout,
+    )
+    try:
+        body = resp.json()
+    except ValueError:
+        body = None
+    if resp.status_code == 200 and not isinstance(body, dict):
+        log.error("Versium online audience returned an unreadable answer (HTTP 200)")
+        return None  # stays retryable; never recorded as a no-match
+    if resp.status_code != 200:
+        body = body if isinstance(body, dict) else {}
+        err = body.get("errors") or body.get("error") or body.get("message") if isinstance(body, dict) else None
+        log.error("Versium online audience rejected (HTTP %s): %s", resp.status_code, str(err)[:300])
+        return None
+    return {**parse_versium_online_audience(body), "_checked": date.today().isoformat()}
+
+
+def save_online_audience(cur, cluster_id: int, oa: dict):
+    """Stores a paid online-audience answer on its own, so it is never lost when another step fails."""
+    if oa:
+        cur.execute("UPDATE master_customers SET versium_online_audience = "
+                    "(COALESCE(versium_online_audience, '{}'::jsonb) - '_pending') || %s::jsonb, updated_at = NOW() "
+                    "WHERE cluster_id = %s;", (json.dumps(oa), cluster_id))
+
+
+def versium_meta_hashes(cust: dict) -> tuple:
+    """Versium's pre-hashed (SHA-256) Facebook emails and phones for this customer."""
+    fb = (cust.get("versium_online_audience") or {}).get("facebook") or {}
+    ok = lambda vals: [v.lower() for v in vals or [] if _SHA256_HEX.match(str(v).lower())]
+    return ok(fb.get("email")), ok(fb.get("phone"))
 
 
 def get_threshold(cur) -> int:
@@ -373,17 +436,24 @@ def save_order_items(cur, txn_id: str, order: dict, square_customer_id: str = No
 
 
 def run_melissa_and_versium_waterfall(first_name: str, last_name: str, email: str, phone: str,
-                                      address: str = "", city: str = "", state: str = "", zip_code: str = "") -> dict:
+                                      address: str = "", city: str = "", state: str = "", zip_code: str = "",
+                                      known: dict = None) -> dict:
     """Step 1: Melissa Personator (Address, Lat/Long, Demographics). Step 2: Versium REACH (Alt Emails/Phones, Wealth).
 
     `md_results` is only set when Melissa actually answered. It stays None when Melissa is not
     configured or the call failed, so the customer is tried again later instead of being written off.
+
+    `known` is the customer's stored record (md_city / md_state / zip5). It is only used by the Versium
+    geography gates, as a fallback after Melissa's answer and the incoming fields, so a webhook that
+    arrives without an address can't make a known Detroit or out-of-state customer look "unknown".
     """
     zip_code = (zip_code or "")[:5]
+    started = time.monotonic()
     result = {
         "alt_emails": [],
         "alt_phones": [],
         "lifestyle_flags": {},
+        "online_audience": {},
         # What we were given, so the geo gate still works if Melissa is unavailable.
         "md_city": city or None,
         "md_state": state or None,
@@ -449,7 +519,11 @@ def run_melissa_and_versium_waterfall(first_name: str, last_name: str, email: st
             log.warning("Melissa lookup failed: %s", type(e).__name__)
 
     # --- STEP 2: VERSIUM REACH (When API Key is active) ---
-    if VERSIUM_API_KEY and not is_detroit_excluded(result.get("md_city"), result.get("zip5")):
+    known = known or {}
+    gate_zip = result.get("zip5") or known.get("zip5")
+    gate_city = result.get("md_city") or known.get("md_city")
+    gate_state = result.get("md_state") or known.get("md_state")
+    if VERSIUM_API_KEY and not is_detroit_excluded(gate_city, gate_zip):
         v_headers = {"x-versium-api-key": VERSIUM_API_KEY, "Accept": "application/json"}
         v_input = {
             "first": first_name,
@@ -486,6 +560,18 @@ def run_melissa_and_versium_waterfall(first_name: str, last_name: str, email: st
             result["lifestyle_flags"] = strip_blocked_versium_fields(vd_res)
         except Exception as e:
             log.warning("Versium lookup failed: %s", type(e).__name__)
+
+        # Online audience append (Meta / Google / LinkedIn / TikTok IDs): local, advertisable customers only.
+        # Enrichment runs inside the webhook request, so it is skipped when the earlier lookups were
+        # already slow. Skipped or failed calls leave the column empty for /cron/versium-online-audience.
+        # Already bought (or checked with no match) for this customer: never pay again.
+        if not known.get("versium_online_audience") and \
+                versium_online_append_eligible(gate_city, gate_state, gate_zip) and \
+                time.monotonic() - started < VERSIUM_ONLINE_BUDGET_SECONDS:
+            try:
+                result["online_audience"] = fetch_versium_online_audience(v_headers, v_input) or {}
+            except Exception as e:
+                log.warning("Versium online audience lookup failed: %s", type(e).__name__)
 
     return result
 
@@ -584,6 +670,9 @@ def build_meta_user_identifiers(cust: dict) -> dict:
     phones = [cust.get("phone")] + list(cust.get("versium_alt_phones") or [])
     hashed_emails = sorted({sha256_hash(e) for e in emails if e})
     hashed_phones = sorted({sha256_hash(meta_phone(p)) for p in phones if meta_phone(p)})
+    v_em, v_ph = versium_meta_hashes(cust)
+    hashed_emails = sorted(set(hashed_emails) | set(v_em))
+    hashed_phones = sorted(set(hashed_phones) | set(v_ph))
     city = meta_city(cust.get("md_city"))
     state = meta_state(cust.get("md_state"))
 
@@ -909,7 +998,7 @@ ENRICHMENT_FIELDS = [
     "md_date_of_birth", "md_gender", "md_delivery_indicator", "md_mik", "md_mak", "md_results",
     "versium_net_worth", "versium_home_market_value", "versium_auto_make_model",
 ]
-JSONB_FIELDS = {"versium_alt_emails", "versium_alt_phones", "versium_lifestyle_flags"}
+JSONB_FIELDS = {"versium_alt_emails", "versium_alt_phones", "versium_lifestyle_flags", "versium_online_audience"}
 
 _MC = "master_customers"
 
@@ -973,6 +1062,7 @@ UPSERT_UPDATE_RULES = {
     "versium_alt_emails": _jsonb("versium_alt_emails", "[]"),
     "versium_alt_phones": _jsonb("versium_alt_phones", "[]"),
     "versium_lifestyle_flags": _jsonb("versium_lifestyle_flags", "{}"),
+    "versium_online_audience": f"COALESCE({_MC}.versium_online_audience, '{{}}'::jsonb) || EXCLUDED.versium_online_audience",
     "ts_lead_status": _keep("ts_lead_status"),
     "ts_max_guests": f"GREATEST(COALESCE({_MC}.ts_max_guests, 0), COALESCE(EXCLUDED.ts_max_guests, 0))",
     "ts_last_event_date": _keep("ts_last_event_date"),
@@ -1086,6 +1176,7 @@ def upsert_and_enrich_customer(cur, data: dict) -> tuple:
             data.get("city") or "",
             data.get("state") or "",
             data.get("zip") or "",
+            known=prior,
         )
         if not existing and enriched.get("md_mik"):
             cur.execute(
@@ -1147,6 +1238,7 @@ def upsert_and_enrich_customer(cur, data: dict) -> tuple:
         "versium_alt_emails": json.dumps(enriched.get("alt_emails") or []),
         "versium_alt_phones": json.dumps(enriched.get("alt_phones") or []),
         "versium_lifestyle_flags": json.dumps(enriched.get("lifestyle_flags") or {}),
+        "versium_online_audience": json.dumps(enriched.get("online_audience") or {}),
         "ts_lead_status": data.get("ts_lead_status"),
         "ts_max_guests": int(data.get("ts_max_guests") or 0) or None,
         "ts_last_event_date": data.get("ts_last_event_date"),
@@ -1201,7 +1293,11 @@ def save_enrichment(cur, cluster_id: int, enr: dict, source: str, extra: dict = 
         sets.append("versium_alt_phones = %(alt_p)s::jsonb")
     if flags:
         sets.append("versium_lifestyle_flags = %(flags)s::jsonb")
+    online = enr.get("online_audience") or {}
+    if online:
+        sets.append("versium_online_audience = COALESCE(versium_online_audience, '{}'::jsonb) || %(online)s::jsonb")
     vals.update({"alt_e": json.dumps(alt_e), "alt_p": json.dumps(alt_p), "flags": json.dumps(flags),
+                 "online": json.dumps(online),
                  "cid": cluster_id})
     cur.execute(f"UPDATE master_customers SET {', '.join(sets)}, updated_at = NOW() "
                 f"WHERE cluster_id = %(cid)s RETURNING *;", vals)
@@ -1955,10 +2051,12 @@ def enrich_partywirks_customers(request: Request, key: Optional[str] = CRON_KEY_
         for r in rows:
             enr = run_melissa_and_versium_waterfall(
                 r.get("first_name") or "", r.get("last_name") or "",
-                r.get("email") or "", r.get("phone") or "",
+                r.get("email") or "", r.get("phone") or "", known=r,
             )
             if enr.get("md_results") is None:
                 lookup_failures += 1  # Melissa didn't answer; leave it for the next run
+                with conn, conn.cursor() as cur:
+                    save_online_audience(cur, r["cluster_id"], enr.get("online_audience"))  # already paid for
                 continue
             processed += 1
             if enr.get("md_address1"):
@@ -2064,11 +2162,12 @@ def recover_square_avs_zips(request: Request, limit: int = 150, scan_payment_pag
                         continue
                     enr = run_melissa_and_versium_waterfall(
                         r.get("first_name") or "", r.get("last_name") or "",
-                        r.get("email") or "", phone, zip_code=avs_zip,
+                        r.get("email") or "", phone, zip_code=avs_zip, known=r,
                     )
                     if enr.get("md_results") is None and MELISSA_API_KEY and (
                             phone or (r.get("first_name") and r.get("last_name"))):
                         lookup_failures += 1  # Melissa didn't answer; try again next run
+                        save_online_audience(cur, r["cluster_id"], enr.get("online_audience"))  # already paid for
                         continue
                     if enr.get("md_address1"):
                         addresses_unlocked += 1
@@ -2090,6 +2189,78 @@ def recover_square_avs_zips(request: Request, limit: int = 150, scan_payment_pag
             "street_addresses_unlocked_via_melissa": addresses_unlocked,
             "lookup_failures_retry_later": lookup_failures,
         }
+    finally:
+        conn.close()
+
+
+# Customers the catch-up may buy: nothing stored yet, or only a claim older than an hour (a run that died).
+OA_UNCLAIMED = ("(COALESCE(versium_online_audience, '{}'::jsonb) = '{}'::jsonb OR "
+                "(versium_online_audience - '_pending' = '{}'::jsonb AND "
+                "(versium_online_audience->>'_pending')::float < extract(epoch FROM now()) - 3600))")
+
+
+@app.post("/cron/versium-online-audience")
+def versium_online_audience_catch_up(request: Request, limit: int = 100,
+                                     key: Optional[str] = CRON_KEY_PARAM):
+    """Online audience append for eligible customers that don't have it yet (never checked, or the live
+    call was skipped or failed). Highest scores first; `limit` paid lookups per call (max 500).
+    Customers Versium has no match for are marked checked so they aren't bought again."""
+    require_cron_key(request)
+    if not VERSIUM_API_KEY:
+        return {"status": "error", "message": "Missing VERSIUM_API_KEY"}
+    limit = max(1, min(int(limit), 500))
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT cluster_id, first_name, last_name, email, phone, md_address1, md_city, md_state, zip5
+                FROM master_customers
+                WHERE {OA_UNCLAIMED}
+                  AND (COALESCE(email, '') <> '' OR COALESCE(phone, '') <> '')
+                ORDER BY bowler_value_score DESC NULLS LAST, true_lifetime_spend DESC NULLS LAST, cluster_id;
+                """
+            )
+            rows = [r for r in cur.fetchall()
+                    if versium_online_append_eligible(r["md_city"], r["md_state"], r["zip5"])][:limit]
+        headers = {"x-versium-api-key": VERSIUM_API_KEY, "Accept": "application/json"}
+        matched = no_match = failures = consecutive_failures = 0
+        for r in rows:
+            # Claim the customer first, so overlapping runs never buy the same lookup twice.
+            with conn, conn.cursor() as cur:
+                cur.execute(f"UPDATE master_customers SET versium_online_audience = "
+                            f"jsonb_build_object('_pending', extract(epoch FROM now())) "
+                            f"WHERE cluster_id = %s AND {OA_UNCLAIMED} RETURNING cluster_id;", (r["cluster_id"],))
+                if not cur.fetchone():
+                    continue  # another run or a live webhook got there first
+            v_input = {k: v for k, v in {
+                "first": r["first_name"], "last": r["last_name"], "email": r["email"], "phone": r["phone"],
+                "address": r["md_address1"], "city": r["md_city"], "state": r["md_state"], "zip": r["zip5"],
+                "country": "US"}.items() if v}
+            try:
+                oa = fetch_versium_online_audience(headers, v_input)
+            except Exception as e:
+                log.warning("Versium online audience lookup failed: %s", type(e).__name__)
+                oa = None
+            if oa is None:
+                with conn, conn.cursor() as cur:  # release the claim so a later run retries
+                    cur.execute("UPDATE master_customers SET versium_online_audience = "
+                                "versium_online_audience - '_pending' WHERE cluster_id = %s;", (r["cluster_id"],))
+                failures += 1
+                consecutive_failures += 1
+                if consecutive_failures >= 3:
+                    break  # Versium is rejecting everything (credits, auth); stop spending the batch
+                continue
+            consecutive_failures = 0
+            if set(oa) - {"_checked"}:
+                matched += 1
+            else:
+                no_match += 1
+            with conn, conn.cursor() as cur:
+                save_online_audience(cur, r["cluster_id"], oa)
+        return {"status": "versium_online_audience", "eligible_in_batch": len(rows), "matched": matched,
+                "no_match": no_match, "failed_retry_later": failures,
+                "stopped_early": consecutive_failures >= 3}
     finally:
         conn.close()
 

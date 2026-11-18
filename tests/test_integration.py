@@ -783,3 +783,22 @@ def test_melissa_geocode_fills_distance_and_census_once(client, db, fake, uid):
     finally:
         db.execute("DELETE FROM customer_identities WHERE cluster_id = ANY(%s)", (list(ids.values()),))
         db.execute("DELETE FROM master_customers WHERE cluster_id = ANY(%s)", (list(ids.values()),))
+
+
+def test_melissa_geocode_skips_a_row_another_run_holds(client, db, fake, uid):
+    import os
+    import psycopg2
+    db.execute("INSERT INTO master_customers (cluster_id, email, md_address1, zip5, bowler_value_score) "
+               "VALUES (nextval('master_cluster_id_seq'), %s, '1 Versium Rd', '48335', %s) RETURNING cluster_id",
+               (f"locked-{uid}@example.test", 10**6 + 5))
+    cid = db.fetchone()["cluster_id"]
+    other = psycopg2.connect(os.environ["TEST_DATABASE_URL"])
+    try:
+        oc = other.cursor()
+        oc.execute("SELECT 1 FROM master_customers WHERE cluster_id = %s FOR UPDATE", (cid,))   # a run mid-lookup
+        before = fake.count("personator.melissadata.net")
+        out = client.post("/cron/melissa-geocode?limit=1", headers={"X-CDP-Key": "test-cron-secret"}).json()
+        assert out["skipped_already_handled"] == 1 and fake.count("personator.melissadata.net") == before
+    finally:
+        other.rollback(); other.close()
+        db.execute("DELETE FROM master_customers WHERE cluster_id = %s", (cid,))

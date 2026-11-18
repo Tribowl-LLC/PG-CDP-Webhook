@@ -2234,28 +2234,41 @@ def melissa_geocode_catch_up(request: Request, limit: int = 100, key: Optional[s
                 LIMIT %s;
                 """, (limit,))
             rows = cur.fetchall()
-        geocoded = no_coordinates = failures = newly_excluded = 0
-        for r in rows:
-            enr = melissa_lookup(r.get("first_name") or "", r.get("last_name") or "", r.get("email") or "",
-                                 r.get("phone") or "", r.get("md_address1") or "", r.get("md_city") or "",
-                                 r.get("md_state") or "", r.get("zip5") or "")
-            if enr.get("md_results") is None:
-                failures += 1  # Melissa didn't answer; try again next run
-                continue
-            enr["md_results"] = f"{enr['md_results'].rstrip(',')},GEO_TRIED"
-            if enr.get("md_latitude"):
-                geocoded += 1
-            else:
-                no_coordinates += 1
-            was = is_detroit_excluded(r.get("md_city"), r.get("zip5"))
+        geocoded = no_coordinates = failures = newly_excluded = skipped = 0
+        for cand in rows:
+            # Lock the row for the lookup and recheck it, so overlapping runs never pay twice for one
+            # customer (the lock is released on commit/rollback, so a crashed run leaves nothing behind).
             with conn, conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT * FROM master_customers
+                    WHERE cluster_id = %s AND md_latitude IS NULL
+                      AND COALESCE(md_results, '') NOT LIKE '%%GEO_TRIED%%'
+                    FOR UPDATE SKIP LOCKED;
+                    """, (cand["cluster_id"],))
+                r = cur.fetchone()
+                if not r:
+                    skipped += 1  # another run has it, or it was geocoded meanwhile
+                    continue
+                enr = melissa_lookup(r.get("first_name") or "", r.get("last_name") or "", r.get("email") or "",
+                                     r.get("phone") or "", r.get("md_address1") or "", r.get("md_city") or "",
+                                     r.get("md_state") or "", r.get("zip5") or "")
+                if enr.get("md_results") is None:
+                    failures += 1  # Melissa didn't answer; try again next run
+                    continue
+                enr["md_results"] = f"{enr['md_results'].rstrip(',')},GEO_TRIED"
+                if enr.get("md_latitude"):
+                    geocoded += 1
+                else:
+                    no_coordinates += 1
+                was = is_detroit_excluded(r.get("md_city"), r.get("zip5"))
                 cust = save_enrichment(cur, r["cluster_id"], enr, "Melissa")
                 cust = rescore_customer(cur, cust)
             if not was and is_detroit_excluded(cust.get("md_city"), cust.get("zip5")):
                 newly_excluded += 1
-        return {"status": "melissa_geocode", "looked_up": len(rows) - failures, "geocoded": geocoded,
+        return {"status": "melissa_geocode", "looked_up": geocoded + no_coordinates, "geocoded": geocoded,
                 "no_coordinates": no_coordinates, "now_in_excluded_area": newly_excluded,
-                "failed_retry_later": failures}
+                "failed_retry_later": failures, "skipped_already_handled": skipped}
     finally:
         conn.close()
 

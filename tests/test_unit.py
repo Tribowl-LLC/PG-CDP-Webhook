@@ -244,12 +244,18 @@ def test_melissa_lookup_maps_census_fields_only_with_a_street(monkeypatch):
 def test_blank_melissa_answer_is_a_failure_not_data(monkeypatch, caplog):
     from conftest import FakeResponse
     monkeypatch.setattr(main, "MELISSA_API_KEY", "k")
-    blank = {"TransmissionResults": "GE05", "Records": [{"AddressLine1": " ", "HouseholdIncome": " ",
-                                                          "MelissaIdentityKey": " ", "Results": " "}]}
-    monkeypatch.setattr(main.requests, "get", lambda url, **kw: FakeResponse(200, blank))
+    rejected = {"TransmissionResults": "GE05", "Records": [{"AddressLine1": " ", "Results": " "}]}
+    monkeypatch.setattr(main.requests, "get", lambda url, **kw: FakeResponse(200, rejected))
     with caplog.at_level("ERROR", logger="pg_cdp"):
         assert main.melissa_lookup("A", "B", "a@b.com", "", "12 Real St", "Novi", "MI", "48375") == {}
     assert "GE05" in caplog.text
+    # no match: Melissa answered, everything blank -> answered (not retried), blanks never stored
+    blank = {"TransmissionResults": " ", "Records": [{"AddressLine1": " ", "HouseholdIncome": " ",
+                                                       "MelissaIdentityKey": " ", "Results": " "}]}
+    monkeypatch.setattr(main.requests, "get", lambda url, **kw: FakeResponse(200, blank))
+    out = main.melissa_lookup("A", "B", "a@b.com", "", "12 Real St", "Novi", "MI", "48375")
+    assert out["md_results"] == "NO_RESULT_CODES" and out["md_address1"] == "12 Real St"
+    assert out["md_household_income"] is None and out["md_mik"] is None
     padded = {"Records": [{"AddressLine1": "12 Real St", "City": "Novi", "PostalCode": "48375", "Latitude": "42.4",
                            "Longitude": "-83.4", "HouseholdIncome": " ", "MelissaIdentityKey": " ", "Results": "AS01 "}]}
     monkeypatch.setattr(main.requests, "get", lambda url, **kw: FakeResponse(200, padded))

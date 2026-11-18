@@ -331,3 +331,126 @@ def test_tripleseat_field_log_has_names_and_money_presence_but_no_values(caplog)
     assert "empty: event.amount_due" in text
     for secret in ("secret@example.test", "Smith Party", "1234.50", "Check"):
         assert secret not in text
+
+
+def _tripleseat_on(monkeypatch):
+    monkeypatch.setattr(main, "TRIPLESEAT_CLIENT_ID", "test-ts-client")
+    monkeypatch.setattr(main, "TRIPLESEAT_CLIENT_SECRET", "test-ts-secret")
+
+
+def test_tripleseat_oauth_state_must_be_signed_recent_and_match_cookie(monkeypatch):
+    _tripleseat_on(monkeypatch)
+    state = main.make_tripleseat_state(now=1_000_000)
+    assert main.tripleseat_state_valid(state, state, now=1_000_100)
+    assert not main.tripleseat_state_valid(state, state, now=1_000_000 + main.TRIPLESEAT_STATE_MAX_AGE + 1)
+    assert not main.tripleseat_state_valid(state, "", now=1_000_100)                       # other browser
+    assert not main.tripleseat_state_valid(state, main.make_tripleseat_state(1_000_000), now=1_000_100)
+    ts, nonce, _sig = state.split(".")
+    forged = f"{ts}.{nonce}.{'0' * 64}"
+    assert not main.tripleseat_state_valid(forged, forged, now=1_000_100)
+    assert not main.tripleseat_state_valid("junk", "junk")
+
+
+def test_tripleseat_authorize_url(monkeypatch):
+    _tripleseat_on(monkeypatch)
+    url = main.tripleseat_authorize_url("abc")
+    assert url.startswith("https://login.tripleseat.com/oauth2/authorize?")
+    assert "client_id=test-ts-client" in url and "response_type=code" in url and "state=abc" in url
+    assert "redirect_uri=https%3A%2F%2Fpg-cdp-webhook.onrender.com%2Foauth%2Ftripleseat%2Fcallback" in url
+    assert "client_secret" not in url and "scope=" not in url
+    monkeypatch.setattr(main, "TRIPLESEAT_SCOPES", "read write")
+    assert "scope=read+write" in main.tripleseat_authorize_url("abc")
+
+
+def test_tripleseat_login_is_off_without_secret_and_needs_cron_key(monkeypatch):
+    from fastapi.testclient import TestClient
+    client = TestClient(main.app)
+    monkeypatch.setattr(main, "TRIPLESEAT_CLIENT_SECRET", None)
+    assert client.get("/oauth/tripleseat/login?key=test-cron-secret", follow_redirects=False).status_code == 503
+    assert client.get("/oauth/tripleseat/callback?code=x&state=y").status_code == 503
+    _tripleseat_on(monkeypatch)
+    assert client.get("/oauth/tripleseat/login?key=wrong", follow_redirects=False).status_code == 401
+    r = client.get("/oauth/tripleseat/login?key=test-cron-secret", follow_redirects=False)
+    assert r.status_code == 302 and r.headers["location"].startswith(main.TRIPLESEAT_AUTHORIZE_URL)
+    assert main.TRIPLESEAT_STATE_COOKIE in r.headers["set-cookie"]
+    # A callback without the matching browser cookie is refused before any token request.
+    assert client.get("/oauth/tripleseat/callback?code=x&state=forged",
+                      cookies={main.TRIPLESEAT_STATE_COOKIE: "other"}).status_code == 400
+
+
+class _FakeTokenDB:
+    """Stands in for get_conn() around the oauth_tokens row."""
+
+    def __init__(self, row):
+        self.row, self.saved = row, []
+
+    def __call__(self):
+        return self
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def cursor(self):
+        return self
+
+    def close(self):
+        pass
+
+    def execute(self, sql, params=None):
+        if sql.lstrip().startswith("INSERT"):
+            self.saved.append(params)
+
+    def fetchone(self):
+        return self.row
+
+
+def test_tripleseat_token_reused_until_near_expiry_then_refreshed(monkeypatch):
+    _tripleseat_on(monkeypatch)
+    db = _FakeTokenDB({"access_token": "old", "refresh_token": "r1", "seconds_left": 3600})
+    monkeypatch.setattr(main, "get_conn", db)
+    posts = []
+
+    def fake_post(url, data=None, **kw):
+        posts.append(data)
+        from conftest import FakeResponse
+        return FakeResponse(200, {"access_token": "new", "expires_in": 7200})
+    monkeypatch.setattr(main.requests, "post", fake_post)
+    assert main.tripleseat_access_token() == "old" and not posts
+    db.row["seconds_left"] = 60
+    assert main.tripleseat_access_token() == "new"
+    assert posts[0]["grant_type"] == "refresh_token" and posts[0]["refresh_token"] == "r1"
+    # Tripleseat didn't send a new refresh token, so the old one is kept.
+    assert db.saved[0][:2] == ("new", "r1")
+
+
+def test_tripleseat_token_not_connected(monkeypatch):
+    import pytest
+    monkeypatch.setattr(main, "TRIPLESEAT_CLIENT_SECRET", None)
+    with pytest.raises(main.TripleseatNotConnected):
+        main.tripleseat_access_token()
+    _tripleseat_on(monkeypatch)
+    monkeypatch.setattr(main, "get_conn", _FakeTokenDB(None))
+    with pytest.raises(main.TripleseatNotConnected):
+        main.tripleseat_access_token()
+
+
+def test_tripleseat_get_renews_once_on_401_and_waits_on_429(monkeypatch):
+    from conftest import FakeResponse
+    tokens = iter(["t1", "t2"])
+    monkeypatch.setattr(main, "tripleseat_access_token", lambda force_refresh=False: next(tokens))
+    monkeypatch.setattr(main.time, "sleep", lambda s: None)
+    answers = [FakeResponse(401, {}), FakeResponse(429, {}), FakeResponse(200, [{"id": 1}])]
+    seen = []
+
+    def fake_get(url, headers=None, **kw):
+        seen.append((url, headers["Authorization"]))
+        r = answers.pop(0)
+        r.headers = {}
+        return r
+    monkeypatch.setattr(main.requests, "get", fake_get)
+    assert main.tripleseat_get("/sites.json") == [{"id": 1}]
+    assert seen[0] == ("https://api.tripleseat.com/v1/sites.json", "Bearer t1")
+    assert [h for _u, h in seen[1:]] == ["Bearer t2", "Bearer t2"]

@@ -15,6 +15,7 @@ import requests
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from fastapi import FastAPI, Request, BackgroundTasks, HTTPException, Query
+from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.concurrency import run_in_threadpool
 from contextlib import asynccontextmanager
 
@@ -58,6 +59,18 @@ PARTYWIRKS_WEBHOOK_SECRET = os.getenv("PARTYWIRKS_WEBHOOK_SECRET")
 PARTYWIRKS_SIGNATURE_ENFORCE = os.getenv("PARTYWIRKS_SIGNATURE_ENFORCE", "").strip().lower() in ("1", "true", "yes")
 # Real Partywirks order IDs are 13-14 digits; their sample/test payload uses "PW-YYYYMM-NNNN".
 REAL_PARTYWIRKS_ORDER_ID = re.compile(r"^\d{10,20}$")
+
+# Tripleseat REST API (OAuth 2, read-only use). Off until TRIPLESEAT_CLIENT_SECRET is set (Tripleseat
+# releases it once they approve the app). The redirect URI must match the one registered with Tripleseat.
+TRIPLESEAT_CLIENT_ID = os.getenv("TRIPLESEAT_CLIENT_ID")
+TRIPLESEAT_CLIENT_SECRET = os.getenv("TRIPLESEAT_CLIENT_SECRET")
+TRIPLESEAT_REDIRECT_URI = os.getenv(
+    "TRIPLESEAT_REDIRECT_URI", "https://pg-cdp-webhook.onrender.com/oauth/tripleseat/callback")
+# Space-separated; blank asks for the scopes configured on the Tripleseat app.
+TRIPLESEAT_SCOPES = os.getenv("TRIPLESEAT_SCOPES", "").strip()
+TRIPLESEAT_AUTHORIZE_URL = "https://login.tripleseat.com/oauth2/authorize"
+TRIPLESEAT_TOKEN_URL = "https://api.tripleseat.com/oauth2/token"
+TRIPLESEAT_API = os.getenv("TRIPLESEAT_API", "https://api.tripleseat.com/v1")
 
 # Your 4 Live Non-Detroit Meta Custom Audience IDs
 AUDIENCE_PG1_CORP = os.getenv("AUDIENCE_PG1_CORP", "120246555016470358")
@@ -1897,6 +1910,209 @@ def handle_tripleseat(raw: dict, background_tasks: BackgroundTasks) -> dict:
         }
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Tripleseat OAuth 2 (authorization code). /oauth/tripleseat/login sends a person to Tripleseat to approve
+# access; Tripleseat returns to /oauth/tripleseat/callback with a code, which is swapped for tokens stored
+# in oauth_tokens (migrations/006). tripleseat_access_token() renews the 2-hour token with the refresh token.
+# ---------------------------------------------------------------------------
+TRIPLESEAT_STATE_COOKIE = "ts_oauth_state"
+TRIPLESEAT_STATE_MAX_AGE = 600  # seconds the person has to finish logging in at Tripleseat
+TRIPLESEAT_REFRESH_MARGIN = 300  # renew when the access token has less than this many seconds left
+
+
+class TripleseatNotConnected(Exception):
+    """Tripleseat isn't set up yet (no client secret) or nobody has logged in at /oauth/tripleseat/login."""
+
+
+def tripleseat_enabled() -> bool:
+    return bool(TRIPLESEAT_CLIENT_ID and TRIPLESEAT_CLIENT_SECRET)
+
+
+def _tripleseat_state_sig(payload: str) -> str:
+    return hmac.new(TRIPLESEAT_CLIENT_SECRET.encode(), payload.encode(), hashlib.sha256).hexdigest()
+
+
+def make_tripleseat_state(now: Optional[float] = None) -> str:
+    payload = f"{int(now if now is not None else time.time())}.{base64.urlsafe_b64encode(os.urandom(18)).decode()}"
+    return f"{payload}.{_tripleseat_state_sig(payload)}"
+
+
+def tripleseat_state_valid(state: str, cookie: str, now: Optional[float] = None) -> bool:
+    """The state must be ours (signed), recent, and match the cookie set on the browser that started the login."""
+    if not state or not cookie or not hmac.compare_digest(state.encode(), cookie.encode()):
+        return False
+    try:
+        ts, nonce, sig = state.split(".")
+        age = (now if now is not None else time.time()) - int(ts)
+    except ValueError:
+        return False
+    return 0 <= age <= TRIPLESEAT_STATE_MAX_AGE and hmac.compare_digest(sig, _tripleseat_state_sig(f"{ts}.{nonce}"))
+
+
+def tripleseat_authorize_url(state: str) -> str:
+    params = {"client_id": TRIPLESEAT_CLIENT_ID, "redirect_uri": TRIPLESEAT_REDIRECT_URI,
+              "response_type": "code", "state": state}
+    if TRIPLESEAT_SCOPES:
+        params["scope"] = TRIPLESEAT_SCOPES
+    return requests.Request("GET", TRIPLESEAT_AUTHORIZE_URL, params=params).prepare().url
+
+
+def _tripleseat_token_request(fields: dict) -> dict:
+    body = {"client_id": TRIPLESEAT_CLIENT_ID, "client_secret": TRIPLESEAT_CLIENT_SECRET, **fields}
+    r = requests.post(TRIPLESEAT_TOKEN_URL, data=body, headers={"Accept": "application/json"}, timeout=20)
+    if r.status_code != 200:
+        # Error bodies are OAuth error codes; never log the request (it holds the secret / code).
+        log.error("Tripleseat token request (%s) rejected: HTTP %s %s",
+                  fields.get("grant_type"), r.status_code, r.text[:300])
+        raise TripleseatNotConnected(f"Tripleseat token request failed (HTTP {r.status_code})")
+    tok = r.json()
+    if not tok.get("access_token"):
+        raise TripleseatNotConnected("Tripleseat token response had no access_token")
+    return tok
+
+
+def save_tripleseat_token(cur, tok: dict, previous_refresh: Optional[str] = None):
+    expires_in = int(tok.get("expires_in") or 7200)
+    cur.execute("""
+        INSERT INTO oauth_tokens (provider, access_token, refresh_token, expires_at, scope, updated_at)
+        VALUES ('tripleseat', %s, %s, NOW() + make_interval(secs => %s), %s, NOW())
+        ON CONFLICT (provider) DO UPDATE SET access_token = EXCLUDED.access_token,
+            refresh_token = EXCLUDED.refresh_token, expires_at = EXCLUDED.expires_at,
+            scope = COALESCE(EXCLUDED.scope, oauth_tokens.scope), updated_at = NOW()
+    """, (tok["access_token"], tok.get("refresh_token") or previous_refresh, expires_in, tok.get("scope")))
+
+
+def tripleseat_access_token(force_refresh: bool = False) -> str:
+    """A valid Tripleseat access token, renewed when close to expiring. The row lock makes concurrent
+    callers wait for one renewal instead of each spending the refresh token."""
+    if not tripleseat_enabled():
+        raise TripleseatNotConnected("TRIPLESEAT_CLIENT_ID / TRIPLESEAT_CLIENT_SECRET are not set")
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("""SELECT access_token, refresh_token,
+                                  EXTRACT(EPOCH FROM (expires_at - NOW())) AS seconds_left
+                           FROM oauth_tokens WHERE provider = 'tripleseat' FOR UPDATE""")
+            row = cur.fetchone()
+            if not row:
+                raise TripleseatNotConnected("Not connected: open /oauth/tripleseat/login")
+            if not force_refresh and float(row["seconds_left"]) > TRIPLESEAT_REFRESH_MARGIN:
+                return row["access_token"]
+            if not row["refresh_token"]:
+                raise TripleseatNotConnected("Token expired and no refresh token: open /oauth/tripleseat/login")
+            tok = _tripleseat_token_request({"grant_type": "refresh_token", "refresh_token": row["refresh_token"]})
+            save_tripleseat_token(cur, tok, previous_refresh=row["refresh_token"])
+            log.info("Tripleseat access token renewed")
+            return tok["access_token"]
+    finally:
+        conn.close()
+
+
+def tripleseat_get(path: str, params: Optional[dict] = None) -> dict:
+    """GET a Tripleseat API path (e.g. "/events/search.json"). Retries 429s (limit 10 requests/second) and
+    renews the token once on a 401."""
+    token = tripleseat_access_token()
+    url = f"{TRIPLESEAT_API}/{path.lstrip('/')}"
+    renewed = False
+    for attempt in range(5):
+        r = requests.get(url, params=params, timeout=30,
+                         headers={"Authorization": f"Bearer {token}", "Accept": "application/json"})
+        if r.status_code == 401 and not renewed:
+            token, renewed = tripleseat_access_token(force_refresh=True), True
+            continue
+        if r.status_code == 429:
+            time.sleep(min(float(r.headers.get("Retry-After") or 1), 10) * (attempt + 1))
+            continue
+        r.raise_for_status()
+        return r.json()
+    r.raise_for_status()
+    raise RuntimeError(f"Tripleseat GET {path} kept failing (HTTP {r.status_code})")
+
+
+def _oauth_page(title: str, message: str, status: int = 200) -> HTMLResponse:
+    import html as _html
+    return HTMLResponse(status_code=status, content=(
+        "<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width'>"
+        f"<title>{_html.escape(title)}</title><body style='font-family:system-ui;max-width:36em;margin:3em auto;"
+        f"padding:0 1em'><h1>{_html.escape(title)}</h1><p>{_html.escape(message)}</p></body>"))
+
+
+@app.get("/oauth/tripleseat/login")
+def tripleseat_login(request: Request, key: Optional[str] = CRON_KEY_PARAM):
+    """Open in a browser (with ?key=CRON_SECRET) to connect the server to Tripleseat."""
+    require_cron_key(request)
+    if not tripleseat_enabled():
+        return _oauth_page("Tripleseat isn't set up yet",
+                           "Add TRIPLESEAT_CLIENT_ID and TRIPLESEAT_CLIENT_SECRET in Render, then try again.", 503)
+    state = make_tripleseat_state()
+    resp = RedirectResponse(tripleseat_authorize_url(state), status_code=302)
+    resp.set_cookie(TRIPLESEAT_STATE_COOKIE, state, max_age=TRIPLESEAT_STATE_MAX_AGE, httponly=True,
+                    secure=True, samesite="lax", path="/oauth/tripleseat")
+    return resp
+
+
+def _finish_tripleseat_login(code: str):
+    tok = _tripleseat_token_request({"grant_type": "authorization_code", "code": code,
+                                     "redirect_uri": TRIPLESEAT_REDIRECT_URI})
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            save_tripleseat_token(cur, tok)
+    finally:
+        conn.close()
+    log.info("Tripleseat connected (scope: %s)", tok.get("scope") or "app default")
+
+
+@app.get("/oauth/tripleseat/callback")
+async def tripleseat_callback(request: Request, code: Optional[str] = None, state: Optional[str] = None,
+                              error: Optional[str] = None):
+    """Tripleseat sends the browser here after the login; not called directly."""
+    if not tripleseat_enabled():
+        return _oauth_page("Tripleseat isn't set up yet", "TRIPLESEAT_CLIENT_SECRET is not set in Render.", 503)
+    if error:
+        return _oauth_page("Tripleseat login cancelled", f"Tripleseat answered: {error[:100]}", 400)
+    if not tripleseat_state_valid(state or "", request.cookies.get(TRIPLESEAT_STATE_COOKIE, "")):
+        return _oauth_page("Login link expired",
+                           "Start again from /oauth/tripleseat/login in the same browser, within 10 minutes.", 400)
+    if not code:
+        return _oauth_page("Tripleseat login failed", "Tripleseat didn't send an authorization code.", 400)
+    try:
+        await run_in_threadpool(_finish_tripleseat_login, code)
+    except TripleseatNotConnected:
+        return _oauth_page("Tripleseat login failed", "Tripleseat refused the code. Check the Render logs.", 502)
+    resp = _oauth_page("Tripleseat connected", "The server can now read Tripleseat. You can close this tab.")
+    resp.delete_cookie(TRIPLESEAT_STATE_COOKIE, path="/oauth/tripleseat")
+    return resp
+
+
+@app.get("/cron/tripleseat-status")
+def tripleseat_status(request: Request, check: bool = False, key: Optional[str] = CRON_KEY_PARAM):
+    """Whether the server is connected to Tripleseat. check=true also makes one small API call."""
+    require_cron_key(request)
+    out = {"client_id_set": bool(TRIPLESEAT_CLIENT_ID), "client_secret_set": bool(TRIPLESEAT_CLIENT_SECRET)}
+    if not tripleseat_enabled():
+        return {**out, "connected": False, "next_step": "add TRIPLESEAT_CLIENT_ID and TRIPLESEAT_CLIENT_SECRET in Render"}
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("""SELECT expires_at, scope, updated_at, refresh_token IS NOT NULL AS has_refresh
+                           FROM oauth_tokens WHERE provider = 'tripleseat'""")
+            row = cur.fetchone()
+    finally:
+        conn.close()
+    if not row:
+        return {**out, "connected": False, "next_step": "open /oauth/tripleseat/login?key=... in a browser"}
+    out.update(connected=True, expires_at=row["expires_at"].isoformat(), scope=row["scope"],
+               has_refresh_token=row["has_refresh"], token_saved_at=row["updated_at"].isoformat())
+    if check:
+        try:
+            data = tripleseat_get("/sites.json")
+            out["api_check"] = f"ok ({len(data) if isinstance(data, list) else 'data'} returned)"
+        except Exception as e:
+            out["api_check"] = f"failed: {type(e).__name__}: {str(e)[:200]}"
+    return out
 
 
 @app.post("/webhooks/tripleseat")

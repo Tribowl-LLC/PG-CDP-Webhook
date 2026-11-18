@@ -2,11 +2,21 @@
 import json
 import threading
 
+import pytest
+
 from fastapi import BackgroundTasks
 
 import main
 
 WH = {"X-CDP-Key": "test-webhook-secret"}
+
+
+@pytest.fixture(autouse=True)
+def melissa_append_enabled(monkeypatch):
+    """These flows exercise Melissa finding an address from an email/phone (the Append action), which needs a
+    subscription license (set MELISSA_ACT). The production default is the credit-license request (Check only),
+    covered by test_credit_license_skips_melissa_without_a_street."""
+    monkeypatch.setattr(main, "MELISSA_ACT", "Check,Verify,Append")
 
 
 def square_post(client, body: dict):
@@ -832,3 +842,24 @@ def test_census_geocode_fills_census_fields_once(client, db, fake, uid):
         assert db.fetchone()["n"] == 3
     finally:
         db.execute("DELETE FROM master_customers WHERE cluster_id = ANY(%s)", (list(ids.values()),))
+
+
+def test_credit_license_skips_melissa_without_a_street(client, db, fake, monkeypatch, uid):
+    monkeypatch.setattr(main, "MELISSA_ACT", "Check")
+    email = f"creditonly-{uid}@example.test"
+    before = fake.count("personator.melissadata.net")
+    r = client.post("/webhooks/webres", headers=WH, json={"reservation_id": f"CR{uid}", "first_name": "Cee",
+                                                          "last_name": "Dee", "email": email, "amount": 30})
+    assert r.status_code == 200 and r.json()["status"] == "webres_synced"
+    assert fake.count("personator.melissadata.net") == before            # no street: no credit spent
+    db.execute("SELECT cluster_id, md_results FROM master_customers WHERE email = %s", (email,))
+    row = db.fetchone()
+    try:
+        assert row["md_results"] == main.MELISSA_NO_STREET                 # answered: no retry until a street arrives
+        client.post("/webhooks/webres", headers=WH, json={"reservation_id": f"CS{uid}", "first_name": "Cee",
+                                                          "last_name": "Dee", "email": email, "amount": 30})
+        assert fake.count("personator.melissadata.net") == before
+    finally:
+        db.execute("DELETE FROM unified_transactions WHERE cluster_id = %s", (row["cluster_id"],))
+        db.execute("DELETE FROM customer_identities WHERE cluster_id = %s", (row["cluster_id"],))
+        db.execute("DELETE FROM master_customers WHERE cluster_id = %s", (row["cluster_id"],))

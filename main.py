@@ -435,11 +435,16 @@ def save_order_items(cur, txn_id: str, order: dict, square_customer_id: str = No
     )
 
 
-# Melissa is used for address work only: verification, geocode, carrier route, household keys.
-# The account is on a credit license, which rejects demographic groups with GE29 ("Not Available for
-# Credit License"); demographics come from Versium. Census/school fields come from the free Census
-# Geocoder. Override with the MELISSA_COLS env var (e.g. after a subscription upgrade).
-MELISSA_COLS = os.getenv("MELISSA_COLS", "GrpAddressDetails,GrpGeo")
+# Melissa is used for address work only: verify a street address, coordinates, carrier route, household
+# key. The account is on a credit license, which answers GE29 ("Not Available for Credit License") to the
+# Append/Move actions and to demographic fields, so: act=Check only, no demographic groups. Demographics
+# and email/phone -> address come from Versium; census/school fields from the free Census Geocoder.
+# Override with MELISSA_ACT / MELISSA_COLS (e.g. after a subscription upgrade).
+MELISSA_ACT = os.getenv("MELISSA_ACT", "Check")
+MELISSA_COLS = os.getenv("MELISSA_COLS", "GrpAddressDetails,GrpGeocode")
+# Recorded in md_results when there was no street address to check (Check needs one); a later street
+# address triggers a lookup again.
+MELISSA_NO_STREET = "NO_STREET_TO_CHECK"
 CENSUS_GEOCODER_URL = "https://geocoding.geo.census.gov/geocoder/geographies/address"
 CENSUS_BUDGET_SECONDS = 6
 
@@ -499,12 +504,14 @@ def melissa_lookup(first_name: str, last_name: str, email: str, phone: str,
     if not MELISSA_API_KEY:
         return {}
     zip_code = (zip_code or "")[:5]
+    if "Append" not in MELISSA_ACT and not (address or "").strip():
+        return {"md_results": MELISSA_NO_STREET}  # nothing Melissa can check; don't spend a credit
     try:
         m_resp = requests.get(
             "https://personator.melissadata.net/v3/WEB/ContactVerify/doContactVerify",
             params={
                 "id": MELISSA_API_KEY,
-                "act": "Check,Verify,Append",
+                "act": MELISSA_ACT,
                 "cols": MELISSA_COLS,
                 "format": "json",
                 "full": f"{first_name} {last_name}".strip(),

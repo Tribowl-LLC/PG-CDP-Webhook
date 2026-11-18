@@ -652,3 +652,42 @@ def test_versium_checked_recognises_csv_and_live_markers():
     assert main.versium_checked({"versium_lifestyle_flags": {"_source": "versium_reach_csv"}})
     assert main.versium_checked({"versium_lifestyle_flags": {"_versium_checked": "2026-11-18"}})
     assert not main.versium_checked({"versium_lifestyle_flags": {}}) and not main.versium_checked({})
+
+
+def test_customer_street_kept_when_melissa_off(monkeypatch):
+    _versium_world(monkeypatch)
+    r = main.run_melissa_and_versium_waterfall("Ann", "Lee", "ann@example.test", "", "9 Elm", "Novi", "MI", "48375")
+    assert r["md_address1"] == "9 Elm" and r["md_census_tract"]
+
+
+def test_checked_customer_not_bought_again_and_partial_success_kept(monkeypatch):
+    seen = _versium_world(monkeypatch)
+    main.run_melissa_and_versium_waterfall("Ann", "Lee", "ann@example.test", "",
+                                           known={"versium_lifestyle_flags": {"_versium_checked": "2026-11-18"}})
+    assert not any("/v2/contact" in u or "/v2/demographic" in u for u, _ in seen)
+    seen = _versium_world(monkeypatch, fail=("demographic",))
+    r = main.run_melissa_and_versium_waterfall("Ann", "Lee", "ann@example.test", "")
+    f = r["lifestyle_flags"]
+    assert f["_versium_contact_done"] and "_versium_demo_done" not in f and "_versium_checked" not in f
+    seen = _versium_world(monkeypatch)
+    r = main.run_melissa_and_versium_waterfall("Ann", "Lee", "ann@example.test", "",
+                                               known={"versium_lifestyle_flags": f})
+    assert not any("/v2/contact" in u for u, _ in seen) and any("/v2/demographic" in u for u, _ in seen)
+    assert r["lifestyle_flags"]["_versium_checked"]
+
+
+def test_conflicting_versium_address_rejected_and_consistent_one_taken_whole():
+    a = {"md_address1": "1 Main", "md_city": "Toledo", "md_state": "OH", "zip5": "43604", "md_plus4": None}
+    assert not main.versium_address_consistent(a, None, "MI", "Novi")
+    assert not main.versium_address_consistent(a, None, None, "Novi")
+    assert not main.versium_address_consistent(a, "48375", None, None)
+    assert main.versium_address_consistent({**a, "md_city": "Novi", "md_state": "Michigan", "zip5": "48375"},
+                                           None, "MI", "novi")
+    assert main.versium_address_consistent(a, None, None, None)
+
+
+def test_versium_address_conflicting_city_state_not_merged(monkeypatch):
+    seen = _versium_world(monkeypatch, contact={**V_CONTACT, "City": "Toledo", "State": "OH", "Zip": "43604",
+                                                "Zip+4": ""})
+    r = main.run_melissa_and_versium_waterfall("Ann", "Lee", "ann@example.test", "", city="Novi", state="MI")
+    assert not r.get("md_address1") and r["md_city"] == "Novi" and not r.get("zip5")

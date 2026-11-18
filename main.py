@@ -435,6 +435,74 @@ def save_order_items(cur, txn_id: str, order: dict, square_customer_id: str = No
     )
 
 
+def melissa_lookup(first_name: str, last_name: str, email: str, phone: str,
+                   address: str = "", city: str = "", state: str = "", zip_code: str = "") -> dict:
+    """Melissa Personator: verified address, geocode + distance, census/school fields, household demographics.
+    Returns {} when Melissa isn't configured or didn't answer (so `md_results` stays None)."""
+    if not MELISSA_API_KEY:
+        return {}
+    zip_code = (zip_code or "")[:5]
+    try:
+        m_resp = requests.get(
+            "https://personator.melissadata.net/v3/WEB/ContactVerify/doContactVerify",
+            params={
+                "id": MELISSA_API_KEY,
+                "act": "Check,Verify,Append",
+                "cols": "GrpAddressDetails,GrpGeo,GrpDemographicBasic,GrpCensus,GrpCensus2",
+                "format": "json",
+                "full": f"{first_name} {last_name}".strip(),
+                "email": email,
+                "phone": phone,
+                "a1": address,
+                "city": city,
+                "state": state,
+                "postal": zip_code,
+            },
+            timeout=5,
+        )
+        m_resp.raise_for_status()
+        rec = (m_resp.json().get("Records") or [{}])[0]
+    except Exception as e:
+        log.warning("Melissa lookup failed: %s", type(e).__name__)
+        return {}
+    has_street = bool((rec.get("AddressLine1") or address or "").strip())
+    lat = to_float(rec.get("Latitude")) if has_street else 0.0
+    lon = to_float(rec.get("Longitude")) if has_street else 0.0
+    dist = haversine_miles(ALLEY_LAT, ALLEY_LON, lat, lon) if (lat and lon) else None
+    street = lambda k: (rec.get(k) or None) if has_street else None
+    return {
+        "md_address1": rec.get("AddressLine1") or address or None,
+        "md_city": street("City") or city or None,
+        "md_state": street("State") or state or None,
+        "zip5": ((rec.get("PostalCode") or zip_code)[:5] if has_street else None) or zip_code or None,
+        "md_plus4": street("Plus4"),
+        "md_carrier_route": street("CarrierRoute"),
+        "md_latitude": lat or None,
+        "md_longitude": lon or None,
+        "distance_miles": dist,
+        "md_census_tract": street("CensusTract"),
+        "md_census_block": street("CensusBlock"),
+        "md_county_name": street("CountyName"),
+        "md_unified_school_district_name": street("UnifiedSchoolDistrictName"),
+        "md_elementary_school_district_name": street("ElementarySchoolDistrictName"),
+        "md_household_income": rec.get("HouseholdIncome") or None,
+        "md_presence_of_children": rec.get("PresenceOfChildren") or None,
+        "md_children_age_range": rec.get("ChildrenAgeRange") or None,
+        "md_own_rent": rec.get("HomeOwnerStatus") or None,
+        "md_marital_status": rec.get("MaritalStatus") or None,
+        "md_household_size": rec.get("HouseholdSize") or None,
+        "md_length_of_residence": rec.get("LengthOfResidence") or None,
+        "md_education": rec.get("Education") or None,
+        "md_occupation": rec.get("Occupation") or None,
+        "md_date_of_birth": rec.get("DateOfBirth") or None,
+        "md_gender": rec.get("Gender") or None,
+        "md_delivery_indicator": rec.get("DeliveryIndicator") or None,
+        "md_mik": rec.get("MelissaIdentityKey") or None,
+        "md_mak": rec.get("MelissaAddressKey") or None,
+        "md_results": rec.get("Results") or "NO_RESULT_CODES",
+    }
+
+
 def run_melissa_and_versium_waterfall(first_name: str, last_name: str, email: str, phone: str,
                                       address: str = "", city: str = "", state: str = "", zip_code: str = "",
                                       known: dict = None) -> dict:
@@ -464,59 +532,7 @@ def run_melissa_and_versium_waterfall(first_name: str, last_name: str, email: st
         return result
 
     # --- STEP 1: MELISSA PERSONATOR ---
-    if MELISSA_API_KEY:
-        try:
-            m_resp = requests.get(
-                "https://personator.melissadata.net/v3/WEB/ContactVerify/doContactVerify",
-                params={
-                    "id": MELISSA_API_KEY,
-                    "act": "Check,Verify,Append",
-                    "cols": "GrpAddressDetails,GrpGeo,GrpDemographicBasic",
-                    "format": "json",
-                    "full": f"{first_name} {last_name}".strip(),
-                    "email": email,
-                    "phone": phone,
-                    "a1": address,
-                    "city": city,
-                    "state": state,
-                    "postal": zip_code,
-                },
-                timeout=5,
-            )
-            m_resp.raise_for_status()
-            rec = (m_resp.json().get("Records") or [{}])[0]
-            has_street = bool((rec.get("AddressLine1") or address or "").strip())
-            lat = to_float(rec.get("Latitude")) if has_street else 0.0
-            lon = to_float(rec.get("Longitude")) if has_street else 0.0
-            dist = haversine_miles(ALLEY_LAT, ALLEY_LON, lat, lon) if (lat and lon) else None
-            result.update({
-                "md_address1": rec.get("AddressLine1") or address or None,
-                "md_city": (rec.get("City") if has_street else None) or city or None,
-                "md_state": (rec.get("State") if has_street else None) or state or None,
-                "zip5": ((rec.get("PostalCode") or zip_code)[:5] if has_street else None) or zip_code or None,
-                "md_plus4": rec.get("Plus4") if has_street else None,
-                "md_carrier_route": rec.get("CarrierRoute") if has_street else None,
-                "md_latitude": lat or None,
-                "md_longitude": lon or None,
-                "distance_miles": dist,
-                "md_household_income": rec.get("HouseholdIncome") or None,
-                "md_presence_of_children": rec.get("PresenceOfChildren") or None,
-                "md_children_age_range": rec.get("ChildrenAgeRange") or None,
-                "md_own_rent": rec.get("HomeOwnerStatus") or None,
-                "md_marital_status": rec.get("MaritalStatus") or None,
-                "md_household_size": rec.get("HouseholdSize") or None,
-                "md_length_of_residence": rec.get("LengthOfResidence") or None,
-                "md_education": rec.get("Education") or None,
-                "md_occupation": rec.get("Occupation") or None,
-                "md_date_of_birth": rec.get("DateOfBirth") or None,
-                "md_gender": rec.get("Gender") or None,
-                "md_delivery_indicator": rec.get("DeliveryIndicator") or None,
-                "md_mik": rec.get("MelissaIdentityKey") or None,
-                "md_mak": rec.get("MelissaAddressKey") or None,
-                "md_results": rec.get("Results") or "NO_RESULT_CODES",
-            })
-        except Exception as e:
-            log.warning("Melissa lookup failed: %s", type(e).__name__)
+    result.update(melissa_lookup(first_name, last_name, email, phone, address, city, state, zip_code))
 
     # --- STEP 2: VERSIUM REACH (When API Key is active) ---
     known = known or {}
@@ -996,6 +1012,8 @@ ENRICHMENT_FIELDS = [
     "md_presence_of_children", "md_children_age_range", "md_own_rent", "md_marital_status",
     "md_household_size", "md_length_of_residence", "md_education", "md_occupation",
     "md_date_of_birth", "md_gender", "md_delivery_indicator", "md_mik", "md_mak", "md_results",
+    "md_census_tract", "md_census_block", "md_county_name", "md_unified_school_district_name",
+    "md_elementary_school_district_name",
     "versium_net_worth", "versium_home_market_value", "versium_auto_make_model",
 ]
 JSONB_FIELDS = {"versium_alt_emails", "versium_alt_phones", "versium_lifestyle_flags", "versium_online_audience"}
@@ -2189,6 +2207,55 @@ def recover_square_avs_zips(request: Request, limit: int = 150, scan_payment_pag
             "street_addresses_unlocked_via_melissa": addresses_unlocked,
             "lookup_failures_retry_later": lookup_failures,
         }
+    finally:
+        conn.close()
+
+
+@app.post("/cron/melissa-geocode")
+def melissa_geocode_catch_up(request: Request, limit: int = 100, key: Optional[str] = CRON_KEY_PARAM):
+    """Runs customers who have a street address + ZIP but no coordinates (e.g. addresses that came from a
+    Versium CSV) through Melissa, so they get a verified address, distance from the venue, census and
+    school-district fields. Highest scores first; `limit` paid lookups per call (max 500). Each customer is
+    tried once (marked GEO_TRIED); a Melissa outage leaves them for the next run."""
+    require_cron_key(request)
+    if not MELISSA_API_KEY:
+        return {"status": "error", "message": "Missing MELISSA_API_KEY"}
+    limit = max(1, min(int(limit), 500))
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT * FROM master_customers
+                WHERE md_latitude IS NULL
+                  AND COALESCE(TRIM(md_address1), '') <> '' AND COALESCE(TRIM(zip5), '') <> ''
+                  AND COALESCE(md_results, '') NOT LIKE '%%GEO_TRIED%%'
+                ORDER BY bowler_value_score DESC NULLS LAST, true_lifetime_spend DESC NULLS LAST, cluster_id
+                LIMIT %s;
+                """, (limit,))
+            rows = cur.fetchall()
+        geocoded = no_coordinates = failures = newly_excluded = 0
+        for r in rows:
+            enr = melissa_lookup(r.get("first_name") or "", r.get("last_name") or "", r.get("email") or "",
+                                 r.get("phone") or "", r.get("md_address1") or "", r.get("md_city") or "",
+                                 r.get("md_state") or "", r.get("zip5") or "")
+            if enr.get("md_results") is None:
+                failures += 1  # Melissa didn't answer; try again next run
+                continue
+            enr["md_results"] = f"{enr['md_results'].rstrip(',')},GEO_TRIED"
+            if enr.get("md_latitude"):
+                geocoded += 1
+            else:
+                no_coordinates += 1
+            was = is_detroit_excluded(r.get("md_city"), r.get("zip5"))
+            with conn, conn.cursor() as cur:
+                cust = save_enrichment(cur, r["cluster_id"], enr, "Melissa")
+                cust = rescore_customer(cur, cust)
+            if not was and is_detroit_excluded(cust.get("md_city"), cust.get("zip5")):
+                newly_excluded += 1
+        return {"status": "melissa_geocode", "looked_up": len(rows) - failures, "geocoded": geocoded,
+                "no_coordinates": no_coordinates, "now_in_excluded_area": newly_excluded,
+                "failed_retry_later": failures}
     finally:
         conn.close()
 

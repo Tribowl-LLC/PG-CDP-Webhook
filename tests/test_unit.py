@@ -114,9 +114,10 @@ OA_BODY = {"versium": {"results": [{
 }]}}
 
 
-def test_online_audience_parse_keeps_only_meta_linkedin_tiktok():
+def test_online_audience_parse_keeps_only_meta_google_linkedin_tiktok():
     oa = main.parse_versium_online_audience(OA_BODY)
-    assert set(oa) == {"facebook", "linkedin", "tiktok"}
+    assert set(oa) == {"facebook", "google", "linkedin", "tiktok"}
+    assert oa["google"]["email"] == [H1]                     # Versium capitalizes Google's keys
     assert oa["facebook"]["email"] == [H1, H2, H2.upper()]
     assert oa["linkedin"]["jobtitle"] == ["Office Manager"]
     assert main.parse_versium_online_audience({}) == {}

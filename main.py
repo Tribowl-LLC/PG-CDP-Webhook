@@ -1886,7 +1886,17 @@ def handle_tripleseat(raw: dict, background_tasks: BackgroundTasks) -> dict:
                     "source": "Tripleseat",
                 })
                 if record_id and kind in ("lead", "event", "booking"):
-                    cust, _ = _count_record_once(cur, cust, f"ts_{kind}_{record_id}", "tripleseat", "ts_events")
+                    # A booking counts once: an event of an already-recorded booking (or a booking one of
+                    # whose events is already recorded) is claimed without counting again.
+                    related = []
+                    if kind == "event" and obj.get("booking_id"):
+                        related = [f"ts_booking_{obj['booking_id']}"]
+                    elif kind == "booking":
+                        related = [f"ts_event_{e['id']}" for e in obj.get("events") or []
+                                   if isinstance(e, dict) and e.get("id")]
+                    bump = not (related and _ts_known(cur, related))
+                    cust, _ = _count_record_once(cur, cust, f"ts_{kind}_{record_id}", "tripleseat", "ts_events",
+                                                 bump=bump)
 
                 thresh = get_threshold(cur)
                 if (
@@ -2223,7 +2233,15 @@ def _ts_link_customer(cur, ident: dict, extra: dict, apply: bool) -> tuple:
     how = "matched" if found else "created"
     if not apply:
         return found, how
+    # Records arrive in update order, not event order: keep the latest event date, never an older one.
+    event_date = extra.pop("ts_last_event_date", None)
     cust, _ = upsert_and_enrich_customer(cur, {**ident, **extra, "in_tripleseat": 1, "source": "Tripleseat"})
+    if event_date:
+        cur.execute("""UPDATE master_customers SET ts_last_event_date = %s
+                       WHERE cluster_id = %s AND (ts_last_event_date IS NULL
+                             OR ts_last_event_date !~ '^\\d{4}-\\d{2}-\\d{2}' OR ts_last_event_date < %s)
+                       RETURNING *;""", (event_date, cust["cluster_id"], event_date))
+        cust = cur.fetchone() or cust
     return cust, how
 
 

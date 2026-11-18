@@ -942,3 +942,26 @@ def test_tripleseat_lead_stored_with_campaign_and_dry_run_writes_nothing(db, fak
     assert str(row["event_date"]) == "2026-12-20"
     c = customer_row(db, row["cluster_id"])
     assert c["ts_lead_status"] == "PROSPECT" and (c["ts_events"] or 0) == 0
+
+
+def test_tripleseat_sync_keeps_latest_event_date(db, fake, uid):
+    bid, eid = int(uid[:8], 16) + 4, int(uid[4:12], 16) + 4
+    newer = ts_booking(uid, bid, eid)  # 2026-12-12
+    older = ts_booking(uid, bid + 1, eid + 1)
+    older["events"][0]["event_start_iso8601"] = "2024-05-01T18:00:00-04:00"
+    with main.get_conn() as conn, conn.cursor() as cur:
+        main.ingest_tripleseat_booking(cur, newer, count_it=True)
+        main.ingest_tripleseat_booking(cur, older, count_it=True)
+    db.execute("SELECT cluster_id FROM tripleseat_bookings WHERE booking_id = %s", (bid,))
+    c = customer_row(db, db.fetchone()["cluster_id"])
+    assert c["ts_last_event_date"] == "2026-12-12" and c["ts_events"] == 2
+
+
+def test_tripleseat_new_event_on_synced_booking_not_counted_again(client, db, fake, uid):
+    bid, eid = int(uid[:8], 16) + 6, int(uid[4:12], 16) + 6
+    with main.get_conn() as conn, conn.cursor() as cur:
+        main.ingest_tripleseat_booking(cur, ts_booking(uid, bid, eid), count_it=True)
+    hook = {"event": {"id": eid + 100, "booking_id": bid, "first_name": "Corp", "last_name": f"Booker{uid}",
+                      "status": "definite", "email_address": f"tsbook-{uid}@example.test", "event_date": "2026-12-13"}}
+    cid = client.post("/webhooks/tripleseat", headers=WH, json=hook).json()["cluster_id"]
+    assert customer_row(db, cid)["ts_events"] == 1

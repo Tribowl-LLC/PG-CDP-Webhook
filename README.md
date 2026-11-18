@@ -8,9 +8,11 @@ Perfect Game is a single-location family entertainment center (bowling, two-stor
 
 **Strategic direction (decided by the owner; treat as rules):**
 - **Hyperlocal.** Shift the customer base toward the immediate western/northern suburbs (Farmington Hills, Novi, Northville, West Bloomfield, Livonia, Bloomfield Hills, Plymouth, Commerce/Walled Lake …; see `PRIME_SUBURB_ZIPS`).
-- **Detroit and Southfield (and the other excluded areas in `is_detroit_excluded`) are removed from Meta entirely.** No Meta events, no audience uploads, no lookalikes seeded from them. They are excluded from *advertising*, not from data collection: their records are still stored and enriched. The Grosse Pointes (48230/48236) are allowed.
+- **Detroit and Southfield (and the other excluded areas in `is_detroit_excluded`) are removed from Meta entirely.** No Meta events, no audience uploads, no lookalikes seeded from them. They are excluded from *advertising*, not from data collection: their records are still stored and Melissa-enriched (Versium is skipped for them). The Grosse Pointes (48230/48236) are allowed.
 - **Only great customers go to Meta.** The 4 curated value-based seed audiences, never the full customer list.
-- **Maximum information.** Enrich every customer with every useful Melissa and Versium field. Cost is secondary.
+- **Maximum information.** Enrich every customer with every useful Melissa field, and every customer *eligible for advertising* with every useful Versium field. Cost is secondary.
+- **Versium spend follows ad eligibility.** No Versium calls for excluded areas (`is_detroit_excluded`); enriching people we will never advertise to is wasted money. Versium *online audience append* (Meta/TikTok/LinkedIn IDs) additionally requires a Michigan or unknown state (`versium_online_append_eligible`): out-of-state customers can't be reached by local ads and would skew lookalike seeds toward visitors.
+- **Never store sensitive Versium fields.** Credit rating / credit lines, ethnic group, religion, party affiliation and political donations are dropped before saving (`strip_blocked_versium_fields`) and must never feed scoring, personas or audiences.
 - **Legal and within platform rules.** The privacy policy and SMS terms disclose enrichment and hashed ad-platform sharing. Never use credit scores, scraping or exclusion lists built from broker financial data. Low-value prospects are handled by withholding the signal, not by excluding people. Promotional SMS goes only to people who opted in.
 - **Scoring is provisional.** The rule-based `bowler_value_score` / personas will be re-tuned once Versium data is in. Don't change weights without the owner.
 

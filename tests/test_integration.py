@@ -641,7 +641,7 @@ def test_docs_shows_key_box_on_cron_endpoints(client):
     spec = client.get("/openapi.json").json()
     for path in ("/cron/adjust-thermostat", "/cron/sync-square-catalog", "/cron/enrich-partywirks",
                  "/cron/recover-square-avs-zips", "/cron/sync-partywirks", "/cron/versium-online-audience",
-                 "/cron/melissa-geocode"):
+                 "/cron/melissa-geocode", "/cron/census-geocode"):
         params = spec["paths"][path]["post"].get("parameters", [])
         assert any(p["name"] == "key" and p["in"] == "query" for p in params), path
 
@@ -658,7 +658,7 @@ def test_endpoints_reject_missing_or_wrong_credentials(client, fake):
         assert client.post(path, json={}, headers={"X-CDP-Key": "wrong"}).status_code == 401
     for path in ("/cron/enrich-partywirks", "/cron/recover-square-avs-zips", "/cron/adjust-thermostat",
                  "/cron/sync-square-catalog", "/cron/sync-partywirks", "/cron/versium-online-audience",
-                 "/cron/melissa-geocode"):
+                 "/cron/melissa-geocode", "/cron/census-geocode"):
         assert client.post(path).status_code == 401
         assert client.post(path, headers=WH).status_code == 401  # webhook key doesn't open cron endpoints
     assert fake.calls == []
@@ -802,3 +802,33 @@ def test_melissa_geocode_skips_a_row_another_run_holds(client, db, fake, uid):
     finally:
         other.rollback(); other.close()
         db.execute("DELETE FROM master_customers WHERE cluster_id = %s", (cid,))
+
+
+# --- Census geocode catch-up ------------------------------------------------------------------------
+
+def test_census_geocode_fills_census_fields_once(client, db, fake, uid):
+    ids = {}
+    for tag, street, lat, score in (("new", "1 Versium Rd", None, 10**6 + 3),
+                                    ("hasgeo", "2 Melissa Ln", 42.5, 10**6 + 2),
+                                    ("miss", "3 Nomatch Ct", None, 10**6 + 1)):
+        db.execute("INSERT INTO master_customers (cluster_id, email, md_address1, md_city, md_state, zip5, "
+                   "md_latitude, distance_miles, bowler_value_score) VALUES (nextval('master_cluster_id_seq'), %s, %s, "
+                   "'Farmington Hills', 'MI', '48335', %s, %s, %s) RETURNING cluster_id",
+                   (f"census-{tag}-{uid}@example.test", street, lat, 9.9 if lat else None, score))
+        ids[tag] = db.fetchone()["cluster_id"]
+    try:
+        out = client.post("/cron/census-geocode?limit=3", headers={"X-CDP-Key": "test-cron-secret"}).json()
+        assert (out["matched"], out["coordinates_added"], out["no_match"], out["failed_retry_later"]) == (2, 1, 1, 0)
+        db.execute("SELECT * FROM master_customers WHERE cluster_id = ANY(%s)", (list(ids.values()),))
+        rows = {r["cluster_id"]: r for r in db.fetchall()}
+        new, hasgeo, miss = rows[ids["new"]], rows[ids["hasgeo"]], rows[ids["miss"]]
+        assert new["md_census_tract"] == "167000" and float(new["distance_miles"]) < 1 and new["census_checked_at"]
+        assert hasgeo["md_census_tract"] == "167000" and float(hasgeo["distance_miles"]) == 9.9   # Melissa's coords kept
+        assert miss["md_census_tract"] is None and miss["census_checked_at"]                    # asked once
+        before = fake.count("geocoding.geo.census.gov")
+        client.post("/cron/census-geocode?limit=3", headers={"X-CDP-Key": "test-cron-secret"})
+        db.execute("SELECT count(*) n FROM master_customers WHERE cluster_id = ANY(%s) AND census_checked_at IS NOT NULL",
+                   (list(ids.values()),))
+        assert db.fetchone()["n"] == 3
+    finally:
+        db.execute("DELETE FROM master_customers WHERE cluster_id = ANY(%s)", (list(ids.values()),))

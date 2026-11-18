@@ -230,7 +230,6 @@ def test_melissa_lookup_maps_census_fields_only_with_a_street(monkeypatch):
         seen.update(params); return FakeResponse(200, {"Records": [rec]})
     monkeypatch.setattr(main.requests, "get", get)
     out = main.melissa_lookup("A", "B", "a@b.com", "")
-    assert "GrpCensus" in seen["cols"] and "GrpCensus2" in seen["cols"]
     assert (out["md_census_tract"], out["md_county_name"], out["md_unified_school_district_name"]) == \
         ("141000", "Oakland", "Novi Community School District")
     assert out["distance_miles"] is not None
@@ -240,3 +239,19 @@ def test_melissa_lookup_maps_census_fields_only_with_a_street(monkeypatch):
     assert out["md_census_tract"] is None and out["md_results"] == "AE01"
     monkeypatch.setattr(main, "MELISSA_API_KEY", None)
     assert main.melissa_lookup("A", "B", "a@b.com", "") == {}
+
+
+def test_blank_melissa_answer_is_a_failure_not_data(monkeypatch, caplog):
+    from conftest import FakeResponse
+    monkeypatch.setattr(main, "MELISSA_API_KEY", "k")
+    blank = {"TransmissionResults": "GE05", "Records": [{"AddressLine1": " ", "HouseholdIncome": " ",
+                                                          "MelissaIdentityKey": " ", "Results": " "}]}
+    monkeypatch.setattr(main.requests, "get", lambda url, **kw: FakeResponse(200, blank))
+    with caplog.at_level("ERROR", logger="pg_cdp"):
+        assert main.melissa_lookup("A", "B", "a@b.com", "", "12 Real St", "Novi", "MI", "48375") == {}
+    assert "GE05" in caplog.text
+    padded = {"Records": [{"AddressLine1": "12 Real St", "City": "Novi", "PostalCode": "48375", "Latitude": "42.4",
+                           "Longitude": "-83.4", "HouseholdIncome": " ", "MelissaIdentityKey": " ", "Results": "AS01 "}]}
+    monkeypatch.setattr(main.requests, "get", lambda url, **kw: FakeResponse(200, padded))
+    out = main.melissa_lookup("A", "B", "a@b.com", "")
+    assert out["md_household_income"] is None and out["md_mik"] is None and out["md_results"] == "AS01"

@@ -162,3 +162,17 @@ def test_waterfall_skips_online_audience_out_of_state_and_excluded(monkeypatch):
     calls.clear()
     main.run_melissa_and_versium_waterfall("A", "B", "a@b.com", "", "1 Main", "Detroit", "MI", "48226")
     assert calls == []                                      # excluded: no Versium at all
+
+
+def test_stored_geography_gates_versium_when_webhook_has_no_address(monkeypatch):
+    calls = _fake_versium(monkeypatch)
+    main.run_melissa_and_versium_waterfall("A", "B", "a@b.com", "", known={"md_state": "OH", "zip5": "43604"})
+    assert any("/v2/contact" in u for u in calls) and not any("onlineAudience" in u for u in calls)
+    calls.clear()
+    main.run_melissa_and_versium_waterfall("A", "B", "a@b.com", "", known={"md_city": "Detroit", "zip5": "48226"})
+    assert calls == []
+    calls.clear()
+    # a fresh Michigan address wins over an old out-of-state one
+    main.run_melissa_and_versium_waterfall("A", "B", "a@b.com", "", "1 Main", "Novi", "MI", "48375",
+                                           known={"md_state": "OH", "zip5": "43604"})
+    assert any("onlineAudience" in u for u in calls)

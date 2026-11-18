@@ -412,11 +412,16 @@ def save_order_items(cur, txn_id: str, order: dict, square_customer_id: str = No
 
 
 def run_melissa_and_versium_waterfall(first_name: str, last_name: str, email: str, phone: str,
-                                      address: str = "", city: str = "", state: str = "", zip_code: str = "") -> dict:
+                                      address: str = "", city: str = "", state: str = "", zip_code: str = "",
+                                      known: dict = None) -> dict:
     """Step 1: Melissa Personator (Address, Lat/Long, Demographics). Step 2: Versium REACH (Alt Emails/Phones, Wealth).
 
     `md_results` is only set when Melissa actually answered. It stays None when Melissa is not
     configured or the call failed, so the customer is tried again later instead of being written off.
+
+    `known` is the customer's stored record (md_city / md_state / zip5). It is only used by the Versium
+    geography gates, as a fallback after Melissa's answer and the incoming fields, so a webhook that
+    arrives without an address can't make a known Detroit or out-of-state customer look "unknown".
     """
     zip_code = (zip_code or "")[:5]
     result = {
@@ -489,7 +494,11 @@ def run_melissa_and_versium_waterfall(first_name: str, last_name: str, email: st
             log.warning("Melissa lookup failed: %s", type(e).__name__)
 
     # --- STEP 2: VERSIUM REACH (When API Key is active) ---
-    if VERSIUM_API_KEY and not is_detroit_excluded(result.get("md_city"), result.get("zip5")):
+    known = known or {}
+    gate_zip = result.get("zip5") or known.get("zip5")
+    gate_city = result.get("md_city") or known.get("md_city")
+    gate_state = result.get("md_state") or known.get("md_state")
+    if VERSIUM_API_KEY and not is_detroit_excluded(gate_city, gate_zip):
         v_headers = {"x-versium-api-key": VERSIUM_API_KEY, "Accept": "application/json"}
         v_input = {
             "first": first_name,
@@ -528,8 +537,7 @@ def run_melissa_and_versium_waterfall(first_name: str, last_name: str, email: st
             log.warning("Versium lookup failed: %s", type(e).__name__)
 
         # Online audience append (Meta / LinkedIn / TikTok IDs): local, advertisable customers only.
-        if versium_online_append_eligible(result.get("md_city") or city, result.get("md_state") or state,
-                                          result.get("zip5") or zip_code):
+        if versium_online_append_eligible(gate_city, gate_state, gate_zip):
             try:
                 result["online_audience"] = fetch_versium_online_audience(v_headers, v_input)
             except Exception as e:
@@ -1138,6 +1146,7 @@ def upsert_and_enrich_customer(cur, data: dict) -> tuple:
             data.get("city") or "",
             data.get("state") or "",
             data.get("zip") or "",
+            known=prior,
         )
         if not existing and enriched.get("md_mik"):
             cur.execute(
@@ -2012,7 +2021,7 @@ def enrich_partywirks_customers(request: Request, key: Optional[str] = CRON_KEY_
         for r in rows:
             enr = run_melissa_and_versium_waterfall(
                 r.get("first_name") or "", r.get("last_name") or "",
-                r.get("email") or "", r.get("phone") or "",
+                r.get("email") or "", r.get("phone") or "", known=r,
             )
             if enr.get("md_results") is None:
                 lookup_failures += 1  # Melissa didn't answer; leave it for the next run
@@ -2121,7 +2130,7 @@ def recover_square_avs_zips(request: Request, limit: int = 150, scan_payment_pag
                         continue
                     enr = run_melissa_and_versium_waterfall(
                         r.get("first_name") or "", r.get("last_name") or "",
-                        r.get("email") or "", phone, zip_code=avs_zip,
+                        r.get("email") or "", phone, zip_code=avs_zip, known=r,
                     )
                     if enr.get("md_results") is None and MELISSA_API_KEY and (
                             phone or (r.get("first_name") and r.get("last_name"))):

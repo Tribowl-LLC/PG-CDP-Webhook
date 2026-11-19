@@ -1481,3 +1481,32 @@ def test_webres_sent_first_then_square_sends_one_purchase(client, db, fake, uid)
     square_post(client, payment(f"SP{uid}", 4500, email=email, name=f"BOOKER/LANE{uid}"))
     assert [e["event_id"] for e in purchases_sent(fake)] == [f"wr_W{uid}"]
     assert capi_rows(db, f"sq_pay_SP{uid}")[0]["meta_response_status"] == "DUPLICATE_PURCHASE"
+
+
+def test_one_square_payment_pairs_with_only_one_webres_booking(client, db, fake, uid):
+    """Two same-priced bookings, only one Square payment tied to the customer: the second booking still counts."""
+    email = f"pair-{uid}@example.test"
+    square_post(client, payment(f"SP{uid}", 5000, email=email, name=f"BOOKER/LANE{uid}"))
+    client.post("/webhooks/webres", headers=WH, json=webres_body(uid, email, 50, rid=f"W1{uid}"))
+    client.post("/webhooks/webres", headers=WH, json=webres_body(uid, email, 50, rid=f"W2{uid}"))
+    assert {e["event_id"] for e in purchases_sent(fake)} == {f"sq_pay_SP{uid}", f"wr_W2{uid}"}
+    # Re-sent bookings don't change the pairing.
+    client.post("/webhooks/webres", headers=WH, json=webres_body(uid, email, 50, rid=f"W2{uid}"))
+    assert capi_rows(db, f"wr_W1{uid}")[0]["meta_response_status"] == "DUPLICATE_PURCHASE"
+    assert capi_rows(db, f"wr_W2{uid}")[0]["sent_to_meta"] is True
+
+
+def test_twin_matching_uses_record_times_not_retry_time(client, db, fake, uid):
+    email = f"retry-{uid}@example.test"
+    fake.meta_mode = "500"  # the WebRes Purchase fails and waits for the retry
+    client.post("/webhooks/webres", headers=WH, json=webres_body(uid, email, 75))
+    fake.meta_mode = "ok"
+    # Two days later the customer pays $75 in store: a different purchase, recorded long after the booking.
+    db.execute("UPDATE unified_transactions SET recorded_at = recorded_at - INTERVAL '2 days' "
+               "WHERE transaction_id = %s", (f"wr_W{uid}",))
+    square_post(client, payment(f"SP{uid}", 7500, email=email, name=f"BOOKER/LANE{uid}"))
+    with main.get_conn() as conn, conn.cursor() as cur:
+        main.retry_unsent_events(cur)
+    wr = capi_rows(db, f"wr_W{uid}")[0]
+    assert wr["sent_to_meta"] is True and wr["meta_response_status"] == "200"
+    assert capi_rows(db, f"sq_pay_SP{uid}")[0]["sent_to_meta"] is True

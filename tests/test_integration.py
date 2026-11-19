@@ -352,7 +352,10 @@ def test_score_counts_separate_visit_days_and_recency(db, uid):
         db.execute("INSERT INTO unified_transactions (transaction_id, cluster_id, source_system, total_amount, "
                    "transaction_date) VALUES (%s, %s, 'square', %s, NOW() - make_interval(days => %s))",
                    (f"sq_pay_V{uid}{i}", cust["cluster_id"], amt, days_ago))
-    assert main.customer_facts(db, cust) == {"visit_days": 3, "recent": True}
+    # A backfilled WebRes copy carries its import date, not a visit day
+    db.execute("INSERT INTO unified_transactions (transaction_id, cluster_id, source_system, total_amount, "
+               "transaction_date) VALUES (%s, %s, 'webres', 30, NOW() - INTERVAL '3 days')", (f"wr_V{uid}", cust["cluster_id"]))
+    assert main.customer_facts(db, cust) == {"visit_days": 3, "recent": True, "ts_booked": False}
     assert main.rescore_customer(db, cust)["bowler_value_score"] == 15  # recent 10 + 3 separate days 5
 
 
@@ -389,6 +392,39 @@ def test_below_threshold_customer_still_joins_seed_audiences(client, db, fake, u
         "email": f"seed-{uid}@example.test", "amount": 30})
     assert capi_rows(db, f"qb_wr_SA{uid}") == []          # the event gate still applies
     assert fake.count("/users") >= 1                      # the seed doesn't need the score
+
+
+def test_new_inquiry_does_not_unbook_a_confirmed_tripleseat_booker(client, db, uid, everyone_qualifies):
+    base = {"first_name": "Again", "last_name": f"Booker{uid}", "email_address": f"again-{uid}@example.test"}
+    r = client.post("/webhooks/tripleseat", headers=WH, json={"event": {
+        **base, "id": f"AB{uid}", "status": "DEFINITE", "event_date": "2027-01-09"}}).json()
+    before = customer_row(db, r["cluster_id"])
+    client.post("/webhooks/tripleseat", headers=WH, json={"lead": {
+        **base, "id": f"AL{uid}", "status": "prospect", "event_date": "2027-06-01"}})
+    after = customer_row(db, r["cluster_id"])
+    assert after["ts_lead_status"] == "DEFINITE" and after["bowler_value_score"] == before["bowler_value_score"]
+    assert after["pg_mosaic_persona"].startswith("PG-1")
+
+
+def test_tripleseat_api_sync_scores_with_the_booking_date(db, uid):
+    ident = {"email": f"apisync-{uid}@example.test", "phone": "", "first_name": "Api", "last_name": f"Sync{uid}"}
+    cust, how = main._ts_link_customer(db, ident, {"ts_lead_status": "DEFINITE", "ts_last_event_date": "2099-05-05"},
+                                       apply=True)
+    assert how == "created" and cust["bowler_value_score"] == 35  # booker 25 + upcoming event 10
+
+
+def test_live_sync_puts_repeat_visitors_in_the_celebration_seed(db, fake, uid, monkeypatch):
+    monkeypatch.setattr(main, "AUDIENCE_PG3_CELEBRATIONS", "999000111")
+    db.execute("INSERT INTO master_customers (cluster_id, email, md_city, zip5, true_lifetime_spend) "
+               "VALUES (nextval('master_cluster_id_seq'), %s, 'Novi', '48375', 60) RETURNING *",
+               (f"repeat-{uid}@example.test",))
+    cust = db.fetchone()   # no distance, spend under $279: only the 3 visit days qualify them
+    for i in range(3):
+        db.execute("INSERT INTO unified_transactions (transaction_id, cluster_id, source_system, total_amount, "
+                   "transaction_date) VALUES (%s, %s, 'square', 20, NOW() - make_interval(days => %s))",
+                   (f"sq_pay_R{uid}{i}", cust["cluster_id"], 10 + i * 30))
+    main.sync_customer_to_meta_custom_audiences(dict(cust))
+    assert fake.count("999000111/users") == 1
 
 
 def test_partywirks_webhook_uses_api_and_counts_once(client, db, fake, uid, everyone_qualifies):

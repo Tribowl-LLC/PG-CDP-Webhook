@@ -16,6 +16,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import main  # noqa: E402
 
 BATCH = 500
+THRESHOLDS = (80, 70, 60, 55, 50, 45)
 
 
 def run(apply: bool):
@@ -36,8 +37,8 @@ def run(apply: bool):
                     changed_persona += before["pg_mosaic_persona"] != after["pg_mosaic_persona"]
                     personas[after["pg_mosaic_persona"]] += 1
                     s = after["bowler_value_score"]
-                    bands[">=80" if s >= 80 else ">=70" if s >= 70 else ">=60" if s >= 60 else
-                          ">=55" if s >= 55 else ">=45" if s >= 45 else "<45"] += 1
+                    for t in THRESHOLDS:
+                        bands[t] += s >= t
                     done += 1
                 if not apply:
                     conn.rollback()
@@ -48,8 +49,8 @@ def run(apply: bool):
     print(f"Rescored {done} customers: {changed_score} scores and {changed_persona} personas changed")
     for p, n in sorted(personas.items()):
         print(f"  {p}: {n}")
-    for b in (">=80", ">=70", ">=60", ">=55", ">=45", "<45"):
-        print(f"  score {b}: {bands[b]}")
+    for t in THRESHOLDS:
+        print(f"  score >= {t}: {bands[t]}")
     print("Applied." if apply else "Dry run: nothing written. Re-run with --apply to write.")
 
 

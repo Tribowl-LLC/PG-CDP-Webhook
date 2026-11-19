@@ -32,10 +32,15 @@ def run(apply: bool, webhook_only: bool = False):
         with conn, conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT mc.*, COALESCE(v.visit_days, 0) AS visit_days FROM master_customers mc
+                SELECT mc.*, COALESCE(v.visit_days, 0) AS visit_days,
+                       EXISTS (SELECT 1 FROM tripleseat_events e WHERE e.cluster_id = mc.cluster_id
+                                 AND UPPER(COALESCE(e.status, '')) IN ('DEFINITE', 'CLOSED'))
+                         OR EXISTS (SELECT 1 FROM tripleseat_bookings b WHERE b.cluster_id = mc.cluster_id
+                                      AND UPPER(COALESCE(b.status, '')) IN ('DEFINITE', 'CLOSED')) AS ts_booked
+                FROM master_customers mc
                 LEFT JOIN (SELECT cluster_id, COUNT(DISTINCT transaction_date::date) AS visit_days
                            FROM unified_transactions
-                           WHERE total_amount > 0 AND source_system IN ('square', 'webres') AND cluster_id IS NOT NULL
+                           WHERE total_amount > 0 AND source_system = 'square' AND cluster_id IS NOT NULL
                            GROUP BY cluster_id) v USING (cluster_id)
                 WHERE (COALESCE(email, '') <> '' OR COALESCE(phone, '') <> '')
                   AND (NOT %s
@@ -51,7 +56,7 @@ def run(apply: bool, webhook_only: bool = False):
     rows_by_audience = collections.defaultdict(list)
     excluded = 0
     for c in customers:
-        targets, ltv = main.audience_targets(c, {"visit_days": c["visit_days"]})
+        targets, ltv = main.audience_targets(c, {"visit_days": c["visit_days"], "ts_booked": c["ts_booked"]})
         if not targets:
             excluded += 1
             continue

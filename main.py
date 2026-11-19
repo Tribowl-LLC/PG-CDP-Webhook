@@ -918,10 +918,16 @@ def is_real_organisation(cust: dict) -> bool:
     return not personal or bool(_ORG_WORDS.search(acct))
 
 
-def is_party_booker(cust: dict) -> bool:
+def ts_confirmed_booker(cust: dict, facts: Optional[dict] = None) -> bool:
+    """A DEFINITE/CLOSED Tripleseat booking: the customer's status (a later inquiry doesn't downgrade it, see
+    UPSERT_UPDATE_RULES) or any booked event/booking in the API-synced Tripleseat tables."""
+    return str(cust.get("ts_lead_status") or "").upper() in TRIPLESEAT_BOOKED_STATUSES or \
+        bool((facts or {}).get("ts_booked"))
+
+
+def is_party_booker(cust: dict, facts: Optional[dict] = None) -> bool:
     """A Partywirks booking, or a DEFINITE/CLOSED Tripleseat event."""
-    return int(cust.get("pw_bookings") or 0) > 0 or \
-        str(cust.get("ts_lead_status") or "").upper() in TRIPLESEAT_BOOKED_STATUSES
+    return int(cust.get("pw_bookings") or 0) > 0 or ts_confirmed_booker(cust, facts)
 
 
 def _fit_facts(cust: dict) -> dict:
@@ -984,7 +990,7 @@ def goal_fits(cust: dict) -> dict:
 def behaviour_points(cust: dict, facts: dict) -> int:
     """Proven money. `facts`: visit_days (separate days with a payment) and recent (bought/booked in 90 days)."""
     spend = float(cust.get("true_lifetime_spend") or 0)
-    return (25 * is_party_booker(cust)
+    return (25 * is_party_booker(cust, facts)
             + (20 if spend >= HIGH_SPEND else 15 if spend >= TOP_QUARTER_SPEND else 0)
             + 10 * bool(facts.get("recent"))
             + 5 * (int(facts.get("visit_days") or 0) >= 3))
@@ -992,7 +998,7 @@ def behaviour_points(cust: dict, facts: dict) -> int:
 
 def assign_persona(cust: dict, facts: dict) -> str:
     f = _fit_facts(cust)
-    if f["org"] or str(cust.get("ts_lead_status") or "").upper() in TRIPLESEAT_BOOKED_STATUSES:
+    if f["org"] or ts_confirmed_booker(cust, facts):
         return PERSONA_CORPORATE
     if int(cust.get("pw_bookings") or 0) > 0 or \
             (f["kids_3_10"] and f["age_35_55"] and f["within_12"] and f["affluent"]):
@@ -1039,21 +1045,32 @@ def _recent_date(v) -> bool:
         return False
 
 
+# Visit days and recency from Square payments only: those carry the real payment date. Partywirks/Tripleseat
+# ledger rows carry the date they were first recorded, and WebRes rows from the Nov 16-17 backfill their import
+# date (and a WebRes booking's money also arrives as a Square payment). Several payments on one day (deposit +
+# balance, split checks) are one visit.
+_FACTS_SQL = """
+    SELECT COUNT(DISTINCT u.transaction_date::date) FILTER (
+               WHERE u.total_amount > 0 AND u.source_system = 'square') AS visit_days,
+           COALESCE(BOOL_OR(u.total_amount > 0 AND u.source_system = 'square'
+                            AND u.transaction_date >= NOW() - make_interval(days => %(days)s)), FALSE) AS recent_paid,
+           EXISTS (SELECT 1 FROM tripleseat_events e WHERE e.cluster_id = %(cid)s
+                     AND UPPER(COALESCE(e.status, '')) IN ('DEFINITE', 'CLOSED'))
+             OR EXISTS (SELECT 1 FROM tripleseat_bookings b WHERE b.cluster_id = %(cid)s
+                          AND UPPER(COALESCE(b.status, '')) IN ('DEFINITE', 'CLOSED')) AS ts_booked
+    FROM unified_transactions u WHERE u.cluster_id = %(cid)s;"""
+
+
 def customer_facts(cur, cust: dict) -> dict:
-    """Behaviour facts from the transaction ledger. Partywirks/Tripleseat ledger rows carry the date they were
-    first recorded (a backfill makes them all look recent), and WebRes rows from the Nov 16-17 backfill too,
-    so those sources' recency comes from the booking's own date (party/reservation/event, past 90 days or
-    upcoming). Several payments on one day (deposit + balance, split checks) are one visit."""
-    cur.execute("""SELECT COUNT(DISTINCT transaction_date::date) FILTER (
-                              WHERE total_amount > 0 AND source_system IN ('square', 'webres')) AS visit_days,
-                          COALESCE(BOOL_OR(total_amount > 0 AND source_system = 'square'
-                                           AND transaction_date >= NOW() - make_interval(days => %s)), FALSE) AS recent
-                   FROM unified_transactions WHERE cluster_id = %s;""", (RECENT_DAYS, cust["cluster_id"]))
+    """Behaviour facts: visit days and payment recency from the ledger, and booked Tripleseat records. Bookings'
+    recency comes from their own date (reservation / party / event, past 90 days or upcoming)."""
+    cur.execute(_FACTS_SQL, {"days": RECENT_DAYS, "cid": cust["cluster_id"]})
     row = cur.fetchone() or {}
-    booked_ts = str(cust.get("ts_lead_status") or "").upper() in TRIPLESEAT_BOOKED_STATUSES
-    recent = bool(row.get("recent")) or _recent_date(cust.get("wr_last_reservation_date")) or \
-        _recent_date(cust.get("pw_last_party_date")) or (booked_ts and _recent_date(cust.get("ts_last_event_date")))
-    return {"visit_days": int(row.get("visit_days") or 0), "recent": recent}
+    facts = {"visit_days": int(row.get("visit_days") or 0), "ts_booked": bool(row.get("ts_booked"))}
+    facts["recent"] = bool(row.get("recent_paid")) or _recent_date(cust.get("wr_last_reservation_date")) or \
+        _recent_date(cust.get("pw_last_party_date")) or \
+        (ts_confirmed_booker(cust, facts) and _recent_date(cust.get("ts_last_event_date")))
+    return facts
 
 
 def rescore_customer(cur, cust: dict, exact: bool = True) -> dict:
@@ -1111,9 +1128,8 @@ def seed_memberships(cust: dict, facts: Optional[dict] = None) -> dict:
     geography, and a party-age family 20 miles away still teaches Meta what a birthday family looks like."""
     f = _fit_facts(cust)
     spend = float(cust.get("true_lifetime_spend") or 0)
-    booked_ts = str(cust.get("ts_lead_status") or "").upper() in TRIPLESEAT_BOOKED_STATUSES
     return {
-        "corporate": f["org"] or booked_ts,
+        "corporate": f["org"] or ts_confirmed_booker(cust, facts),
         "birthday": int(cust.get("pw_bookings") or 0) > 0 or (f["kids_3_10"] and f["age_35_55"] and f["affluent"]),
         "celebration": spend >= TOP_QUARTER_SPEND or int((facts or {}).get("visit_days") or 0) >= 3
                        or (cust.get("pg_mosaic_persona") or "").startswith("PG-3"),
@@ -1182,11 +1198,22 @@ def upload_audience_rows(aud_id: str, rows: list) -> dict:
     return {"ok": True, "received": body.get("num_received"), "invalid": body.get("num_invalid_entries")}
 
 
-def sync_customer_to_meta_custom_audiences(cust: dict):
-    """Pushes one non-excluded customer into the Meta value-based Custom Audiences they belong in (any score)."""
+def sync_customer_to_meta_custom_audiences(cust: dict, facts: Optional[dict] = None):
+    """Pushes one non-excluded customer into the Meta value-based Custom Audiences they belong in (any score).
+    Reads the customer's visit/booking facts (seed rules use them) when the caller doesn't pass them."""
     if not META_ACCESS_TOKEN or cust.get("enrich_after"):
         return  # a customer waiting for enrichment is synced by the worker once it's done
-    targets, ltv = audience_targets(cust)
+    if facts is None:
+        try:
+            conn = get_conn()
+            try:
+                with conn, conn.cursor() as cur:
+                    facts = customer_facts(cur, cust)
+            finally:
+                conn.close()
+        except Exception as e:
+            log.warning("Audience sync could not read customer facts: %s", type(e).__name__)
+    targets, ltv = audience_targets(cust, facts)
     row = audience_row(cust, ltv)
     for aud_id in targets:
         upload_audience_rows(aud_id, [row])
@@ -1563,7 +1590,10 @@ UPSERT_UPDATE_RULES = {
     # Merged, so a live lookup adds to (never wipes) what the CSV import stored.
     "versium_lifestyle_flags": f"COALESCE({_MC}.versium_lifestyle_flags, '{{}}'::jsonb) || EXCLUDED.versium_lifestyle_flags",
     "versium_online_audience": f"COALESCE({_MC}.versium_online_audience, '{{}}'::jsonb) || EXCLUDED.versium_online_audience",
-    "ts_lead_status": _keep("ts_lead_status"),
+    # A new inquiry (prospect/tentative) from a customer who has a confirmed booking doesn't un-book them.
+    "ts_lead_status": (f"CASE WHEN UPPER({_MC}.ts_lead_status) IN ('DEFINITE', 'CLOSED') AND "
+                       f"UPPER(EXCLUDED.ts_lead_status) IN ('PROSPECT', 'TENTATIVE', 'ACCOUNT_CONTACT_ONLY') "
+                       f"THEN {_MC}.ts_lead_status ELSE {_keep('ts_lead_status')} END"),
     "ts_max_guests": f"GREATEST(COALESCE({_MC}.ts_max_guests, 0), COALESCE(EXCLUDED.ts_max_guests, 0))",
     "ts_last_event_date": _keep("ts_last_event_date"),
     "ts_turned_down_reason": _keep("ts_turned_down_reason"),
@@ -2742,7 +2772,9 @@ def _ts_link_customer(cur, ident: dict, extra: dict, apply: bool) -> tuple:
                        WHERE cluster_id = %s AND (ts_last_event_date IS NULL
                              OR ts_last_event_date !~ '^\\d{4}-\\d{2}-\\d{2}' OR ts_last_event_date < %s)
                        RETURNING *;""", (event_date, cust["cluster_id"], event_date))
-        cust = cur.fetchone() or cust
+        updated = cur.fetchone()
+        if updated:
+            cust = rescore_customer(cur, updated)  # the booking's date counts for recency
     return cust, how
 
 

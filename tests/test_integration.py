@@ -251,6 +251,80 @@ def test_tripleseat_resends_give_one_qualified_bowler(client, db, fake, uid):
     assert customer_row(db, r["cluster_id"])["ts_events"] == 2  # one lead + one event, not 5
 
 
+
+# --- Meta values are real money or nothing ------------------------------------------------------
+
+@pytest.fixture
+def everyone_qualifies(monkeypatch):
+    """These tests are about the value sent, not who qualifies."""
+    monkeypatch.setattr(main, "get_threshold", lambda cur: 0)
+
+
+def test_webres_qualified_bowler_carries_the_real_booking_amount(client, db, fake, uid, everyone_qualifies):
+    r = client.post("/webhooks/webres", headers=WH, json={
+        "reservation_id": f"RV{uid}", "first_name": "Lane", "last_name": f"Small{uid}",
+        "email": f"small-{uid}@example.test", "amount": 66, "reservation_date": "2026-11-28T18:00:00"}).json()
+    qb = capi_rows(db, f"qb_wr_RV{uid}")
+    assert len(qb) == 1 and float(qb[0]["event_value"]) == 66.0, r  # no $250 floor
+    sent = [e for e in fake.meta_events() if e["event_name"] == "Qualified_Bowler"]
+    assert sent[0]["custom_data"]["value"] == 66.0
+
+
+def test_tripleseat_prospect_and_tentative_are_leads_with_no_value(client, db, fake, uid, everyone_qualifies):
+    base = {"first_name": "Maybe", "last_name": f"Planner{uid}", "email_address": f"maybe-{uid}@example.test",
+            "event_date": "2026-12-19", "grand_total": "1800.00"}
+    r = client.post("/webhooks/tripleseat", headers=WH, json={"lead": {**base, "id": f"L{uid}", "status": "prospect"}}).json()
+    client.post("/webhooks/tripleseat", headers=WH, json={"event": {**base, "id": f"E{uid}", "status": "tentative"}})
+    cid = r["cluster_id"]
+    assert capi_rows(db, f"qb_ts_{cid}_%") == []
+    leads = capi_rows(db, f"lead_ts_{cid}_%")
+    assert len(leads) == 1 and float(leads[0]["event_value"]) == 0.0  # one per date, however many re-sends
+    sent = [e for e in fake.meta_events() if e["event_name"] == "Lead"]
+    assert len(sent) == 1 and "value" not in sent[0]["custom_data"] and "currency" not in sent[0]["custom_data"]
+
+
+def test_tripleseat_definite_event_is_qualified_bowler_worth_its_grand_total(client, db, fake, uid, everyone_qualifies):
+    r = client.post("/webhooks/tripleseat", headers=WH, json={"event": {
+        "id": f"D{uid}", "first_name": "Booked", "last_name": f"Planner{uid}", "status": "DEFINITE",
+        "email_address": f"booked-{uid}@example.test", "event_date": "2026-12-20", "grand_total": "2400.50"}}).json()
+    qb = capi_rows(db, f"qb_ts_{r['cluster_id']}_%")
+    assert len(qb) == 1 and float(qb[0]["event_value"]) == 2400.5
+    assert capi_rows(db, f"lead_ts_{r['cluster_id']}_%") == []
+
+
+def test_tripleseat_definite_without_a_total_sends_no_value(client, db, fake, uid, everyone_qualifies):
+    r = client.post("/webhooks/tripleseat", headers=WH, json={"event": {
+        "id": f"N{uid}", "first_name": "Booked", "last_name": f"NoTotal{uid}", "status": "definite",
+        "email_address": f"nototal-{uid}@example.test", "event_date": "2026-12-21", "grand_total": None}}).json()
+    assert len(capi_rows(db, f"qb_ts_{r['cluster_id']}_%")) == 1
+    sent = [e for e in fake.meta_events() if e["event_name"] == "Qualified_Bowler"]
+    assert "value" not in sent[0]["custom_data"]  # never the old $450/$1,000 estimate
+
+
+def test_tripleseat_booking_value_comes_from_its_totals():
+    assert main.tripleseat_contract_value("booking", {"total_grand_total": "3100.00"}) == 3100.0
+    assert main.tripleseat_contract_value("booking", {"events": [{"grand_total": "100.25"},
+                                                                 {"grand_total": "200"}, "junk"]}) == 300.25
+    assert main.tripleseat_contract_value("event", {"grand_total": "n/a"}) == 0.0
+
+
+def test_partywirks_qualified_bowler_carries_the_order_total(client, db, fake, uid, everyone_qualifies):
+    oid = f"31{int(uid, 16)}"
+    body = fake.add_partywirks(uid, oid)
+    client.post("/webhooks/partywirks", headers=WH, json=body)
+    qb = capi_rows(db, f"qb_pw_{oid}")
+    assert len(qb) == 1 and float(qb[0]["event_value"]) == 728.7
+    assert not [e for e in fake.meta_events() if e["event_name"] == "Purchase"]  # Square sends the money
+
+
+def test_partywirks_without_a_total_sends_no_value(client, db, fake, uid, everyone_qualifies):
+    oid = f"32{int(uid, 16)}"
+    body = fake.add_partywirks(uid, oid)
+    del fake.pw_reservations[oid]["totals"]
+    client.post("/webhooks/partywirks", headers=WH, json=body)
+    qb = capi_rows(db, f"qb_pw_{oid}")
+    assert len(qb) == 1 and float(qb[0]["event_value"]) == 0.0
+
 def test_partywirks_webhook_uses_api_and_counts_once(client, db, fake, uid):
     oid = f"26{int(uid, 16)}"
     body = fake.add_partywirks(uid, oid, package="BIRTHDAY EXTRAVAGANZA", event_date="2026-12-05")

@@ -193,6 +193,18 @@ def date_only(val):
     return val or None
 
 
+def as_text(val) -> Optional[str]:
+    """A webhook value for a text column. Tripleseat sends some fields as objects: `lost_reason` on a LOST
+    event or booking is {"id", "name"}, so an object becomes its name and a list its names joined."""
+    if isinstance(val, dict):
+        return as_text(val.get("name") or val.get("value") or val.get("label"))
+    if isinstance(val, (list, tuple)):
+        return ", ".join(t for t in (as_text(v) for v in val) if t) or None
+    if val is None:
+        return None
+    return str(val).strip() or None
+
+
 def parse_cardholder_name(raw_name: str) -> tuple:
     """Parses EMV chip cardholder_name (handles 'LAST/FIRST' and 'FIRST LAST' formats)."""
     if not raw_name or not isinstance(raw_name, str):
@@ -1581,6 +1593,13 @@ def upsert_and_enrich_customer(cur, data: dict) -> tuple:
     if is_pw:
         vals["md_presence_of_children"] = "Children Present"
 
+    # Last line of defence: a dict or list in a plain column makes psycopg2 fail the whole webhook
+    # ("can't adapt type 'dict'"). Handlers convert the fields they know (as_text); anything else is dropped.
+    for c, v in vals.items():
+        if c not in JSONB_FIELDS and isinstance(v, (dict, list, tuple)):
+            log.warning("Dropped a %s value for column %s (%s)", type(v).__name__, c, vals.get("source"))
+            vals[c] = None
+
     cols = list(vals)
     placeholders = [f"%({c})s::jsonb" if c in JSONB_FIELDS else f"%({c})s" for c in cols]
     sql = f"INSERT INTO master_customers ({', '.join(cols)}, updated_at) VALUES ({', '.join(placeholders)}, NOW())"
@@ -2065,39 +2084,59 @@ def log_tripleseat_fields(raw: dict):
         log.warning("Tripleseat field logging failed: %s", type(e).__name__)
 
 
-def handle_tripleseat(raw: dict, background_tasks: BackgroundTasks) -> dict:
-    kind, obj = "record", raw
+def tripleseat_record(raw: dict) -> tuple:
+    """(kind, object) of a Tripleseat webhook: its lead, event, booking or contact."""
     for key in ("lead", "event", "booking", "contact"):
         if isinstance(raw.get(key), dict):
-            kind, obj = key, raw[key]
-            break
+            return key, raw[key]
+    return "record", raw
+
+
+def tripleseat_record_key(raw) -> Optional[str]:
+    """Which Tripleseat record a webhook is about ("event:123"), so a failed copy can be matched to newer ones."""
+    if not isinstance(raw, dict):
+        return None
+    kind, obj = tripleseat_record(raw)
+    rid = as_text(obj.get("id") or obj.get("lead_id") or obj.get("event_id"))
+    return f"{kind}:{rid}" if rid else None
+
+
+def handle_tripleseat(raw: dict, background_tasks: BackgroundTasks) -> dict:
+    kind, obj = tripleseat_record(raw)
     contact = obj.get("contact") if isinstance(obj.get("contact"), dict) else obj
     account = obj.get("account") or contact.get("account") or {}
     if not isinstance(account, dict):
         account = {}
 
-    email = contact.get("email_address") or obj.get("email_address") or obj.get("email") or ""
-    if not email and isinstance(contact.get("email_addresses"), list) and contact["email_addresses"]:
-        email = contact["email_addresses"][0].get("address", "")
+    # Every value is read through as_text: Tripleseat sends some fields as objects (lost_reason is
+    # {"id", "name"} on LOST events), and a dict in a text column used to fail the whole webhook.
+    email = as_text(contact.get("email_address") or obj.get("email_address") or obj.get("email")) or ""
+    if not email and isinstance(contact.get("email_addresses"), list) and contact["email_addresses"] \
+            and isinstance(contact["email_addresses"][0], dict):
+        email = as_text(contact["email_addresses"][0].get("address")) or ""
 
-    phone = contact.get("phone_number") or obj.get("phone_number") or obj.get("phone") or ""
-    if not phone and isinstance(contact.get("phone_numbers"), list) and contact["phone_numbers"]:
-        phone = contact["phone_numbers"][0].get("number", "")
+    phone = as_text(contact.get("phone_number") or obj.get("phone_number") or obj.get("phone")) or ""
+    if not phone and isinstance(contact.get("phone_numbers"), list) and contact["phone_numbers"] \
+            and isinstance(contact["phone_numbers"][0], dict):
+        phone = as_text(contact["phone_numbers"][0].get("number")) or ""
 
     addr_obj = {}
     if isinstance(contact.get("addresses"), list) and contact["addresses"]:
         addr_obj = contact["addresses"][0]
     elif isinstance(obj.get("addresses"), list) and obj["addresses"]:
         addr_obj = obj["addresses"][0]
+    if not isinstance(addr_obj, dict):
+        addr_obj = {}
 
-    first_name = contact.get("first_name") or obj.get("first_name") or ""
-    last_name = contact.get("last_name") or obj.get("last_name") or ""
-    company = account.get("name") or obj.get("company") or obj.get("account_name") or contact.get("company") or ""
-    status = str(obj.get("status") or obj.get("lead_status") or "PROSPECT").upper().replace(" ", "_")
+    first_name = as_text(contact.get("first_name") or obj.get("first_name")) or ""
+    last_name = as_text(contact.get("last_name") or obj.get("last_name")) or ""
+    company = as_text(account.get("name") or obj.get("company") or obj.get("account_name")
+                      or contact.get("company")) or ""
+    status = (as_text(obj.get("status") or obj.get("lead_status")) or "PROSPECT").upper().replace(" ", "_")
     guest_count = to_int(obj.get("guest_count") or obj.get("guaranteed_guest_count") or obj.get("expected_guest_count"))
-    event_date = date_only(obj.get("event_date") or obj.get("event_start_iso8601") or obj.get("desired_date"))
-    turned_down_reason = obj.get("turned_down_reason") or obj.get("lost_reason") or None
-    record_id = obj.get("id") or obj.get("lead_id") or obj.get("event_id")
+    event_date = date_only(as_text(obj.get("event_date") or obj.get("event_start_iso8601") or obj.get("desired_date")))
+    turned_down_reason = as_text(obj.get("turned_down_reason") or obj.get("lost_reason"))
+    record_id = as_text(obj.get("id") or obj.get("lead_id") or obj.get("event_id"))
 
     if not any([email, phone, first_name, last_name]):
         return {"status": "ignored_empty_tripleseat_payload"}
@@ -2111,10 +2150,10 @@ def handle_tripleseat(raw: dict, background_tasks: BackgroundTasks) -> dict:
                     "last_name": last_name,
                     "email": email,
                     "phone": phone,
-                    "address": addr_obj.get("address1") or obj.get("address"),
-                    "city": addr_obj.get("city") or obj.get("city"),
-                    "state": addr_obj.get("state") or obj.get("state"),
-                    "zip": addr_obj.get("zip_code") or obj.get("zip"),
+                    "address": as_text(addr_obj.get("address1") or obj.get("address")),
+                    "city": as_text(addr_obj.get("city") or obj.get("city")),
+                    "state": as_text(addr_obj.get("state") or obj.get("state")),
+                    "zip": as_text(addr_obj.get("zip_code") or obj.get("zip")),
                     "ts_account": company or None,
                     "ts_lead_status": status,
                     "ts_max_guests": guest_count,
@@ -2696,6 +2735,139 @@ def sync_tripleseat(request: Request, background_tasks: BackgroundTasks, days_ba
             "days_back": None if history else days_back}
 
 
+# ---------------------------------------------------------------------------
+# Dead letters (migrations/010): a webhook that fails is stored with its payload and retried by
+# /cron/retry-webhooks, so a bug or an outage doesn't lose the record.
+# ---------------------------------------------------------------------------
+DEAD_LETTER_MAX_ATTEMPTS = 5
+
+
+def save_dead_letter(source: str, raw, error: Exception, record_key: Optional[str] = None) -> Optional[int]:
+    """Keeps a failed webhook's payload. Never raises: the webhook's own error is what gets reported.
+    A re-sent identical payload is the same row, moved to now (it's the latest copy of its record)."""
+    if not isinstance(raw, (dict, list)):
+        return None
+    try:
+        body = json.dumps(raw, sort_keys=True, default=str)
+        digest = hashlib.sha256(body.encode()).hexdigest()
+        err = f"{type(error).__name__}: {error}"[:1000]
+        conn = get_conn()
+        try:
+            with conn, conn.cursor() as cur:
+                cur.execute("""INSERT INTO webhook_dead_letters (source, payload, payload_hash, error, record_key)
+                               VALUES (%s, %s::jsonb, %s, %s, %s)
+                               ON CONFLICT (source, payload_hash) DO UPDATE
+                               SET error = EXCLUDED.error, received_at = NOW(), resolved_at = NULL, result = NULL
+                               RETURNING id;""", (source, body, digest, err, record_key))
+                dl_id = cur.fetchone()["id"]
+        finally:
+            conn.close()
+        log.error("%s webhook failed (%s); kept as dead letter %s for /cron/retry-webhooks",
+                  source, type(error).__name__, dl_id)
+        return dl_id
+    except Exception as e:
+        log.error("Could not keep the failed %s webhook as a dead letter: %s", source, type(e).__name__)
+        return None
+
+
+def supersede_dead_letters(source: str, record_key: Optional[str], before_sql: str, params: tuple = (),
+                           cur=None) -> int:
+    """Marks open dead letters of this record received before `before_sql` (when the newer copy arrived)
+    as superseded: replaying them would overwrite newer data (e.g. bring a LOST event back to PROSPECT)."""
+    if not record_key:
+        return 0
+    sql = f"""UPDATE webhook_dead_letters SET resolved_at = NOW(), result = '{{"status": "superseded"}}'::jsonb
+              WHERE source = %s AND record_key = %s AND resolved_at IS NULL AND received_at < {before_sql};"""
+    if cur is not None:
+        cur.execute(sql, (source, record_key) + params)
+        return cur.rowcount
+    try:
+        conn = get_conn()
+        try:
+            with conn, conn.cursor() as c:
+                c.execute(sql, (source, record_key) + params)
+                return c.rowcount
+        finally:
+            conn.close()
+    except Exception as e:  # never fail a webhook that already succeeded
+        log.warning("Could not check %s dead letters: %s", source, type(e).__name__)
+        return 0
+
+
+def _run_background_tasks(tasks: BackgroundTasks):
+    for t in tasks.tasks:
+        try:
+            t.func(*t.args, **t.kwargs)
+        except Exception as e:
+            log.warning("Dead-letter retry follow-up task failed: %s", type(e).__name__)
+
+
+def retry_dead_letters(limit: int = 50) -> dict:
+    """Processes stored failed webhooks again, oldest first. A success is marked resolved; a failure
+    counts an attempt and is given up after DEAD_LETTER_MAX_ATTEMPTS (still visible in the table)."""
+    handlers = {"tripleseat": handle_tripleseat}
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("""SELECT id, source, payload FROM webhook_dead_letters
+                           WHERE resolved_at IS NULL AND attempts < %s ORDER BY id LIMIT %s;""",
+                        (DEAD_LETTER_MAX_ATTEMPTS, limit))
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+    resolved, failed, superseded = [], [], []
+    for r in rows:
+        # Only the newest open copy of a record is replayed; older ones are superseded by it.
+        conn = get_conn()
+        try:
+            with conn, conn.cursor() as cur:
+                cur.execute("""SELECT resolved_at IS NULL AS still_open, record_key,
+                                      EXISTS (SELECT 1 FROM webhook_dead_letters n
+                                              WHERE n.source = d.source AND n.record_key = d.record_key
+                                                AND n.id <> d.id AND n.resolved_at IS NULL
+                                                AND n.received_at > d.received_at) AS newer_open
+                               FROM webhook_dead_letters d WHERE id = %s;""", (r["id"],))
+                state = cur.fetchone()
+                if state["still_open"] and state["newer_open"]:
+                    cur.execute("""UPDATE webhook_dead_letters SET resolved_at = NOW(),
+                                   result = '{"status": "superseded"}'::jsonb WHERE id = %s;""", (r["id"],))
+        finally:
+            conn.close()
+        if not state["still_open"] or state["newer_open"]:
+            superseded.append(r["id"])
+            continue
+        handler = handlers.get(r["source"])
+        tasks = BackgroundTasks()
+        try:
+            if handler is None:
+                raise ValueError(f"no retry handler for {r['source']}")
+            result, err = handler(r["payload"], tasks), None
+        except Exception as e:
+            result, err = None, f"{type(e).__name__}: {e}"[:1000]
+        conn = get_conn()
+        try:
+            with conn, conn.cursor() as cur:
+                if err is None:
+                    cur.execute("""UPDATE webhook_dead_letters SET attempts = attempts + 1, last_attempt_at = NOW(),
+                                   resolved_at = NOW(), result = %s::jsonb WHERE id = %s;""",
+                                (json.dumps(result, default=str), r["id"]))
+                    supersede_dead_letters(r["source"], state["record_key"],
+                                           "(SELECT received_at FROM webhook_dead_letters WHERE id = %s)",
+                                           (r["id"],), cur=cur)
+                else:
+                    cur.execute("""UPDATE webhook_dead_letters SET attempts = attempts + 1, last_attempt_at = NOW(),
+                                   error = %s WHERE id = %s;""", (err, r["id"]))
+        finally:
+            conn.close()
+        if err is None:
+            _run_background_tasks(tasks)
+            resolved.append(r["id"])
+        else:
+            log.warning("Dead letter %s (%s) failed again: %s", r["id"], r["source"], err.split(":")[0])
+            failed.append(r["id"])
+    return {"checked": len(rows), "resolved": resolved, "failed": failed, "superseded": superseded}
+
+
 @app.post("/webhooks/tripleseat")
 async def tripleseat_webhook(request: Request, background_tasks: BackgroundTasks):
     """Tripleseat Lead, Event, Booking, and Contact webhooks."""
@@ -2703,7 +2875,18 @@ async def tripleseat_webhook(request: Request, background_tasks: BackgroundTasks
     _, raw = await read_json(request)
     if TRIPLESEAT_LOG_FIELDS and isinstance(raw, dict):
         log_tripleseat_fields(raw)
-    return await run_in_threadpool(handle_tripleseat, raw, background_tasks)
+    record_key = tripleseat_record_key(raw)
+    arrived = datetime.now(timezone.utc)  # before processing: a slower request mustn't outrank a newer one
+    try:
+        result = await run_in_threadpool(handle_tripleseat, raw, background_tasks)
+    except Exception as e:
+        # Still a 500 (Tripleseat sees the failure), but the payload is kept for /cron/retry-webhooks.
+        await run_in_threadpool(save_dead_letter, "tripleseat", raw, e, record_key)
+        raise
+    # This copy is newer than the failed copies of the same record saved before it arrived: those must not
+    # be replayed. A copy that failed while this one was being processed arrived later, so it is kept.
+    await run_in_threadpool(supersede_dead_letters, "tripleseat", record_key, "%s::timestamptz", (arrived,))
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -3615,6 +3798,14 @@ def _melissa_batch_payload(cur, batch: dict) -> dict:
     return {"ready": True, "batch_id": batch["batch_id"], "customers": batch["customer_count"],
             "filename": f"melissa-batch-{batch['batch_id']:03d}-{created:%Y-%m-%d}.csv",
             "csv": melissa_batch_csv(cur, batch["batch_id"])}
+
+
+@app.post("/cron/retry-webhooks")
+def retry_webhooks(request: Request, key: Optional[str] = CRON_KEY_PARAM,
+                   limit: int = Query(50, ge=1, le=500)):
+    """Processes failed webhooks again (webhook_dead_letters, migrations/010). Run hourly."""
+    require_cron_key(request)
+    return retry_dead_letters(limit)
 
 
 @app.post("/cron/melissa-batch")

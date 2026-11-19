@@ -1852,8 +1852,8 @@ def ts_event(uid, status="DEFINITE", event_date="12/05/2026", rid=None, **extra)
 def test_partywirks_then_tripleseat_reentry_fires_one_qb(client, db, fake, uid, everyone_qualifies):
     oid = f"50{int(uid, 16)}"
     r = client.post("/webhooks/partywirks", headers=WH, json=fake.add_partywirks(uid, oid)).json()
-    db.execute("SELECT transaction_date::date AS d FROM unified_transactions WHERE transaction_id = %s", (f"pw_{oid}",))
-    assert str(db.fetchone()["d"]) == "2026-12-05"   # the ledger row carries the party date
+    db.execute("SELECT party_date FROM unified_transactions WHERE transaction_id = %s", (f"pw_{oid}",))
+    assert str(db.fetchone()["party_date"]) == "2026-12-05"   # the ledger row carries the party date
     t = client.post("/webhooks/tripleseat", headers=WH, json=ts_event(uid)).json()
     assert t["cluster_id"] == r["cluster_id"]
     assert qbs_sent(fake) == [f"qb_pw_{oid}"]
@@ -1906,7 +1906,8 @@ def test_held_twins_release_one_qb(client, db, fake, uid, everyone_qualifies, de
     client.post("/webhooks/tripleseat", headers=WH, json=ts_event(uid))
     assert fake.meta_events() == []
     run_worker_now(db, r["cluster_id"])
-    assert qbs_sent(fake) == [f"qb_pw_{oid}"]
+    mine = [e for e in qbs_sent(fake) if e == f"qb_pw_{oid}" or e.startswith(f"qb_ts_{r['cluster_id']}_")]
+    assert mine == [f"qb_pw_{oid}"]   # the worker may also release other tests' held events
     assert capi_rows(db, f"qb_ts_{r['cluster_id']}_%")[0]["meta_response_status"] == "DUPLICATE_QUALIFIED_BOWLER"
 
 
@@ -1956,15 +1957,79 @@ def test_partywirks_party_date_backfill(db, fake, uid):
     oid = f"55{int(uid, 16)}"
     db.execute("INSERT INTO unified_transactions (transaction_id, source_system, transaction_date) "
                "VALUES (%s, 'partywirks', NOW())", (f"pw_{oid}",))   # recorded before party dates were stored
+    assert mod.run(True, [])["ledger_not_listed"] >= 1               # not listed: stays unknown
     listed = [{"order_id": oid, "event_date": "2026-12-05"}, {"order_id": None, "event_date": "2026-12-06"}]
 
     def day():
-        db.execute("SELECT to_char(transaction_date AT TIME ZONE 'UTC', 'YYYY-MM-DD') AS d FROM unified_transactions "
+        db.execute("SELECT to_char(party_date, 'YYYY-MM-DD') AS d FROM unified_transactions "
                    "WHERE transaction_id = %s", (f"pw_{oid}",))
         return db.fetchone()["d"]
-    before = day()
+    assert day() is None
     mod.run(False, listed)
-    assert day() == before                                   # dry run writes nothing
+    assert day() is None                                     # dry run writes nothing
     assert mod.run(True, listed)["ledger_dates_set"] >= 1
     assert day() == "2026-12-05"
     assert mod.run(True, listed)["ledger_dates_set"] == 0    # re-running is harmless
+
+
+def test_rescheduled_partywirks_party_still_blocks_its_tripleseat_reentry(client, db, fake, uid, everyone_qualifies):
+    oid = f"56{int(uid, 16)}"
+    client.post("/webhooks/partywirks", headers=WH, json=fake.add_partywirks(uid, oid))           # Dec 5
+    fake.pw_reservations[oid]["event_date"] = "2026-12-12"                                       # moved a week
+    client.post("/webhooks/partywirks", headers=WH, json={"event": "reservation.updated", "data": {"order_id": oid}})
+    db.execute("SELECT party_date FROM unified_transactions WHERE transaction_id = %s", (f"pw_{oid}",))
+    assert str(db.fetchone()["party_date"]) == "2026-12-12"
+    client.post("/webhooks/tripleseat", headers=WH, json=ts_event(uid, event_date="12/12/2026"))
+    assert qbs_sent(fake) == [f"qb_pw_{oid}"]                 # one QB, not re-sent by the update either
+
+
+def test_undated_partywirks_booking_never_matches_on_its_recording_day(client, db, fake, uid, everyone_qualifies):
+    oid = f"57{int(uid, 16)}"
+    body = fake.add_partywirks(uid, oid)
+    fake.pw_reservations[oid]["event_date"] = None
+    client.post("/webhooks/partywirks", headers=WH, json=body)
+    db.execute("SELECT party_date, transaction_date::date AS rec FROM unified_transactions WHERE transaction_id = %s",
+               (f"pw_{oid}",))
+    row = db.fetchone()
+    assert row["party_date"] is None
+    t = client.post("/webhooks/tripleseat", headers=WH, json=ts_event(uid, event_date=str(row["rec"]))).json()
+    assert sorted(qbs_sent(fake)) == sorted([f"qb_pw_{oid}", f"qb_ts_{t['cluster_id']}_{row['rec']}"])
+
+
+def test_expired_failed_twin_does_not_block_a_new_qb(client, db, fake, uid, everyone_qualifies):
+    oid = f"58{int(uid, 16)}"
+    fake.meta_mode = "500"
+    client.post("/webhooks/partywirks", headers=WH, json=fake.add_partywirks(uid, oid))
+    fake.meta_mode = "ok"
+    db.execute("UPDATE capi_events_log SET sent_at = NOW() - INTERVAL '8 days' WHERE event_id = %s", (f"qb_pw_{oid}",))
+    t = client.post("/webhooks/tripleseat", headers=WH, json=ts_event(uid)).json()
+    ts = capi_rows(db, f"qb_ts_{t['cluster_id']}_2026-12-05")[0]
+    assert ts["sent_to_meta"] is True                       # past the retry window, the failed twin can't win
+
+
+def test_young_failed_twin_still_wins_and_is_retried(client, db, fake, uid, everyone_qualifies):
+    oid = f"59{int(uid, 16)}"
+    fake.meta_mode = "500"
+    client.post("/webhooks/partywirks", headers=WH, json=fake.add_partywirks(uid, oid))
+    fake.meta_mode = "ok"
+    client.post("/webhooks/tripleseat", headers=WH, json=ts_event(uid))
+    with main.get_conn() as conn, conn.cursor() as cur:
+        main.retry_unsent_events(cur)
+    pw = capi_rows(db, f"qb_pw_{oid}")[0]
+    ts = capi_rows(db, f"qb_ts_{pw['cluster_id']}_%")[0]
+    assert pw["sent_to_meta"] is True and ts["sent_to_meta"] is False
+    assert ts["meta_response_status"] == "DUPLICATE_QUALIFIED_BOWLER"
+
+
+def test_booking_sent_under_its_old_key_is_not_sent_again(client, db, fake, uid, everyone_qualifies):
+    r = client.post("/webhooks/tripleseat", headers=WH, json=ts_booking_webhook(uid, "PROSPECT")).json()
+    cid, bid = r["cluster_id"], int(uid[:8], 16)
+    db.execute("DELETE FROM capi_events_log WHERE cluster_id = %s", (cid,))
+    for prefix, name in (("qb", "Qualified_Bowler"), ("lead", "Lead")):   # logged before this change
+        db.execute("INSERT INTO capi_events_log (event_id, cluster_id, event_name, sent_to_meta, sent_at) "
+                   "VALUES (%s, %s, %s, TRUE, NOW())", (f"{prefix}_ts_{cid}_booking_{bid}", cid, name))
+    n = len(fake.meta_events())
+    client.post("/webhooks/tripleseat", headers=WH, json=ts_booking_webhook(uid, "PROSPECT"))
+    client.post("/webhooks/tripleseat", headers=WH, json=ts_booking_webhook(uid, "DEFINITE"))
+    assert len(fake.meta_events()) == n
+    assert capi_rows(db, f"qb_ts_{cid}_2026-%") == [] and capi_rows(db, f"lead_ts_{cid}_2026-%") == []

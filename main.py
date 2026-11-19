@@ -1415,7 +1415,7 @@ def adjust_spend(cur, cluster_id: int, sq_diff: float = 0.0, wr_diff: float = 0.
             wr_spend = GREATEST(0, COALESCE(wr_spend, 0) + %(wr)s),
             webres_online_spend = GREATEST(0, COALESCE(wr_spend, 0) + %(wr)s),
             true_lifetime_spend = GREATEST(GREATEST(0, COALESCE(sq_spend, 0) + %(sq)s),
-                                           GREATEST(0, COALESCE(wr_spend, 0) + %(wr)s)),
+                                           GREATEST(0, COALESCE(wr_spend, 0) + %(wr)s), COALESCE(pw_spend, 0)),
             instore_pos_spend = GREATEST(0, GREATEST(0, COALESCE(sq_spend, 0) + %(sq)s)
                                             - GREATEST(0, COALESCE(wr_spend, 0) + %(wr)s)),
             sq_visits = COALESCE(sq_visits, 0) + %(v)s,
@@ -1568,7 +1568,8 @@ UPSERT_UPDATE_RULES = {
     "in_partywirks": _flag("in_partywirks"),
     "sq_spend": _SQ_NEW,
     "wr_spend": _WR_NEW,
-    "true_lifetime_spend": f"GREATEST({_SQ_NEW}, {_WR_NEW})",
+    # Max, never a sum: a WebRes booking or Partywirks party and its Square payment are the same money.
+    "true_lifetime_spend": f"GREATEST({_SQ_NEW}, {_WR_NEW}, COALESCE({_MC}.pw_spend, 0))",
     "webres_online_spend": _WR_NEW,
     "instore_pos_spend": f"GREATEST(0, {_SQ_NEW} - {_WR_NEW})",
     "sq_visits": _add("sq_visits"),
@@ -3254,6 +3255,42 @@ def fetch_partywirks_record(order_id: str):
     return rec
 
 
+def record_partywirks_spend(cur, cluster_id, txn_id: str, total: float) -> Optional[dict]:
+    """Puts a Partywirks order's real total on its ledger row and adds it to the customer's pw_spend, once per
+    order (only while the row is still at $0). true_lifetime_spend becomes the max of the per-system totals,
+    never the sum. Returns the updated customer, or None when nothing changed (no total, already recorded)."""
+    total = round(float(total or 0), 2)
+    if total <= 0 or not cluster_id:
+        return None
+    cur.execute("UPDATE unified_transactions SET total_amount = %s WHERE transaction_id = %s AND cluster_id = %s "
+                "AND source_system = 'partywirks' AND total_amount = 0 RETURNING transaction_id;",
+                (total, txn_id, cluster_id))
+    if not cur.fetchone():
+        return None
+    return _set_partywirks_spend(cur, cluster_id, total)
+
+
+def reverse_partywirks_spend(cur, txn_id: str) -> Optional[dict]:
+    """A cancelled order's total comes off the customer's pw_spend (its ledger row goes back to $0)."""
+    cur.execute("SELECT cluster_id, total_amount FROM unified_transactions WHERE transaction_id = %s "
+                "AND source_system = 'partywirks' AND total_amount > 0 FOR UPDATE;", (txn_id,))
+    row = cur.fetchone()
+    if not row or not row["cluster_id"]:
+        return None
+    cur.execute("UPDATE unified_transactions SET total_amount = 0 WHERE transaction_id = %s;", (txn_id,))
+    return _set_partywirks_spend(cur, row["cluster_id"], -float(row["total_amount"]))
+
+
+def _set_partywirks_spend(cur, cluster_id, delta: float) -> dict:
+    cur.execute("""UPDATE master_customers SET
+                       pw_spend = GREATEST(0, COALESCE(pw_spend, 0) + %(d)s),
+                       true_lifetime_spend = GREATEST(COALESCE(sq_spend, 0), COALESCE(wr_spend, 0),
+                                                      GREATEST(0, COALESCE(pw_spend, 0) + %(d)s)),
+                       updated_at = NOW()
+                   WHERE cluster_id = %(cid)s RETURNING *;""", {"d": delta, "cid": cluster_id})
+    return cur.fetchone()
+
+
 def ingest_partywirks(cur, rec: dict, background_tasks: BackgroundTasks = None, count_booking: bool = True) -> dict:
     """Saves one Partywirks reservation. A booking is counted (and its Qualified_Bowler sent) once per
     order; cancelled reservations update contact details only. count_booking=False marks the order as
@@ -3276,10 +3313,17 @@ def ingest_partywirks(cur, rec: dict, background_tasks: BackgroundTasks = None, 
         "source": "Partywirks",
     })
     if cancelled:
+        if rec.get("order_id") and reverse_partywirks_spend(cur, f"pw_{rec['order_id']}"):
+            rescore_customer(cur, cust)
         return {"status": "partywirks_cancelled_reservation", "cluster_id": cust["cluster_id"]}
 
     key = rec.get("order_id") or f"c{cust['cluster_id']}_{rec.get('party_date') or 'undated'}"
     cust, is_new = _count_record_once(cur, cust, f"pw_{key}", "partywirks", "pw_bookings", bump=count_booking)
+    # The order's real total is the booker's spend (often their only spend: the Square deposit is usually not
+    # linked to them). Recorded once per order, including bookings first seen before totals were stored.
+    spent = record_partywirks_spend(cur, cust["cluster_id"], f"pw_{key}", rec.get("total"))
+    if spent:
+        cust = rescore_customer(cur, spent)
 
     thresh = get_threshold(cur)
     if not is_new:

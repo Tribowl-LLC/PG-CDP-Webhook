@@ -2,6 +2,7 @@
 import csv
 import io
 import json
+import os
 import threading
 
 import pytest
@@ -425,6 +426,81 @@ def test_live_sync_puts_repeat_visitors_in_the_celebration_seed(db, fake, uid, m
                    (f"sq_pay_R{uid}{i}", cust["cluster_id"], 10 + i * 30))
     main.sync_customer_to_meta_custom_audiences(dict(cust))
     assert fake.count("999000111/users") == 1
+
+
+# --- Partywirks order totals are customer spend ---------------------------------------------------
+
+def _load_spend_backfill():
+    import importlib.util
+    path = os.path.join(os.path.dirname(__file__), "..", "scripts", "backfill_partywirks_spend.py")
+    spec = importlib.util.spec_from_file_location("backfill_partywirks_spend", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_partywirks_booking_total_is_stored_as_spend(client, db, fake, uid):
+    oid = f"40{int(uid, 16)}"
+    r = client.post("/webhooks/partywirks", headers=WH, json=fake.add_partywirks(uid, oid)).json()
+    c = customer_row(db, r["cluster_id"])
+    assert float(c["pw_spend"]) == 728.7 and float(c["true_lifetime_spend"]) == 728.7
+    db.execute("SELECT total_amount FROM unified_transactions WHERE transaction_id = %s", (f"pw_{oid}",))
+    assert float(db.fetchone()["total_amount"]) == 728.7
+    client.post("/webhooks/partywirks", headers=WH, json={"event": "reservation.updated", "data": {"order_id": oid}})
+    assert float(customer_row(db, r["cluster_id"])["pw_spend"]) == 728.7  # once per order, however many re-sends
+
+
+def test_partywirks_qb_value_is_still_the_order_total(client, db, fake, uid, everyone_qualifies):
+    oid = f"41{int(uid, 16)}"
+    client.post("/webhooks/partywirks", headers=WH, json=fake.add_partywirks(uid, oid))
+    qb = [e for e in fake.meta_events() if e["event_name"] == "Qualified_Bowler"]
+    assert len(qb) == 1 and qb[0]["custom_data"]["value"] == 728.7
+
+
+def test_party_deposit_in_square_is_not_counted_twice(client, db, fake, uid):
+    oid = f"42{int(uid, 16)}"
+    r = client.post("/webhooks/partywirks", headers=WH, json=fake.add_partywirks(uid, oid)).json()
+    square_post(client, payment(f"PD{uid}", 30000, email=f"party-{uid}@example.test"))   # $300 deposit
+    c = customer_row(db, r["cluster_id"])
+    assert float(c["sq_spend"]) == 300.0 and float(c["true_lifetime_spend"]) == 728.7     # the max, not $1,028.70
+    square_post(client, payment(f"PE{uid}", 90000, email=f"party-{uid}@example.test"))   # more in-store spend
+    assert float(customer_row(db, r["cluster_id"])["true_lifetime_spend"]) == 1200.0      # Square now the larger
+
+
+def test_cancelled_partywirks_order_comes_off_spend(client, db, fake, uid):
+    oid = f"43{int(uid, 16)}"
+    r = client.post("/webhooks/partywirks", headers=WH, json=fake.add_partywirks(uid, oid)).json()
+    assert float(customer_row(db, r["cluster_id"])["pw_spend"]) == 728.7
+    fake.pw_reservations[oid]["status"] = "cancelled"
+    client.post("/webhooks/partywirks", headers=WH, json={"event": "reservation.cancelled", "data": {"order_id": oid}})
+    c = customer_row(db, r["cluster_id"])
+    assert float(c["pw_spend"] or 0) == 0 and float(c["true_lifetime_spend"] or 0) == 0
+
+
+def test_spend_backfill_uses_api_totals_and_never_invents_one(db, uid):
+    db.execute("INSERT INTO master_customers (cluster_id, email, md_city, zip5, pw_bookings) "
+               "VALUES (nextval('master_cluster_id_seq'), %s, 'Novi', '48375', 2) RETURNING cluster_id",
+               (f"backfill-{uid}@example.test",))
+    cid = db.fetchone()["cluster_id"]
+    a, b = f"44{int(uid, 16)}", f"45{int(uid, 16)}"
+    for oid in (a, b):
+        db.execute("INSERT INTO unified_transactions (transaction_id, cluster_id, source_system, total_amount) "
+                   "VALUES (%s, %s, 'partywirks', 0)", (f"pw_{oid}", cid))
+    listed = [{"order_id": a, "status": "confirmed", "totals": {"total": 512.25}},
+              {"order_id": b, "status": "confirmed", "totals": {}}]                    # API has no total for b
+    mod = _load_spend_backfill()
+    dry = mod.run(False, listed)
+    assert dry["ledger_totals_recorded"] >= 1 and customer_row(db, cid)["pw_spend"] is None  # dry run writes nothing
+    first = mod.run(True, listed)
+    c = customer_row(db, cid)
+    assert float(c["pw_spend"]) == 512.25 and float(c["true_lifetime_spend"]) == 512.25
+    db.execute("SELECT transaction_id, total_amount FROM unified_transactions WHERE transaction_id = ANY(%s)",
+               ([f"pw_{a}", f"pw_{b}"],))
+    amounts = {r["transaction_id"]: float(r["total_amount"]) for r in db.fetchall()}
+    assert amounts == {f"pw_{a}": 512.25, f"pw_{b}": 0.0}
+    assert first["ledger_no_total_available"] >= 1
+    mod.run(True, listed)
+    assert float(customer_row(db, cid)["pw_spend"]) == 512.25                           # re-running is harmless
 
 
 def test_partywirks_webhook_uses_api_and_counts_once(client, db, fake, uid, everyone_qualifies):

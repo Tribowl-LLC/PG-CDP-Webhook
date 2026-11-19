@@ -1235,17 +1235,20 @@ def fire_meta_capi_event(cur, cust: dict, event_name: str, value: float, thresho
     prior = cur.fetchone()
     if prior and prior["sent_to_meta"]:
         return
-    twin = purchase_twin(cur, cust["cluster_id"], event_name, event_id, value)
+    twin, dup_status = purchase_twin(cur, cust["cluster_id"], event_name, event_id, value), "DUPLICATE_PURCHASE"
+    if not twin:
+        twin, dup_status = party_qb_twin(cur, cust["cluster_id"], event_name, event_id), "DUPLICATE_QUALIFIED_BOWLER"
     if twin:
-        # The same money already went (or is going) to Meta under the other source's event ID.
+        # The same money (Purchase) or the same party (Qualified_Bowler) already went, or is going, to Meta
+        # under the other source's event ID. Logged, pointing at that event, and never retried.
         cur.execute("""INSERT INTO capi_events_log (event_id, cluster_id, event_name, event_value, bowler_value_score,
                            threshold_at_send, sent_to_meta, meta_response_status, meta_response_body)
-                       VALUES (%s, %s, %s, %s, %s, %s, FALSE, 'DUPLICATE_PURCHASE', %s)
-                       ON CONFLICT (event_id) DO UPDATE SET meta_response_status = 'DUPLICATE_PURCHASE',
+                       VALUES (%s, %s, %s, %s, %s, %s, FALSE, %s, %s)
+                       ON CONFLICT (event_id) DO UPDATE SET meta_response_status = EXCLUDED.meta_response_status,
                            meta_response_body = EXCLUDED.meta_response_body
                        WHERE NOT capi_events_log.sent_to_meta;""",
                     (event_id, cust["cluster_id"], event_name, value, int(cust.get("bowler_value_score") or 0),
-                     threshold, twin))
+                     threshold, dup_status, twin))
         return
     if cust.get("enrich_after"):
         # Waiting for enrichment: hold the event until the address (Detroit gate) and score are known.
@@ -1307,10 +1310,10 @@ def fire_meta_capi_event(cur, cust: dict, event_name: str, value: float, thresho
     )
 
 
-# Held for enrichment, dropped once enrichment showed the customer doesn't qualify, or the other half of a
-# WebRes + Square pair for the same money: never retried as failures.
+# Held for enrichment, dropped once enrichment showed the customer doesn't qualify, the other half of a
+# WebRes + Square pair for the same money, or the second Qualified_Bowler for one party: never retried as failures.
 _NOT_HELD = ("COALESCE(meta_response_status, '') NOT IN "
-             "('DEFERRED_ENRICHMENT', 'DROPPED_AFTER_ENRICHMENT', 'DUPLICATE_PURCHASE')")
+             "('DEFERRED_ENRICHMENT', 'DROPPED_AFTER_ENRICHMENT', 'DUPLICATE_PURCHASE', 'DUPLICATE_QUALIFIED_BOWLER')")
 
 # A WebRes booking is paid through Square online, so the same money arrives twice: the Square payment first,
 # then the WebRes booking (~1-6 minutes later, from the Gmail script), under different event IDs (sq_pay_ / wr_)
@@ -1355,6 +1358,59 @@ def purchase_twin(cur, cluster_id, event_name: str, event_id: str, value) -> Opt
                  "hours": PURCHASE_TWIN_HOURS})
     row = cur.fetchone()
     return row["event_id"] if row else None
+
+
+# Staff re-enter Partywirks birthday bookings into Tripleseat (for BEOs and kitchen sheets), so one party can
+# fire a Partywirks Qualified_Bowler (qb_pw_<order>) and a Tripleseat one (qb_ts_<cluster>_<date>). One QB per
+# customer per party date: the first one wins and the other is logged as DUPLICATE_QUALIFIED_BOWLER. The
+# Partywirks party date is on its ledger row (unified_transactions pw_<order>.transaction_date); the Tripleseat
+# date is in its event ID (ISO since PR #28, M/D/YYYY before). Accepted edge case: a customer with two genuinely
+# different parties on the same date, one in each system, gets one QB. Same-day double parties for one customer
+# are rare; the re-entry is systematic. (Guest-count matching could refine this later.)
+_QB_TWIN_SKIP = ("COALESCE(l.meta_response_status, '') NOT IN "
+                 "('DROPPED_AFTER_ENRICHMENT', 'DUPLICATE_QUALIFIED_BOWLER')")
+
+
+def _pw_party_date(cur, event_id: str) -> Optional[str]:
+    cur.execute("SELECT to_char(transaction_date AT TIME ZONE 'UTC', 'YYYY-MM-DD') AS d FROM unified_transactions "
+                "WHERE transaction_id = %s AND source_system = 'partywirks';", ("pw_" + event_id[len("qb_pw_"):],))
+    row = cur.fetchone()
+    return row["d"] if row else None
+
+
+def _ts_qb_date(event_id: str) -> Optional[str]:
+    parts = event_id.split("_", 3)  # qb, ts, <cluster>, <date or record key>
+    return ts_date(parts[3]) if len(parts) == 4 else None
+
+
+def party_qb_twin(cur, cluster_id, event_name: str, event_id: str) -> Optional[str]:
+    """The event ID of the other system's Qualified_Bowler for the same customer and party date, if it came first.
+
+    It came first if Meta already has it, or if this event isn't logged yet, or if it was logged before this one
+    (both held for enrichment or waiting for a retry: they're released oldest first, so the earlier one sends)."""
+    if event_name != "Qualified_Bowler" or not cluster_id:
+        return None
+    if event_id.startswith("qb_pw_"):
+        day, other = _pw_party_date(cur, event_id), "qb\\_ts\\_%"
+    elif event_id.startswith("qb_ts_"):
+        day, other = _ts_qb_date(event_id), "qb\\_pw\\_%"
+    else:
+        return None
+    if not day:
+        return None
+    cur.execute("SELECT sent_at FROM capi_events_log WHERE event_id = %s;", (event_id,))
+    me = cur.fetchone()
+    cur.execute(f"""SELECT l.event_id, l.sent_to_meta, l.sent_at FROM capi_events_log l
+                    WHERE l.cluster_id = %s AND l.event_name = 'Qualified_Bowler' AND l.event_id LIKE %s
+                      AND l.event_id <> %s AND {_QB_TWIN_SKIP}
+                    ORDER BY l.sent_to_meta DESC, l.sent_at, l.event_id;""", (cluster_id, other, event_id))
+    for r in cur.fetchall():
+        theirs = _pw_party_date(cur, r["event_id"]) if r["event_id"].startswith("qb_pw_") else _ts_qb_date(r["event_id"])
+        if theirs != day:
+            continue
+        if r["sent_to_meta"] or not me or (r["sent_at"], r["event_id"]) < (me["sent_at"], event_id):
+            return r["event_id"]
+    return None
 
 
 def _action_source_for(event_id: str) -> str:
@@ -2259,10 +2315,11 @@ async def webres_webhook(request: Request, background_tasks: BackgroundTasks):
 
 
 def _count_record_once(cur, cust: dict, txn_id: str, source_system: str, counter: str,
-                       bump: bool = True) -> tuple:
+                       bump: bool = True, transaction_date=None) -> tuple:
     """Bumps a booking/event counter only the first time we see this Tripleseat/Partywirks record.
-    Returns (customer, first_time_seen). bump=False records the ID without counting it."""
-    if not claim_transaction(cur, txn_id, source_system):
+    Returns (customer, first_time_seen). bump=False records the ID without counting it. transaction_date
+    (default: now) is the record's own date when it has one (a Partywirks party date)."""
+    if not claim_transaction(cur, txn_id, source_system, transaction_date=transaction_date):
         return cust, False
     cur.execute("UPDATE unified_transactions SET cluster_id = %s WHERE transaction_id = %s;",
                 (cust["cluster_id"], txn_id))
@@ -2384,7 +2441,11 @@ def handle_tripleseat(raw: dict, background_tasks: BackgroundTasks) -> dict:
                       or contact.get("company")) or ""
     status = (as_text(obj.get("status") or obj.get("lead_status")) or "PROSPECT").upper().replace(" ", "_")
     guest_count = to_int(obj.get("guest_count") or obj.get("guaranteed_guest_count") or obj.get("expected_guest_count"))
-    event_date = date_only(as_text(obj.get("event_date") or obj.get("event_start_iso8601") or obj.get("desired_date")))
+    # A booking has no event_date, only start_date (a plain YYYY-MM-DD). Reading it gives a booking the same
+    # date key as its event, so one Tripleseat party gets one Qualified_Bowler / Lead, not a date-key one plus
+    # a booking-key one seconds apart.
+    event_date = date_only(as_text(obj.get("event_date") or obj.get("event_start_iso8601") or obj.get("desired_date")
+                                   or (obj.get("start_date") if kind == "booking" else None)))
     turned_down_reason = as_text(obj.get("turned_down_reason") or obj.get("lost_reason"))
     record_id = as_text(obj.get("id") or obj.get("lead_id") or obj.get("event_id"))
 
@@ -2436,7 +2497,8 @@ def handle_tripleseat(raw: dict, background_tasks: BackgroundTasks) -> dict:
                     and status not in ("LOST", "TURNED_DOWN")
                 ):
                     # One event per customer per event date, however many times Tripleseat re-sends the
-                    # lead/event (a lead and the event it turns into share the date). Only a definite booking
+                    # lead/event/booking (a lead, its event and the event's booking share the date; the record
+                    # key is only a fallback for a record with no date at all). Only a definite booking
                     # is a Qualified_Bowler, worth its contracted total (or no value); a prospect or tentative
                     # lead is a Lead with no value. A lead that later becomes definite sends both, once each.
                     key = ts_date(event_date) or event_date or (f"{kind}_{record_id}" if record_id else "undated")
@@ -3294,6 +3356,12 @@ def _set_partywirks_spend(cur, cluster_id, delta: float) -> dict:
     return cur.fetchone()
 
 
+def pw_party_timestamp(party_date) -> Optional[str]:
+    """A Partywirks party date as the timestamp its ledger row stores: UTC midnight of that day."""
+    d = ts_date(str(party_date)) if party_date else None
+    return f"{d}T00:00:00Z" if d else None
+
+
 def ingest_partywirks(cur, rec: dict, background_tasks: BackgroundTasks = None, count_booking: bool = True) -> dict:
     """Saves one Partywirks reservation. A booking is counted (and its Qualified_Bowler sent) once per
     order; cancelled reservations update contact details only. count_booking=False marks the order as
@@ -3321,7 +3389,10 @@ def ingest_partywirks(cur, rec: dict, background_tasks: BackgroundTasks = None, 
         return {"status": "partywirks_cancelled_reservation", "cluster_id": cust["cluster_id"]}
 
     key = rec.get("order_id") or f"c{cust['cluster_id']}_{rec.get('party_date') or 'undated'}"
-    cust, is_new = _count_record_once(cur, cust, f"pw_{key}", "partywirks", "pw_bookings", bump=count_booking)
+    # The ledger row carries the party date (UTC midnight of that day), so a Tripleseat re-entry of the same
+    # party can be matched to it (party_qb_twin). Scoring reads only Square rows' dates.
+    cust, is_new = _count_record_once(cur, cust, f"pw_{key}", "partywirks", "pw_bookings", bump=count_booking,
+                                      transaction_date=pw_party_timestamp(rec.get("party_date")))
     # The order's real total is the booker's spend (often their only spend: the Square deposit is usually not
     # linked to them). Recorded once per order, including bookings first seen before totals were stored.
     spent = record_partywirks_spend(cur, cust["cluster_id"], f"pw_{key}", rec.get("total"))
@@ -4046,6 +4117,7 @@ def adjust_thermostat(request: Request, key: Optional[str] = CRON_KEY_PARAM):
             with conn.cursor() as cur:
                 # First re-send anything Meta didn't accept, so the thermostat counts it.
                 retried = retry_unsent_events(cur)
+                # The function is versioned in migrations/012_thermostat.sql (an exact copy of production's).
                 cur.execute("SELECT adjust_meta_capi_thermostat() AS new_threshold;")
                 res = cur.fetchone()
         return {"status": "adjusted", "new_threshold": res["new_threshold"], "meta_retry": retried}

@@ -1070,6 +1070,18 @@ def fire_meta_capi_event(cur, cust: dict, event_name: str, value: float, thresho
     prior = cur.fetchone()
     if prior and prior["sent_to_meta"]:
         return
+    twin = purchase_twin(cur, cust["cluster_id"], event_name, event_id, value)
+    if twin:
+        # The same money already went (or is going) to Meta under the other source's event ID.
+        cur.execute("""INSERT INTO capi_events_log (event_id, cluster_id, event_name, event_value, bowler_value_score,
+                           threshold_at_send, sent_to_meta, meta_response_status, meta_response_body)
+                       VALUES (%s, %s, %s, %s, %s, %s, FALSE, 'DUPLICATE_PURCHASE', %s)
+                       ON CONFLICT (event_id) DO UPDATE SET meta_response_status = 'DUPLICATE_PURCHASE',
+                           meta_response_body = EXCLUDED.meta_response_body
+                       WHERE NOT capi_events_log.sent_to_meta;""",
+                    (event_id, cust["cluster_id"], event_name, value, int(cust.get("bowler_value_score") or 0),
+                     threshold, twin))
+        return
     if cust.get("enrich_after"):
         # Waiting for enrichment: hold the event until the address (Detroit gate) and score are known.
         cur.execute("""INSERT INTO capi_events_log (event_id, cluster_id, event_name, event_value, bowler_value_score,
@@ -1125,8 +1137,54 @@ def fire_meta_capi_event(cur, cust: dict, event_name: str, value: float, thresho
     )
 
 
-# Held for enrichment, or dropped once enrichment showed the customer doesn't qualify: never retried as failures.
-_NOT_HELD = "COALESCE(meta_response_status, '') NOT IN ('DEFERRED_ENRICHMENT', 'DROPPED_AFTER_ENRICHMENT')"
+# Held for enrichment, dropped once enrichment showed the customer doesn't qualify, or the other half of a
+# WebRes + Square pair for the same money: never retried as failures.
+_NOT_HELD = ("COALESCE(meta_response_status, '') NOT IN "
+             "('DEFERRED_ENRICHMENT', 'DROPPED_AFTER_ENRICHMENT', 'DUPLICATE_PURCHASE')")
+
+# A WebRes booking is paid through Square online, so the same money arrives twice: the Square payment first,
+# then the WebRes booking (~1-6 minutes later, from the Gmail script), under different event IDs (sq_pay_ / wr_)
+# that Meta can't dedupe. The Square payment is the source of truth for the money (it's the actual charge and
+# carries refunds). A WebRes Purchase is skipped when the same customer has a Square Purchase of the same amount
+# recorded within PURCHASE_TWIN_HOURS of the booking (sent, failed and being retried, or held for enrichment). A Square Purchase is only
+# skipped when a matching WebRes Purchase already reached Meta (the rare reverse order). A WebRes booking whose
+# Square payment couldn't be tied to the customer still sends its Purchase: it's the only one Meta gets.
+PURCHASE_TWIN_HOURS = 6
+
+
+def purchase_twin(cur, cluster_id, event_name: str, event_id: str, value) -> Optional[str]:
+    """The event ID of the other source's Purchase for the same money, if there is one.
+
+    Times are when each payment/booking was first recorded (unified_transactions.recorded_at), never when an
+    event was (re)sent, so a retry days later pairs with the same twin it would have paired with at first.
+    A payment pairs with at most one booking: one already claimed by another skipped copy isn't reused."""
+    if event_name != "Purchase" or not cluster_id:
+        return None
+    if event_id.startswith("wr_"):
+        other, need_sent = "sq\\_pay\\_%", False
+    elif event_id.startswith("sq_pay_"):
+        other, need_sent = "wr\\_%", True
+    else:
+        return None
+    cur.execute("""SELECT l.event_id
+                   FROM capi_events_log l
+                   JOIN unified_transactions o ON o.transaction_id = l.event_id
+                   JOIN unified_transactions me ON me.transaction_id = %(eid)s
+                   WHERE l.cluster_id = %(cid)s AND l.event_name = 'Purchase' AND l.event_id LIKE %(other)s
+                     AND l.event_value = ROUND(%(value)s::numeric, 2)
+                     AND COALESCE(l.meta_response_status, '') NOT IN ('DROPPED_AFTER_ENRICHMENT', 'DUPLICATE_PURCHASE')
+                     AND (l.sent_to_meta OR NOT %(need_sent)s)
+                     AND o.recorded_at BETWEEN me.recorded_at - make_interval(hours => %(hours)s)
+                                           AND me.recorded_at + make_interval(hours => %(hours)s)
+                     AND NOT EXISTS (SELECT 1 FROM capi_events_log d
+                                     WHERE d.meta_response_status = 'DUPLICATE_PURCHASE'
+                                       AND d.meta_response_body = l.event_id AND d.event_id <> %(eid)s)
+                   ORDER BY ABS(EXTRACT(EPOCH FROM o.recorded_at - me.recorded_at)), l.event_id
+                   LIMIT 1;""",
+                {"eid": event_id, "cid": cluster_id, "other": other, "value": value, "need_sent": need_sent,
+                 "hours": PURCHASE_TWIN_HOURS})
+    row = cur.fetchone()
+    return row["event_id"] if row else None
 
 
 def _action_source_for(event_id: str) -> str:

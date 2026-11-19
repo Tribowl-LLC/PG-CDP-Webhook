@@ -2084,12 +2084,25 @@ def log_tripleseat_fields(raw: dict):
         log.warning("Tripleseat field logging failed: %s", type(e).__name__)
 
 
-def handle_tripleseat(raw: dict, background_tasks: BackgroundTasks) -> dict:
-    kind, obj = "record", raw
+def tripleseat_record(raw: dict) -> tuple:
+    """(kind, object) of a Tripleseat webhook: its lead, event, booking or contact."""
     for key in ("lead", "event", "booking", "contact"):
         if isinstance(raw.get(key), dict):
-            kind, obj = key, raw[key]
-            break
+            return key, raw[key]
+    return "record", raw
+
+
+def tripleseat_record_key(raw) -> Optional[str]:
+    """Which Tripleseat record a webhook is about ("event:123"), so a failed copy can be matched to newer ones."""
+    if not isinstance(raw, dict):
+        return None
+    kind, obj = tripleseat_record(raw)
+    rid = as_text(obj.get("id") or obj.get("lead_id") or obj.get("event_id"))
+    return f"{kind}:{rid}" if rid else None
+
+
+def handle_tripleseat(raw: dict, background_tasks: BackgroundTasks) -> dict:
+    kind, obj = tripleseat_record(raw)
     contact = obj.get("contact") if isinstance(obj.get("contact"), dict) else obj
     account = obj.get("account") or contact.get("account") or {}
     if not isinstance(account, dict):
@@ -2729,8 +2742,9 @@ def sync_tripleseat(request: Request, background_tasks: BackgroundTasks, days_ba
 DEAD_LETTER_MAX_ATTEMPTS = 5
 
 
-def save_dead_letter(source: str, raw, error: Exception) -> Optional[int]:
-    """Keeps a failed webhook's payload. Never raises: the webhook's own error is what gets reported."""
+def save_dead_letter(source: str, raw, error: Exception, record_key: Optional[str] = None) -> Optional[int]:
+    """Keeps a failed webhook's payload. Never raises: the webhook's own error is what gets reported.
+    A re-sent identical payload is the same row, moved to now (it's the latest copy of its record)."""
     if not isinstance(raw, (dict, list)):
         return None
     try:
@@ -2740,11 +2754,11 @@ def save_dead_letter(source: str, raw, error: Exception) -> Optional[int]:
         conn = get_conn()
         try:
             with conn, conn.cursor() as cur:
-                cur.execute("""INSERT INTO webhook_dead_letters (source, payload, payload_hash, error)
-                               VALUES (%s, %s::jsonb, %s, %s)
+                cur.execute("""INSERT INTO webhook_dead_letters (source, payload, payload_hash, error, record_key)
+                               VALUES (%s, %s::jsonb, %s, %s, %s)
                                ON CONFLICT (source, payload_hash) DO UPDATE
-                               SET error = EXCLUDED.error, resolved_at = NULL
-                               RETURNING id;""", (source, body, digest, err))
+                               SET error = EXCLUDED.error, received_at = NOW(), resolved_at = NULL, result = NULL
+                               RETURNING id;""", (source, body, digest, err, record_key))
                 dl_id = cur.fetchone()["id"]
         finally:
             conn.close()
@@ -2754,6 +2768,30 @@ def save_dead_letter(source: str, raw, error: Exception) -> Optional[int]:
     except Exception as e:
         log.error("Could not keep the failed %s webhook as a dead letter: %s", source, type(e).__name__)
         return None
+
+
+def supersede_dead_letters(source: str, record_key: Optional[str], before_sql: str = "NOW()",
+                           params: tuple = (), cur=None) -> int:
+    """Marks open dead letters of this record received before a newer copy was processed as superseded:
+    replaying them would overwrite newer data (e.g. bring a LOST event back to PROSPECT)."""
+    if not record_key:
+        return 0
+    sql = f"""UPDATE webhook_dead_letters SET resolved_at = NOW(), result = '{{"status": "superseded"}}'::jsonb
+              WHERE source = %s AND record_key = %s AND resolved_at IS NULL AND received_at < {before_sql};"""
+    if cur is not None:
+        cur.execute(sql, (source, record_key) + params)
+        return cur.rowcount
+    try:
+        conn = get_conn()
+        try:
+            with conn, conn.cursor() as c:
+                c.execute(sql, (source, record_key) + params)
+                return c.rowcount
+        finally:
+            conn.close()
+    except Exception as e:  # never fail a webhook that already succeeded
+        log.warning("Could not check %s dead letters: %s", source, type(e).__name__)
+        return 0
 
 
 def _run_background_tasks(tasks: BackgroundTasks):
@@ -2777,8 +2815,27 @@ def retry_dead_letters(limit: int = 50) -> dict:
             rows = cur.fetchall()
     finally:
         conn.close()
-    resolved, failed = [], []
+    resolved, failed, superseded = [], [], []
     for r in rows:
+        # Only the newest open copy of a record is replayed; older ones are superseded by it.
+        conn = get_conn()
+        try:
+            with conn, conn.cursor() as cur:
+                cur.execute("""SELECT resolved_at IS NULL AS still_open, record_key,
+                                      EXISTS (SELECT 1 FROM webhook_dead_letters n
+                                              WHERE n.source = d.source AND n.record_key = d.record_key
+                                                AND n.id <> d.id AND n.resolved_at IS NULL
+                                                AND n.received_at > d.received_at) AS newer_open
+                               FROM webhook_dead_letters d WHERE id = %s;""", (r["id"],))
+                state = cur.fetchone()
+                if state["still_open"] and state["newer_open"]:
+                    cur.execute("""UPDATE webhook_dead_letters SET resolved_at = NOW(),
+                                   result = '{"status": "superseded"}'::jsonb WHERE id = %s;""", (r["id"],))
+        finally:
+            conn.close()
+        if not state["still_open"] or state["newer_open"]:
+            superseded.append(r["id"])
+            continue
         handler = handlers.get(r["source"])
         tasks = BackgroundTasks()
         try:
@@ -2794,6 +2851,9 @@ def retry_dead_letters(limit: int = 50) -> dict:
                     cur.execute("""UPDATE webhook_dead_letters SET attempts = attempts + 1, last_attempt_at = NOW(),
                                    resolved_at = NOW(), result = %s::jsonb WHERE id = %s;""",
                                 (json.dumps(result, default=str), r["id"]))
+                    supersede_dead_letters(r["source"], state["record_key"],
+                                           "(SELECT received_at FROM webhook_dead_letters WHERE id = %s)",
+                                           (r["id"],), cur=cur)
                 else:
                     cur.execute("""UPDATE webhook_dead_letters SET attempts = attempts + 1, last_attempt_at = NOW(),
                                    error = %s WHERE id = %s;""", (err, r["id"]))
@@ -2805,7 +2865,7 @@ def retry_dead_letters(limit: int = 50) -> dict:
         else:
             log.warning("Dead letter %s (%s) failed again: %s", r["id"], r["source"], err.split(":")[0])
             failed.append(r["id"])
-    return {"checked": len(rows), "resolved": resolved, "failed": failed}
+    return {"checked": len(rows), "resolved": resolved, "failed": failed, "superseded": superseded}
 
 
 @app.post("/webhooks/tripleseat")
@@ -2815,12 +2875,16 @@ async def tripleseat_webhook(request: Request, background_tasks: BackgroundTasks
     _, raw = await read_json(request)
     if TRIPLESEAT_LOG_FIELDS and isinstance(raw, dict):
         log_tripleseat_fields(raw)
+    record_key = tripleseat_record_key(raw)
     try:
-        return await run_in_threadpool(handle_tripleseat, raw, background_tasks)
+        result = await run_in_threadpool(handle_tripleseat, raw, background_tasks)
     except Exception as e:
         # Still a 500 (Tripleseat sees the failure), but the payload is kept for /cron/retry-webhooks.
-        await run_in_threadpool(save_dead_letter, "tripleseat", raw, e)
+        await run_in_threadpool(save_dead_letter, "tripleseat", raw, e, record_key)
         raise
+    # This copy is newer than any earlier failed one of the same record: those must not be replayed.
+    await run_in_threadpool(supersede_dead_letters, "tripleseat", record_key)
+    return result
 
 
 # ---------------------------------------------------------------------------

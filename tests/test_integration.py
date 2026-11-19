@@ -1356,3 +1356,53 @@ def test_failed_tripleseat_webhook_is_kept_and_retried(client, db, fake, uid, mo
     assert customer_row(db, dl["result"]["cluster_id"])["ts_turned_down_reason"] == "Went with another venue"
     again = client.post("/cron/retry-webhooks", headers={"X-CDP-Key": "test-cron-secret"}).json()
     assert rows[0]["id"] not in again["resolved"] + again["failed"]
+
+
+def test_dead_letter_is_not_replayed_over_a_newer_update(client, db, fake, uid, monkeypatch):
+    """A failed PROSPECT copy must not overwrite a LOST update for the same event that succeeded later."""
+    from fastapi.testclient import TestClient
+    lost = ts_lost_event_webhook(uid)
+    prospect = json.loads(json.dumps(lost))
+    prospect["event"].update(status="PROSPECT", lost_reason=None)
+    prospect["event"]["booking"].update(status="PROSPECT", lost_reason=None)
+    real = main.handle_tripleseat
+
+    def broken(raw, tasks):
+        raise RuntimeError("simulated outage")
+    monkeypatch.setattr(main, "handle_tripleseat", broken)
+    failing = TestClient(main.app, raise_server_exceptions=False)
+    assert failing.post("/webhooks/tripleseat", headers=WH, json=prospect).status_code == 500
+    monkeypatch.setattr(main, "handle_tripleseat", real)
+    cid = client.post("/webhooks/tripleseat", headers=WH, json=lost).json()["cluster_id"]
+
+    db.execute("SELECT id, resolved_at, result FROM webhook_dead_letters WHERE record_key = %s",
+               (f"event:{lost['event']['id']}",))
+    dl = db.fetchone()
+    assert dl["resolved_at"] is not None and dl["result"]["status"] == "superseded"
+    client.post("/cron/retry-webhooks", headers={"X-CDP-Key": "test-cron-secret"})
+    c = customer_row(db, cid)
+    assert c["ts_lead_status"] == "LOST" and c["ts_turned_down_reason"] == "Went with another venue"
+    assert capi_rows(db, f"qb_ts_{cid}_%") == []
+
+
+def test_only_the_newest_failed_copy_of_a_record_is_replayed(client, db, fake, uid, monkeypatch):
+    from fastapi.testclient import TestClient
+    lost = ts_lost_event_webhook(uid)
+    prospect = json.loads(json.dumps(lost))
+    prospect["event"].update(status="PROSPECT", lost_reason=None)
+    real = main.handle_tripleseat
+
+    def broken(raw, tasks):
+        raise RuntimeError("simulated outage")
+    monkeypatch.setattr(main, "handle_tripleseat", broken)
+    failing = TestClient(main.app, raise_server_exceptions=False)
+    for body in (prospect, lost):  # PROSPECT first, then the newer LOST: both fail
+        assert failing.post("/webhooks/tripleseat", headers=WH, json=body).status_code == 500
+    monkeypatch.setattr(main, "handle_tripleseat", real)
+    client.post("/cron/retry-webhooks", headers={"X-CDP-Key": "test-cron-secret"})
+    db.execute("SELECT payload->'event'->>'status' AS status, result->>'status' AS outcome FROM webhook_dead_letters "
+               "WHERE record_key = %s ORDER BY id", (f"event:{lost['event']['id']}",))
+    assert [(r["status"], r["outcome"]) for r in db.fetchall()] == [("PROSPECT", "superseded"),
+                                                                       ("LOST", "tripleseat_synced")]
+    db.execute("SELECT cluster_id FROM master_customers WHERE email = %s", (f"lost-{uid}@example.test",))
+    assert customer_row(db, db.fetchone()["cluster_id"])["ts_lead_status"] == "LOST"

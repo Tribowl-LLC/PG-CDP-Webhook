@@ -55,7 +55,7 @@ def run(apply: bool, delete_blank: bool):
                     UPDATE master_customers SET
                         sq_spend = %(spend)s,
                         sq_visits = %(visits)s,
-                        true_lifetime_spend = GREATEST(%(spend)s, COALESCE(wr_spend, 0)),
+                        true_lifetime_spend = GREATEST(%(spend)s, COALESCE(wr_spend, 0), COALESCE(pw_spend, 0)),
                         instore_pos_spend = GREATEST(0, %(spend)s - COALESCE(wr_spend, 0)),
                         updated_at = NOW()
                     WHERE cluster_id = %(cid)s;

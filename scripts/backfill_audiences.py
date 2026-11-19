@@ -1,8 +1,9 @@
 """Pushes every qualifying customer into the Meta Custom Audiences they belong in.
 
-Qualifying = the same rule the webhooks use: bowler_value_score at or above the current thermostat
-threshold, not in an excluded area, and with an email or phone Meta can match on. Re-uploading a
-customer who is already in an audience is harmless (Meta de-duplicates).
+Qualifying = the same rule the webhooks use: not in an excluded area, and with an email or phone Meta
+can match on. Seeds are built from who the customer is (main.seed_memberships), not from the score
+threshold or distance. Re-uploading a customer who is already in an audience is harmless (Meta
+de-duplicates). Uploading adds members; it never removes anyone who no longer belongs.
 
 Run it where META_ACCESS_TOKEN is available (e.g. `render ssh <service> --ephemeral`):
     python scripts/backfill_audiences.py --webhook-customers-only            # dry run: counts, uploads nothing
@@ -29,17 +30,24 @@ def run(apply: bool, webhook_only: bool = False):
     conn = main.get_conn()
     try:
         with conn, conn.cursor() as cur:
-            thresh = main.get_threshold(cur)
             cur.execute(
                 """
-                SELECT * FROM master_customers
-                WHERE bowler_value_score >= %s
-                  AND (COALESCE(email, '') <> '' OR COALESCE(phone, '') <> '')
+                SELECT mc.*, COALESCE(v.visit_days, 0) AS visit_days,
+                       EXISTS (SELECT 1 FROM tripleseat_events e WHERE e.cluster_id = mc.cluster_id
+                                 AND UPPER(COALESCE(e.status, '')) IN ('DEFINITE', 'CLOSED'))
+                         OR EXISTS (SELECT 1 FROM tripleseat_bookings b WHERE b.cluster_id = mc.cluster_id
+                                      AND UPPER(COALESCE(b.status, '')) IN ('DEFINITE', 'CLOSED')) AS ts_booked
+                FROM master_customers mc
+                LEFT JOIN (SELECT cluster_id, COUNT(DISTINCT transaction_date::date) AS visit_days
+                           FROM unified_transactions
+                           WHERE total_amount > 0 AND source_system = 'square' AND cluster_id IS NOT NULL
+                           GROUP BY cluster_id) v USING (cluster_id)
+                WHERE (COALESCE(email, '') <> '' OR COALESCE(phone, '') <> '')
                   AND (NOT %s
                        OR cluster_id IN (SELECT cluster_id FROM capi_events_log WHERE cluster_id IS NOT NULL)
                        OR cluster_id IN (SELECT cluster_id FROM unified_transactions WHERE cluster_id IS NOT NULL));
                 """,
-                (thresh, webhook_only),
+                (webhook_only,),
             )
             customers = cur.fetchall()
     finally:
@@ -48,7 +56,7 @@ def run(apply: bool, webhook_only: bool = False):
     rows_by_audience = collections.defaultdict(list)
     excluded = 0
     for c in customers:
-        targets, ltv = main.audience_targets(c)
+        targets, ltv = main.audience_targets(c, {"visit_days": c["visit_days"], "ts_booked": c["ts_booked"]})
         if not targets:
             excluded += 1
             continue
@@ -58,7 +66,7 @@ def run(apply: bool, webhook_only: bool = False):
 
     names = main.audience_names()
     scope = "touched by a webhook" if webhook_only else "in total"
-    print(f"Threshold {thresh}: {len(customers)} customers {scope} at or above it with an email/phone "
+    print(f"{len(customers)} customers {scope} with an email/phone "
           f"({excluded} skipped as excluded area)")
     for aud, rows in rows_by_audience.items():
         print(f"  {names.get(aud, aud)}: {len(rows)} customers")

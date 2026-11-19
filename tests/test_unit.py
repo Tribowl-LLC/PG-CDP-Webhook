@@ -51,21 +51,113 @@ def test_cardholder_parsing():
     assert main.parse_cardholder_name("VALUED CUSTOMER") == ("", "")
 
 
-def test_scoring_unchanged_for_known_case():
-    persona, score = main.score_and_assign_persona({
-        "in_partywirks": 1, "md_household_income": "$125,000-$149,999", "distance_miles": 5,
-        "md_city": "Novi", "zip5": "48375", "true_lifetime_spend": 500,
-    })
-    assert persona.startswith("PG-2") and score == 100
+# --- Personas and scoring (behaviour + best goal fit, no base, no ratchet) ----------------------
+
+NOVI = {"md_city": "Novi", "zip5": "48375"}
+BIRTHDAY_FIT = {**NOVI, "md_children_age_range": "3-5,6-10", "distance_miles": 4,
+                "versium_lifestyle_flags": {"age_range": "35-45", "household_income": "$150,000-199,999",
+                                            "length_of_residence": "5-10 Years", "gender": "Female",
+                                            "marital_status": "Married", "household_size": "2"}}
+
+
+def test_no_behaviour_and_no_fit_scores_zero():
+    persona, score = main.score_and_assign_persona({**NOVI})
+    assert score == 0 and persona.startswith("PG-5")
+
+
+def test_birthday_propensity_scores_as_specified():
+    # age 10 + kids 10 + affluence 5 + tenure 5 + female 5 + within 5mi 10 + married 5 + household of 2 5
+    assert main.goal_fits(BIRTHDAY_FIT)["birthday"] == 55
+    persona, score = main.score_and_assign_persona(BIRTHDAY_FIT)
+    assert persona.startswith("PG-2") and score == 55
+    young = {**BIRTHDAY_FIT, "versium_lifestyle_flags": {**BIRTHDAY_FIT["versium_lifestyle_flags"],
+                                                         "young_adult_in_household": "Yes"}}
+    assert main.goal_fits(young)["birthday"] == 45
+    assert main.winning_goal(BIRTHDAY_FIT) == "birthday"
+
+
+def test_corporate_propensity_scores_as_specified():
+    cust = {**NOVI, "first_name": "Pat", "last_name": "Lane", "ts_account": "Comerica Bank", "distance_miles": 14,
+            "versium_lifestyle_flags": {"age_range": "55-65", "gender": "Female", "marital_status": "Married"}}
+    # org 15 + age 35-65 10 + female 5 + within 15mi 2 + married 5; no income/home points
+    assert main.goal_fits(cust)["corporate"] == 37
+    persona, score = main.score_and_assign_persona(cust)
+    assert persona.startswith("PG-1") and score == 37 and main.winning_goal(cust) == "corporate"
+
+
+def test_celebration_propensity_scores_as_specified():
+    cust = {**NOVI, "distance_miles": 9, "versium_home_market_value": "$500,000-749,999",
+            "versium_lifestyle_flags": {"age_range": "45-55", "length_of_residence": "11-14 Years",
+                                        "household_size": "2", "marital_status": "Married"}}
+    # within 12mi 5 + age 5 + affluence (home) 5 + tenure 5 + household 2 5 + married 5
+    assert main.goal_fits(cust)["celebration"] == 30
+    # The same household is a stronger birthday fit (age counts 10 there), so the score is the better of the two
+    assert main.goal_fits(cust)["birthday"] == 35 and main.score_and_assign_persona(cust)[1] == 35
+    # With a young adult at home birthday drops 10 and celebration wins
+    ya = {**cust, "versium_lifestyle_flags": {**cust["versium_lifestyle_flags"], "young_adult_in_household": "Yes"}}
+    assert main.score_and_assign_persona(ya)[1] == 30 and main.winning_goal(ya) == "celebration"
+
+
+def test_behaviour_points_and_dominance():
+    booker = {**NOVI, "pw_bookings": 1, "true_lifetime_spend": 650}
+    # booker 25 + $600+ 20 + recent 10 + 3+ separate visits 5
+    assert main.behaviour_points(booker, {"recent": True, "visit_days": 3}) == 60
+    assert main.behaviour_points({"true_lifetime_spend": 300}, {}) == 15
+    assert main.score_and_assign_persona(booker, {"recent": True, "visit_days": 3})[1] > \
+        main.score_and_assign_persona(BIRTHDAY_FIT)[1]
+
+
+def test_income_bands_parse_by_lower_bound():
+    # The old text match counted "$75,001-$100,000" as high income; affluence needs $150k+
+    for band, rich in (("$75,001-$100,000", False), ("$125,001-$150,000", False), ("$150,001+", True)):
+        assert main._fit_facts({"md_household_income": band})["affluent"] is rich, band
+    assert main._fit_facts({"versium_lifestyle_flags": {"household_income": "> $250,000"}})["affluent"]
+    assert not main._fit_facts({"versium_lifestyle_flags": {"household_income": "$100,000-149,999"},
+                                "md_household_income": "$150,001+"})["affluent"]  # Versium first
+    assert main._fit_facts({"versium_home_market_value": "450000"})["affluent"]
+
+
+def test_large_family_party_without_an_organisation_is_not_corporate():
+    fam = {**NOVI, "first_name": "Dana", "last_name": "Wood", "ts_account": "Wood Family", "ts_max_guests": 40,
+           "ts_lead_status": "PROSPECT"}
+    assert not main.score_and_assign_persona(fam)[0].startswith("PG-1")
+    assert main.is_real_organisation({"first_name": "Dana", "last_name": "Noonan",
+                                      "ts_account": "Noonan Electrical Services"})
+    assert main.is_real_organisation({"first_name": "Dana", "last_name": "Wood", "md_delivery_indicator": "B"})
+    assert not main.is_real_organisation({"first_name": "Dana", "last_name": "Wood", "ts_account": "Dana Wood"})
+
+
+def test_excluded_geo_persona():
+    persona, _ = main.score_and_assign_persona({"md_city": "Detroit", "zip5": "48226", "true_lifetime_spend": 50})
+    assert persona.startswith("PG-4")
 
 
 def test_audience_targets():
     t, ltv = main.audience_targets({"pg_mosaic_persona": "PG-2: x", "zip5": "48335", "md_city": "Farmington Hills",
-                                    "in_partywirks": 1, "true_lifetime_spend": 100})
+                                    "in_partywirks": 1, "pw_bookings": 1, "true_lifetime_spend": 100})
     assert t == [main.AUDIENCE_ALL_NONDETROIT, main.AUDIENCE_PG2_FAMILIES, main.AUDIENCE_PRIME_SUBURBS]
-    assert ltv == 450.0
     assert main.audience_targets({"md_city": "Detroit", "zip5": "48226", "pg_mosaic_persona": "PG-1"}) == ([], 0.0)
     assert main.audience_targets({"zip5": "48230", "md_city": "Grosse Pointe"})[0] == [main.AUDIENCE_ALL_NONDETROIT]
+
+
+def test_lookalike_value_is_real_lifetime_spend_with_no_floor():
+    for cust in ({"in_tripleseat": 1, "true_lifetime_spend": 100}, {"in_partywirks": 1, "pw_bookings": 1},
+                 {"in_tripleseat": 1, "ts_lead_status": "DEFINITE", "true_lifetime_spend": 1234.5}):
+        assert main.audience_targets({**NOVI, **cust})[1] == float(cust.get("true_lifetime_spend") or 0)
+
+
+def test_seeds_follow_who_the_customer_is_not_score_or_distance():
+    # A Tripleseat prospect is no longer in the corporate seed just for being in Tripleseat...
+    t, _ = main.audience_targets({**NOVI, "in_tripleseat": 1, "ts_lead_status": "PROSPECT",
+                                  "first_name": "A", "last_name": "B", "ts_account": "A B", "true_lifetime_spend": 700})
+    assert main.AUDIENCE_PG1_CORP not in t
+    # ...nor a cancelled-only Partywirks contact in the families seed
+    assert main.AUDIENCE_PG2_FAMILIES not in main.audience_targets({**NOVI, "in_partywirks": 1})[0]
+    # A party-age family with no distance and a score of 0 is in the birthday seed
+    fam = {**BIRTHDAY_FIT, "distance_miles": None, "bowler_value_score": 0}
+    assert main.AUDIENCE_PG2_FAMILIES in main.audience_targets(fam)[0]
+    org = {**NOVI, "first_name": "A", "last_name": "B", "ts_account": "Ford Motor Company", "bowler_value_score": 0}
+    assert main.AUDIENCE_PG1_CORP in main.audience_targets(org)[0]
 
 
 def test_rejected_audience_upload_is_logged(fake, caplog):

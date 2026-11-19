@@ -26,9 +26,9 @@ Perfect Game is a single-location family entertainment center (bowling, two-stor
 **How the ads engine works:**
 - **Identity:** every Square, WebRes, Tripleseat and Partywirks touch is resolved to one household (`master_customers.cluster_id`) through emails, phones, Square customer IDs and Melissa keys (`customer_identities`), without double-counting revenue that settles through Square.
 - **Enrichment:** Melissa first (verified address, geocode, distance, household demographics), then Versium (alternate emails/phones for Meta match rates, wealth, B2B employment).
-- **Scoring and gating:** each household gets a persona (`PG-1`…`PG-6`) and a `bowler_value_score`. A `Qualified_Bowler` event goes to Meta only for households outside the excluded areas that score at or above a nightly thermostat threshold, paced to ~50/week so ad sets exit "Learning Limited". Low scorers send nothing, so Meta learns not to chase them. Campaigns should optimize on the `Qualified_Bowler` custom conversion.
+- **Scoring and gating:** each household gets a persona (`PG-1`…`PG-5`) and a `bowler_value_score` (behaviour + best goal fit, section 4.4). A `Qualified_Bowler` event goes to Meta only for households outside the excluded areas that score at or above a nightly thermostat threshold, paced to ~50/week so ad sets exit "Learning Limited". Low scorers send nothing, so Meta learns not to chase them. Campaigns should optimize on the `Qualified_Bowler` custom conversion.
 - **Attribution:** real `Purchase` events (WebRes bookings, Square payments including in-store bar/arcade/kitchen spend) are sent with the same hashed identifiers. Meta can then attribute both the booking *and* later in-venue spend to the ad that drove it.
-- **Audiences:** qualifying households are pushed automatically into the 4 value-based Custom Audiences that seed the lookalikes.
+- **Audiences:** non-excluded households are pushed automatically into the value-based Custom Audiences that seed the lookalikes, by who they are (section 4.5), whatever their score.
 
 **Roadmap (in rough order):** Versium enrichment (alternate IDs, wealth, C2B) → recover more identities (card fingerprints, receipt emails, register phone/email capture) → re-tune the score on real spend and item data → the owner's own "Perfect Game Mosaic" (cluster households on demographics + spend; find look-alike Census tracts and non-customer households for lookalikes, prospect lists and carrier-route mail) → item-based segments (e.g. open-play families who never booked a party, the bar/league crowd, "book next year's birthday" reminders) → CRM features on Square price keys → Google Ads (offline conversions + Customer Match) → Intercard arcade data.
 
@@ -36,7 +36,7 @@ Perfect Game is a single-location family entertainment center (bowling, two-stor
 - Identity Resolution & Deduplication: Stitches fragmented customer records across Square, WebRes, Tripleseat, and Partywirks into a single golden household record (`master_customers.cluster_id`) without double-counting revenue when online bookings or Partywirks/Tripleseat deposits settle through Square POS.
 - Real-Time Progressive Enrichment: Automatically enriches incoming leads and POS customers via Melissa Personator API (verifying physical street address, latitude/longitude, distance from the venue, household income, and presence of children) and, once the Versium key is set, Versium REACH API (appending up to 5 alternate emails/phones per person, net worth, home market value, and B2B corporate employment).
 - Hard Geographic Ad Exclusion Gate: Strictly blocks Meta CAPI optimization events (`Qualified_Bowler`, `Purchase`) and Custom Audience syncs for excluded geographic areas (Detroit, Southfield, Redford, Pontiac, Oak Park, Inkster, etc.) so Meta's ad delivery algorithm never learns to prospect in non-target areas.
-- Algorithmic Lead Scoring & Thermostat Pacing: Assigns every household to a Perfect Game Mosaic Persona (`PG-1` through `PG-6`) and calculates a `bowler_value_score` (`0–100`). A nightly thermostat (`cdp_thermostat_config`) dynamically adjusts the minimum score threshold (started at `70`; moves in steps of 5 between `45` and `90`) to maintain ~50 `Qualified_Bowler` conversion events per 7-day rolling window—keeping Meta Ad Sets out of the "Learning Limited" phase while optimizing purely for high-value suburban families and corporate event planners.
+- Algorithmic Lead Scoring & Thermostat Pacing: Assigns every household to a Perfect Game Mosaic Persona (`PG-1` through `PG-5`) and calculates a `bowler_value_score` (`0–100`). A nightly thermostat (`cdp_thermostat_config`) dynamically adjusts the minimum score threshold (started at `70`; moves in steps of 5 between `45` and `90`) to maintain ~50 `Qualified_Bowler` conversion events per 7-day rolling window—keeping Meta Ad Sets out of the "Learning Limited" phase while optimizing purely for high-value suburban families and corporate event planners.
 ---
 2. Infrastructure & Tech Stack
 Application Server: FastAPI (`main.py`) hosted on Render (`https://pg-cdp-webhook.onrender.com`)
@@ -111,7 +111,7 @@ Automated Department Classification (`pg_department`):
 ---
 4. Geographic Rules, Personas & Scoring Model
 4.1 Hard Geographic Exclusion Gate (`is_detroit_excluded`)
-To prevent Meta's ad delivery AI from optimizing toward lower-converting or out-of-market areas, any non-corporate customer matching the following verified cities or ZIP codes is hard-capped at a `bowler_value_score` of `25`, assigned to `PG-5: Excluded Geo`, and completely blocked from firing Meta CAPI events or entering Meta Custom Audiences:
+To prevent Meta's ad delivery AI from optimizing toward lower-converting or out-of-market areas, any customer matching the following verified cities or ZIP codes is assigned to `PG-4: Excluded Geo` (unless an earlier persona matches) and completely blocked from firing Meta CAPI events or entering Meta Custom Audiences:
 Excluded Cities: `detroit`, `pontiac`, `redford`, `redford charter township`, `redford twp`, `inkster`, `highland park`, `hamtramck`, `southfield`, `lathrup village`, `oak park`, `ferndale`, `hazel park`, `eastpointe`, `harper woods`, `ecorse`, `river rouge`
 Excluded ZIP Prefixes / Codes: All `482xx` ZIP codes except the Grosse Pointes (`48230`, `48236`, see `ALLOWED_482_ZIPS`), plus `48033`, `48034`, `48037`, `48075`, `48076`, `48340`, `48341`, `48342`, `48141`
 Grosse Pointe: `48230` (Grosse Pointe, Farms, Park) and `48236` (Woods, Shores) are marketable. The city check runs first, so a `48236` address in Harper Woods or Detroit is still excluded.
@@ -127,26 +127,23 @@ Bloomfield Hills / Birmingham / Franklin: `48301`, `48302`, `48304`, `48009`, `4
 Plymouth / Canton: `48170`, `48187`, `48188`
 Commerce Twp / Walled Lake / Wixom / South Lyon: `48382`, `48390`, `48393`, `48178`
 4.3 Mosaic Personas (`pg_mosaic_persona`)
-Evaluated in priority order inside `score_and_assign_persona(cust)`:
-`PG-1: Corporate & Org Event Planners`: `ts_account` present, `versium_b2b_company` present, `md_delivery_indicator == 'B'`, or `ts_max_guests >= 25`.
-`PG-5: Excluded Geo (Detroit / Southfield / Downriver)`: Matches `is_detroit_excluded(md_city, zip5)` and is not `PG-1`. Hard-capped at score `25`.
-`PG-2: Affluent Suburban Party Families`: Verified children (`md_presence_of_children` or `in_partywirks == 1`) AND `$100,000+` household income.
-`PG-3: Core Suburban Family Bowlers`: Verified children (`md_presence_of_children` or `in_partywirks == 1`) with `<$100k` or unknown income.
-`PG-4: Adult Social, Date Night & League`: Verified street address (`md_address1`), no children on file.
-`PG-6: Digital-Only (Need Versium Append)`: Email/phone only (`md_address1 IS NULL`); awaiting Versium REACH address append.
-4.4 Bowler Value Score Calculation (`0–100`)
-(Note: Subject to refinement once Versium REACH net worth, home value, and B2B columns are batch-merged.)
-Base Score: `30` points
-Persona / Family Bonus:
-`PG-1: Corporate & Org Event Planners`: `+35` points
-`PG-2: Affluent Suburban Party Families`: `+25` points
-`PG-3: Core Suburban Family Bowlers` (`has_kids`): `+15` points
-Household Income Bonus:
-High Income (`$100,000+`): `+15` points
-Mid Income (`$60,000–$99,999`): `+10` points
-Proximity Bonus (`<= 12.0` Haversine miles from alley): `+15` points (includes Farmington Hills, Novi, Northville, Livonia, West Bloomfield, Walled Lake, Commerce Twp, Wixom, Plymouth).
-High Lifetime Spend Bonus (`true_lifetime_spend >= $400`): `+15` points
-Cap: `min(100, score)` (or locked at `25` if `is_detroit_excluded` and not `PG-1`).
+Labels for reporting, first match wins (`assign_persona`). Seeds overlap and don't use the persona order (4.5).
+`PG-1: Corporate & Group Organisers`: a real organisation (`is_real_organisation`: a Tripleseat account name that is not the contact's own name, unless it has a business word like "Services"/"Foundation"; or a business mailing address, `md_delivery_indicator == 'B'`), or the contact on a `DEFINITE`/`CLOSED` Tripleseat event. Guest count alone no longer counts (it labelled large family parties as corporate).
+`PG-2: Birthday Party Families`: a Partywirks booking, or kids aged 3-10 + age 35-55 + within 12 miles + affluence.
+`PG-3: High-Value Open Bowlers / Celebrations`: lifetime spend `$279+` (top quarter), or 3+ separate visit days within 15 miles.
+`PG-4: Excluded Geo (Detroit / Southfield / Downriver)`: `is_detroit_excluded`. Never sends events or joins audiences (whatever the label, every send checks the geography).
+`PG-5: Not Enough Data Yet`: everyone else. Not a target; customers graduate by spending or by enrichment.
+4.4 Bowler Value Score (`0–100`)
+Recomputed from current facts on every rescore, so it goes down as well as up (no ratchet), with no base points. Score = behaviour + the best of three goal fits, capped at 100. Verified on the customer base on 2026-11-19 (spend-correlators-2026-11-19.md); behaviour predicts far better than demographics and covers everyone.
+Behaviour (shared): party/event booker (Partywirks booking or `DEFINITE`/`CLOSED` Tripleseat) `+25`; lifetime spend `$279+` `+15` or `$600+` `+20`; bought or booked in the last 90 days `+10`; 3+ separate visit days `+5`.
+Recency: Square payments by their payment date; WebRes, Partywirks and Tripleseat by the booking's own date (reservation / party / event date in the past 90 days or upcoming). Their ledger rows carry the date they were first recorded, and the Nov 16-17 backfill made them all look recent. Several payments on one day are one visit.
+Birthday fit: age 35-55 `+10`, kids 3-10 `+10`, affluence (income `$150k+` or home `$450k+`) `+5`, 5-14 years at the address `+5`, female contact `+5`, within 5 miles `+10` / 12 miles `+5`, married `+5`, household of 2 `+5`, young adult (18-24) at home `-10`.
+Corporate fit: real organisation `+15`, age 35-65 `+10`, female contact `+5`, within 5 / 12 / 15 miles `+10` / `+5` / `+2`, married `+5`. Income and home value don't count.
+Celebration fit: within 5 / 12 miles `+10` / `+5`, age 35-55 `+5`, affluence `+5`, 5-14 years at the address `+5`, household of 2 `+5`, married `+5`.
+Sources (`_fit_facts`): Versium `versium_lifestyle_flags` first (`age_range`, `household_income`, `home_value`, `length_of_residence`, `household_size`, `young_adult_in_household`, `gender`, `marital_status`), then `versium_home_market_value`; Melissa only for kids' ages (`md_children_age_range`), and as a fallback for income (`md_household_income`) and tenure (`md_length_of_residence`). Bands are read by their lower bound. Never ethnicity, religion, politics or credit; kids present alone, own/rent, education and net worth are not scored (verified weak).
+The winning goal (`winning_goal`) is sent on every `Qualified_Bowler` as `custom_data.qb_goal` (`birthday` / `corporate` / `celebration`) for per-goal custom conversions.
+4.5 Seed audiences (`seed_memberships`, `audience_targets`)
+Built from who the customer is, not from the score threshold and not from distance (the ad set's radius does the geography). `LOOKALIKE_VALUE` is real lifetime spend, no floor. PG-1 Corporate: real organisation or a `DEFINITE`/`CLOSED` Tripleseat contact. PG-2 Families: a Partywirks booking, or kids 3-10 + age 35-55 + affluence. PG-3 Celebrations (`AUDIENCE_PG3_CELEBRATIONS`, uploaded only once that Meta audience ID is set): spend `$279+`, 3+ visit days, or persona PG-3. Prime Suburbs and All Non-Detroit unchanged. Excluded areas join none. Uploads only add people; removing members who no longer belong means replacing the audience.
 ---
 5. Live API Endpoints (`main.py`)
 5.1 Real-Time Ingestion Webhooks
@@ -202,9 +199,9 @@ Dual-Event Strategy:
 **One Purchase per payment (WebRes + Square).** A WebRes booking is paid through Square online, so the same money arrives as a Square payment (`sq_pay_…`) and, 1–6 minutes later, as the WebRes booking (`wr_…`). Meta can't dedupe the two IDs. The Square payment is the source of truth for the money. A WebRes Purchase is logged as `DUPLICATE_PURCHASE` (not sent, never retried; `meta_response_body` = the Square event ID) when the same customer has a Square Purchase of the same amount recorded within `PURCHASE_TWIN_HOURS` (6) of the booking (times are when each was first recorded in `unified_transactions`, so a retry days later pairs the same way), whether it was sent, is waiting for a retry, or is held for enrichment. Each Square payment pairs with at most one booking. A Square Purchase is only skipped that way if a matching WebRes Purchase already reached Meta. A WebRes booking whose Square payment couldn't be tied to the customer still sends its Purchase. Lifetime spend already counted the money once (`true_lifetime_spend` = greater of Square and WebRes).
 **Meta values are real money or nothing.** Every event carries the actual money of that transaction, or no `value`/`currency` at all; never an estimate, since Meta treats value as revenue in bidding and reporting. Events sent Nov 14–19, 2026 carried estimated Qualified_Bowler values ($250 floor, $450/$1,000), so value reporting for that window is inflated.
 
-`Qualified_Bowler`: Custom conversion event gated by geography (`not is_detroit_excluded`) and `bowler_value_score >= threshold`. Used as the primary Optimization Goal in Meta Ad Sets so Meta's bidding AI hunts exclusively for high-scoring suburban families and corporate planners.
+`Qualified_Bowler`: Custom conversion event gated by geography (`not is_detroit_excluded`) and `bowler_value_score >= threshold`. Carries `qb_goal` (the winning goal). Used as the primary Optimization Goal in Meta Ad Sets so Meta's bidding AI hunts exclusively for high-scoring suburban families and corporate planners.
 Live Custom Audience Sync (`sync_customer_to_meta_custom_audiences`):
-Whenever a qualified customer is enriched or transacts, FastAPI's `BackgroundTasks` pushes their hashed identity and `LOOKALIKE_VALUE` directly into up to 4 live Meta Value-Based Custom Audiences (`PG-1 Corporate`, `PG-2 Affluent Families`, `Prime Suburbs`, and `All Non-Detroit`).
+Whenever a non-excluded customer is enriched or transacts, FastAPI's `BackgroundTasks` pushes their hashed identity and `LOOKALIKE_VALUE` (real lifetime spend) into the Meta Value-Based Custom Audiences they belong in (`PG-1 Corporate`, `PG-2 Families`, `PG-3 Celebrations` once its ID is set, `Prime Suburbs`, `All Non-Detroit`), whatever their score.
 ---
 7. Reliability Rules (Nov 2026)
 Every webhook is safe to receive more than once. `unified_transactions` is the ledger: one row per Square payment (`sq_pay_<id>`), WebRes booking (`wr_<id>`), Tripleseat lead/event (`ts_<kind>_<id>`) and Partywirks booking (`pw_<id>`). Spend and visit/booking counts only change the first time an ID is seen; a later notice for the same Square payment or WebRes booking only applies the change in amount (e.g. a refund).
@@ -212,7 +209,7 @@ Square spend is `total_money` (includes tips) minus `refunded_money`.
 Square payments with no customer ID, no email and no name on the card are recorded in the ledger but create no customer. Payments from a Square customer ID whose profile has no contact details are parked (`external_customer_id`, no `cluster_id`) and credited automatically once that Square customer is identified.
 `Qualified_Bowler` event IDs are stable: WebRes per booking, Tripleseat per customer per event date (`qb_ts_` for a definite booking, `lead_ts_` for a prospect/tentative lead), Partywirks per booking. Repeat webhooks never create a second conversion.
 Melissa is called at most once per customer for the same inputs: `md_results` records that Melissa answered. It is only retried if Melissa was unreachable or the customer gains a new email/phone.
-Custom Audience uploads log Meta's answer; a rejected upload is logged as an ERROR (`Meta audience upload to <audience> rejected`). `scripts/backfill_audiences.py` (dry run by default, `--apply` to upload) pushes qualifying customers, or with `--webhook-customers-only` just those a webhook has touched (imported customers arrive via the seed uploads); run it where `META_ACCESS_TOKEN` is set, e.g. `render ssh <service> --ephemeral`.
+Custom Audience uploads log Meta's answer; a rejected upload is logged as an ERROR (`Meta audience upload to <audience> rejected`). `scripts/backfill_audiences.py` (dry run by default, `--apply` to upload) pushes every non-excluded customer with an email/phone into their seeds (no score cutoff), or with `--webhook-customers-only` just those a webhook has touched (imported customers arrive via the seed uploads); run it where `META_ACCESS_TOKEN` is set, e.g. `render ssh <service> --ephemeral`.
 Meta failures never roll back a customer update. `capi_events_log.sent_to_meta` reflects Meta's actual response, and a failed event is re-sent if it comes through again.
 New `cluster_id`s come from the `master_cluster_id_seq` sequence; a new customer is a plain INSERT, so a numbering clash fails loudly instead of merging two people.
 Webhook routes read the body asynchronously and run all blocking work in a worker thread, so a slow Melissa/Meta call doesn't hold up other webhooks.
@@ -229,6 +226,8 @@ Webhook routes read the body asynchronously and run all blocking work in a worke
 
 7.3 Partywirks
 With `PARTYWIRKS_API_KEY` set, a Partywirks webhook is treated as a notification: the reservation (`GET /reservations/{order_id}`) and the parent (`GET /customers/{id}`, including street address) are read from the API. An order ID Partywirks doesn't know is ignored. If the API is down, the webhook body is used (flat `customer.address/city/state/zip_code`), but only for a real 10–20 digit order ID, so Partywirks' sample/test delivery (`PW-YYYYMM-NNNN`, John Doe) is never saved. Package = `activity.name`; party date = `event_date`. Each booking's real order total (`totals.total`) goes on its ledger row (`pw_<id>`, once per order) and into the customer's `pw_spend`: the Square deposit is usually not linked to the booker, so this is often their only recorded spend. Cancelled reservations update contact details only (no booking count, no `Qualified_Bowler`) and take a recorded order total back off `pw_spend`. `scripts/backfill_partywirks_spend.py` (dry run by default, `--apply` to write) adds the totals of bookings recorded before totals were stored, from the API's reservation list; an order without a total from the API is skipped, never estimated. Children's details (`event_name`, `customer_responses`, waivers) are never stored.
+`scripts/rescore_all.py` (dry run by default, `--apply` to write) recomputes every customer's persona and score with the current model through `rescore_customer`. It sends no Meta events and uploads no audiences. Run it after a scoring change.
+
 `scripts/backfill_partywirks.py --count-since "<YYYY-MM-DD HH:MM:SS>"` records every reservation; bookings created before the cutoff (already counted by the original import) aren't counted again or sent to Meta.
 
 7.4 Square items & history

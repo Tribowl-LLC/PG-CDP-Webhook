@@ -2167,15 +2167,13 @@ TRIPLESEAT_BOOKED_STATUSES = ("DEFINITE", "CLOSED")
 
 def tripleseat_contract_value(kind: str, obj: dict) -> float:
     """The contracted money of a Tripleseat event (grand_total: incl. taxes, fees, gratuity), or 0 if unknown.
-    A booking uses its total_grand_total, else adds up its events' totals."""
+    A booking uses its total_grand_total, else adds up the totals of its events that aren't lost or deleted."""
     def money(v) -> float:
-        try:
-            return max(float(as_text(v) or 0), 0.0)
-        except ValueError:
-            return 0.0
+        return max(ts_money(as_text(v)) or 0.0, 0.0)  # ts_money also reads "2,400.00" / "$2400"
     if kind == "booking":
         return money(obj.get("total_grand_total")) or round(sum(
-            money(e.get("grand_total")) for e in obj.get("events") or [] if isinstance(e, dict)), 2)
+            money(e.get("grand_total")) for e in obj.get("events") or []
+            if isinstance(e, dict) and str(e.get("status") or "").upper() != "LOST" and not e.get("deleted_at")), 2)
     return money(obj.get("grand_total"))
 
 

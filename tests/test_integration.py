@@ -306,6 +306,10 @@ def test_tripleseat_booking_value_comes_from_its_totals():
     assert main.tripleseat_contract_value("booking", {"events": [{"grand_total": "100.25"},
                                                                  {"grand_total": "200"}, "junk"]}) == 300.25
     assert main.tripleseat_contract_value("event", {"grand_total": "n/a"}) == 0.0
+    assert main.tripleseat_contract_value("event", {"grand_total": "2,400.00"}) == 2400.0
+    assert main.tripleseat_contract_value("booking", {"events": [
+        {"grand_total": "100", "status": "DEFINITE"}, {"grand_total": "900", "status": "LOST"},
+        {"grand_total": "500", "deleted_at": "2026-11-01T00:00:00Z"}]}) == 100.0
 
 
 def test_partywirks_qualified_bowler_carries_the_order_total(client, db, fake, uid, everyone_qualifies):

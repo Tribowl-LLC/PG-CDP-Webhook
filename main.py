@@ -2770,10 +2770,10 @@ def save_dead_letter(source: str, raw, error: Exception, record_key: Optional[st
         return None
 
 
-def supersede_dead_letters(source: str, record_key: Optional[str], before_sql: str = "NOW()",
-                           params: tuple = (), cur=None) -> int:
-    """Marks open dead letters of this record received before a newer copy was processed as superseded:
-    replaying them would overwrite newer data (e.g. bring a LOST event back to PROSPECT)."""
+def supersede_dead_letters(source: str, record_key: Optional[str], before_sql: str, params: tuple = (),
+                           cur=None) -> int:
+    """Marks open dead letters of this record received before `before_sql` (when the newer copy arrived)
+    as superseded: replaying them would overwrite newer data (e.g. bring a LOST event back to PROSPECT)."""
     if not record_key:
         return 0
     sql = f"""UPDATE webhook_dead_letters SET resolved_at = NOW(), result = '{{"status": "superseded"}}'::jsonb
@@ -2876,14 +2876,16 @@ async def tripleseat_webhook(request: Request, background_tasks: BackgroundTasks
     if TRIPLESEAT_LOG_FIELDS and isinstance(raw, dict):
         log_tripleseat_fields(raw)
     record_key = tripleseat_record_key(raw)
+    arrived = datetime.now(timezone.utc)  # before processing: a slower request mustn't outrank a newer one
     try:
         result = await run_in_threadpool(handle_tripleseat, raw, background_tasks)
     except Exception as e:
         # Still a 500 (Tripleseat sees the failure), but the payload is kept for /cron/retry-webhooks.
         await run_in_threadpool(save_dead_letter, "tripleseat", raw, e, record_key)
         raise
-    # This copy is newer than any earlier failed one of the same record: those must not be replayed.
-    await run_in_threadpool(supersede_dead_letters, "tripleseat", record_key)
+    # This copy is newer than the failed copies of the same record saved before it arrived: those must not
+    # be replayed. A copy that failed while this one was being processed arrived later, so it is kept.
+    await run_in_threadpool(supersede_dead_letters, "tripleseat", record_key, "%s::timestamptz", (arrived,))
     return result
 
 

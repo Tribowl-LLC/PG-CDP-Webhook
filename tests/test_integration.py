@@ -1406,3 +1406,26 @@ def test_only_the_newest_failed_copy_of_a_record_is_replayed(client, db, fake, u
                                                                        ("LOST", "tripleseat_synced")]
     db.execute("SELECT cluster_id FROM master_customers WHERE email = %s", (f"lost-{uid}@example.test",))
     assert customer_row(db, db.fetchone()["cluster_id"])["ts_lead_status"] == "LOST"
+
+
+def test_slow_older_webhook_does_not_supersede_a_newer_failure(client, db, fake, uid, monkeypatch):
+    """PROSPECT is still being processed when a later LOST copy fails: the LOST dead letter must stay open."""
+    lost = ts_lost_event_webhook(uid)
+    prospect = json.loads(json.dumps(lost))
+    prospect["event"].update(status="PROSPECT", lost_reason=None)
+    real = main.handle_tripleseat
+
+    def slow_prospect(raw, tasks):
+        res = real(raw, tasks)
+        # While this request was running, the newer LOST webhook arrived and failed.
+        main.save_dead_letter("tripleseat", lost, RuntimeError("simulated outage"), main.tripleseat_record_key(lost))
+        return res
+    monkeypatch.setattr(main, "handle_tripleseat", slow_prospect)
+    assert client.post("/webhooks/tripleseat", headers=WH, json=prospect).status_code == 200
+    monkeypatch.setattr(main, "handle_tripleseat", real)
+    db.execute("SELECT resolved_at FROM webhook_dead_letters WHERE record_key = %s",
+               (f"event:{lost['event']['id']}",))
+    assert db.fetchone()["resolved_at"] is None
+    client.post("/cron/retry-webhooks", headers={"X-CDP-Key": "test-cron-secret"})
+    db.execute("SELECT cluster_id FROM master_customers WHERE email = %s", (f"lost-{uid}@example.test",))
+    assert customer_row(db, db.fetchone()["cluster_id"])["ts_lead_status"] == "LOST"

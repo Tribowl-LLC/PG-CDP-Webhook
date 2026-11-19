@@ -807,3 +807,68 @@ def test_as_text_turns_tripleseat_objects_into_text():
     assert main.as_text([{"id": 1, "name": "A"}, "B", None]) == "A, B"
     assert main.as_text(123) == "123" and main.as_text("  x ") == "x"
     assert main.as_text(None) is None and main.as_text("") is None and main.as_text({}) is None
+
+
+# --- Broad Local replaces the PG-3 Celebrations audience ------------------------------------------
+
+BROAD_ID = "777000222"
+AFFLUENT_35_55 = {"versium_lifestyle_flags": {"age_range": "35-45", "household_income": "$150,000 - $174,999"}}
+
+
+def _old_celebration_rule(cust, facts):
+    """The pre-fold celebration seed, kept here to prove Broad Local contains all of it."""
+    return (float(cust.get("true_lifetime_spend") or 0) >= main.TOP_QUARTER_SPEND
+            or int((facts or {}).get("visit_days") or 0) >= 3
+            or (cust.get("pg_mosaic_persona") or "").startswith("PG-3"))
+
+
+def test_broad_local_membership(monkeypatch):
+    monkeypatch.setattr(main, "AUDIENCE_BROAD_LOCAL", BROAD_ID)
+    def inn(cust, facts=None):
+        return BROAD_ID in main.audience_targets({**NOVI, **cust}, facts)[0]
+    assert inn({"true_lifetime_spend": main.TOP_QUARTER_SPEND})                     # top-quarter spender
+    assert inn({"true_lifetime_spend": 40}, {"visit_days": 3})                      # frequent low-spend visitor
+    assert inn({**AFFLUENT_35_55, "md_children_age_range": "3-5", "true_lifetime_spend": 20})  # affluent 35-55 family
+    assert not inn({"true_lifetime_spend": 278.99}, {"visit_days": 2})              # none of the three
+    assert not inn({"versium_lifestyle_flags": {"age_range": "35-45"}, "true_lifetime_spend": 20})  # age, not affluent
+    assert main.audience_targets({**AFFLUENT_35_55, "md_city": "Detroit", "zip5": "48226",
+                                  "true_lifetime_spend": 900}, {"visit_days": 9}) == ([], 0.0)  # excluded area
+
+
+def test_fold_loses_nobody_from_the_old_celebration_seed():
+    personas = ["", "PG-3: High-Value Open Bowlers / Celebrations", "PG-2: Birthday Party Families"]
+    demos = [{}, AFFLUENT_35_55, {"versium_lifestyle_flags": {"age_range": "55-65"}, "md_household_income": "$200,000+"}]
+    checked = 0
+    for spend in (0, 100, 278.99, 279, 5000):
+        for days in (0, 2, 3, 10):
+            for demo in demos:
+                for persona in personas:
+                    cust = {**NOVI, **demo, "true_lifetime_spend": spend, "pg_mosaic_persona": persona}
+                    facts = {"visit_days": days}
+                    # Old PG-3 personas imply spend >= $279 or 3+ visit days, so only real PG-3s count here.
+                    real_pg3 = spend >= main.TOP_QUARTER_SPEND or days >= 3
+                    if _old_celebration_rule(cust, facts) and (real_pg3 or not persona.startswith("PG-3")):
+                        assert main.seed_memberships(cust, facts)["broad_local"], cust
+                        checked += 1
+    assert checked > 50
+
+
+def test_no_audience_targets_pg3():
+    assert not hasattr(main, "AUDIENCE_PG3_CELEBRATIONS")
+    assert "celebration" not in main.seed_memberships(NOVI)
+    assert not any("PG-3" in name or "Celebration" in name for name in main.audience_names().values())
+    import pathlib
+    src = pathlib.Path(main.__file__).read_text()
+    assert "AUDIENCE_PG3" not in src
+
+
+def test_stored_personas_never_affect_seed_membership():
+    labels = ["", "PG-1: Corporate & Group Organisers", "PG-2: Birthday Party Families",
+              "PG-3: High-Value Open Bowlers / Celebrations", "PG-4: Excluded Geo", "PG-5: Not Enough Data Yet",
+              "PG-3: Celebrations (old)", "Prime Suburban Family", "PG-2 Affluent Families"]
+    custs = [{**NOVI, "true_lifetime_spend": 10}, {**NOVI, **AFFLUENT_35_55}, {**NOVI, "pw_bookings": 1},
+             {**NOVI, "first_name": "A", "last_name": "B", "ts_account": "Ford Motor Company"}]
+    for cust in custs:
+        base = main.seed_memberships(cust, {"visit_days": 1})
+        for label in labels:
+            assert main.seed_memberships({**cust, "pg_mosaic_persona": label}, {"visit_days": 1}) == base, label

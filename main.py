@@ -1102,13 +1102,15 @@ def fire_meta_capi_event(cur, cust: dict, event_name: str, value: float, thresho
             "action_source": action_source,
             "user_data": build_meta_user_identifiers(cust),
             "custom_data": {
-                "currency": "USD",
-                "value": round(float(value), 2),
                 "pg_persona": cust.get("pg_mosaic_persona"),
                 "bowler_value_score": score,
             },
         }]
     }
+    if value and float(value) > 0:
+        # Only real money for this transaction. No money known = no value, never a made-up estimate:
+        # Meta treats value as revenue in bidding and in reporting.
+        payload["data"][0]["custom_data"].update(currency="USD", value=round(float(value), 2))
     try:
         resp = requests.post(
             f"https://graph.facebook.com/v21.0/{META_PIXEL_ID}/events",
@@ -2065,7 +2067,7 @@ def handle_webres(data: dict, background_tasks: BackgroundTasks) -> dict:
                     if amount > 0:
                         fire_meta_capi_event(cur, cust, "Purchase", amount, thresh, event_id=txn_id)
                     if cust["bowler_value_score"] >= thresh or cust.get("enrich_after"):
-                        fire_meta_capi_event(cur, cust, "Qualified_Bowler", max(amount, 250.0), thresh,
+                        fire_meta_capi_event(cur, cust, "Qualified_Bowler", amount, thresh,
                                              event_id=f"qb_wr_{booking_id}")
                         background_tasks.add_task(sync_customer_to_meta_custom_audiences, dict(cust))
 
@@ -2159,6 +2161,22 @@ def tripleseat_record_key(raw) -> Optional[str]:
     return f"{kind}:{rid}" if rid else None
 
 
+# Tripleseat event statuses that mean a booked event (CLOSED = definite and already held).
+TRIPLESEAT_BOOKED_STATUSES = ("DEFINITE", "CLOSED")
+
+
+def tripleseat_contract_value(kind: str, obj: dict) -> float:
+    """The contracted money of a Tripleseat event (grand_total: incl. taxes, fees, gratuity), or 0 if unknown.
+    A booking uses its total_grand_total, else adds up the totals of its events that aren't lost or deleted."""
+    def money(v) -> float:
+        return max(ts_money(as_text(v)) or 0.0, 0.0)  # ts_money also reads "2,400.00" / "$2400"
+    if kind == "booking":
+        return money(obj.get("total_grand_total")) or round(sum(
+            money(e.get("grand_total")) for e in obj.get("events") or []
+            if isinstance(e, dict) and str(e.get("status") or "").upper() != "LOST" and not e.get("deleted_at")), 2)
+    return money(obj.get("grand_total"))
+
+
 def handle_tripleseat(raw: dict, background_tasks: BackgroundTasks) -> dict:
     kind, obj = tripleseat_record(raw)
     contact = obj.get("contact") if isinstance(obj.get("contact"), dict) else obj
@@ -2239,12 +2257,17 @@ def handle_tripleseat(raw: dict, background_tasks: BackgroundTasks) -> dict:
                     and (cust["bowler_value_score"] >= thresh or cust.get("enrich_after"))
                     and status not in ("LOST", "TURNED_DOWN")
                 ):
-                    # One Qualified_Bowler per customer per event date, however many times Tripleseat
-                    # re-sends the lead/event (a lead and the event it turns into share the date).
+                    # One event per customer per event date, however many times Tripleseat re-sends the
+                    # lead/event (a lead and the event it turns into share the date). Only a definite booking
+                    # is a Qualified_Bowler, worth its contracted total (or no value); a prospect or tentative
+                    # lead is a Lead with no value. A lead that later becomes definite sends both, once each.
                     key = event_date or (f"{kind}_{record_id}" if record_id else "undated")
-                    synthetic_val = 1000.0 if (cust.get("pg_mosaic_persona") or "").startswith("PG-1") else 450.0
-                    fire_meta_capi_event(cur, cust, "Qualified_Bowler", synthetic_val, thresh,
-                                         event_id=f"qb_ts_{cust['cluster_id']}_{key}")
+                    if kind in ("event", "booking") and status in TRIPLESEAT_BOOKED_STATUSES:
+                        fire_meta_capi_event(cur, cust, "Qualified_Bowler", tripleseat_contract_value(kind, obj),
+                                             thresh, event_id=f"qb_ts_{cust['cluster_id']}_{key}")
+                    else:
+                        fire_meta_capi_event(cur, cust, "Lead", 0.0, thresh,
+                                             event_id=f"lead_ts_{cust['cluster_id']}_{key}")
                     background_tasks.add_task(sync_customer_to_meta_custom_audiences, dict(cust))
 
         return {
@@ -3025,7 +3048,17 @@ def partywirks_record(res: dict, customer: dict = None) -> dict:
         "package": (activity.get("name") or "BIRTHDAY PARTY")[:100],
         "party_date": date_only(res.get("event_date")),
         "created_at": res.get("created_at"),
+        "total": _partywirks_total(res),
     }
+
+
+def _partywirks_total(res: dict) -> float:
+    """The reservation's real order total (totals.total, incl. tax), or 0 when Partywirks didn't give one."""
+    totals = res.get("totals") if isinstance(res.get("totals"), dict) else {}
+    try:
+        return max(float(totals.get("total") or 0), 0.0)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def fetch_partywirks_record(order_id: str):
@@ -3078,7 +3111,10 @@ def ingest_partywirks(cur, rec: dict, background_tasks: BackgroundTasks = None, 
         retry_unsent_event(cur, f"qb_pw_{key}")  # a Meta failure last time gets another try
     elif (count_booking and not is_detroit_excluded(cust.get("md_city"), cust.get("zip5"))
             and (cust["bowler_value_score"] >= thresh or cust.get("enrich_after"))):
-        fire_meta_capi_event(cur, cust, "Qualified_Bowler", 450.0, thresh, event_id=f"qb_pw_{key}")
+        # The real order total, or no value. Not a Purchase: the deposit/balance arrive as Square payments,
+        # so a Partywirks Purchase would need the same twin check as WebRes (purchase_twin) first.
+        fire_meta_capi_event(cur, cust, "Qualified_Bowler", rec.get("total") or 0.0, thresh,
+                             event_id=f"qb_pw_{key}")
         if background_tasks is not None:
             background_tasks.add_task(sync_customer_to_meta_custom_audiences, dict(cust))
         else:
@@ -3216,7 +3252,7 @@ _VERSIUM_MARKERS = ("_versium_checked", "_versium_contact_done", "_versium_demo_
 
 def release_deferred_events(cur, cust: dict) -> collections.Counter:
     """Sends the Meta events held while the customer waited for enrichment, now that the address and score are
-    known: Purchase if not in an excluded area; Qualified_Bowler also needs the score threshold."""
+    known: Purchase if not in an excluded area; Qualified_Bowler and Lead also need the score threshold."""
     out = collections.Counter()
     cur.execute("""SELECT * FROM capi_events_log WHERE cluster_id = %s AND NOT sent_to_meta
                    AND meta_response_status = 'DEFERRED_ENRICHMENT' ORDER BY sent_at FOR UPDATE;""",
@@ -3231,7 +3267,7 @@ def release_deferred_events(cur, cust: dict) -> collections.Counter:
                 "WHERE event_id = ANY(%s);", (score, thresh, [r["event_id"] for r in rows]))
     for r in rows:
         reason = "excluded_area" if excluded else (
-            "below_threshold" if r["event_name"] == "Qualified_Bowler" and score < thresh else None)
+            "below_threshold" if r["event_name"] in ("Qualified_Bowler", "Lead") and score < thresh else None)
         if reason:
             cur.execute("UPDATE capi_events_log SET meta_response_status = 'DROPPED_AFTER_ENRICHMENT', "
                         "meta_response_body = %s WHERE event_id = %s;", (reason, r["event_id"]))

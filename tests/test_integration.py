@@ -1279,3 +1279,80 @@ def test_melissa_batch_endpoints_need_the_cron_key(client):
         assert client.post(path).status_code == 401
         assert client.post(path, headers=WH).status_code == 401
     assert client.post("/cron/melissa-batch/999999999/emailed", headers=CRON).status_code == 404
+
+
+def ts_lost_event_webhook(uid):
+    """The shape of the Event webhooks that crashed on Nov 18, 2026 (field names from the production log;
+    values are made up). Only LOST events carry lost_reason, and it is an object, not text."""
+    contact = {"id": int(uid[:6], 16), "account_id": 9001, "first_name": "Lost", "last_name": f"Event{uid}",
+               "email_addresses": [{"id": 1, "address": f"lost-{uid}@example.test"}],
+               "phone_numbers": [{"id": 2, "number": "(248) 555-0142", "extension": None,
+                                  "phone_number_type": "Work"}],
+               "websites": [{"id": 3, "url": "https://example.test"}]}
+    account = {"id": 9001, "name": f"Lost Event Co {uid}"}
+    creator = {"id": 5, "customer_id": 77, "first_name": "Sales", "last_name": "Person", "email": "sales@example.test",
+               "title": "Event Manager", "login_count": 10, "phone_numbers": [], "created_at": "2025-01-01T00:00:00Z",
+               "updated_at": "2026-11-01T00:00:00Z", "login_at": "2026-11-18T15:00:00Z"}
+    return {"event": {
+        "id": int(uid[:7], 16), "booking_id": int(uid[:8], 16), "status": "LOST",
+        "lost_reason": {"id": 12, "name": "Went with another venue"}, "lost_reason_details": "Price",
+        "event_date": "12/12/2026", "event_start_iso8601": "2026-12-12T18:00:00-05:00", "guest_count": 60,
+        "account": account, "account_id": 9001, "contact": contact, "contact_id": contact["id"],
+        "creator": creator, "created_by": 5, "created_at": "2026-10-01T12:00:00Z", "customer_id": 77,
+        "deleted_at": None, "actual_amount": "2400.00", "amount_due": "2400.00", "deposit_amount": None,
+        "grand_total": "2400.00", "price_per_person": None, "rental_fee": None, "payment_set": None,
+        "billing_totals": [{"name": "Food", "total": "2000.00"}],
+        "category_totals": [{"name": "Bowling", "total": "400.00"}],
+        "custom_fields": [{"id": 1, "custom_field_id": 2, "custom_field_name": "Occasion",
+                           "custom_field_slug": "occasion", "custom_field_required": False, "value": "Holiday party"}],
+        "attachments": [], "delivery_instructions": None, "delivery_provider": None, "description": None,
+        "documents": [{"financials": {"amount_due": "2400.00", "grand_total": "2400.00", "discounts_total": None},
+                       "line_items": [{"price": "40.00", "total_price": "2400.00", "grand_total": "2400.00"}],
+                       "billing_totals": [], "category_totals": [],
+                       "payment_set": {"amount_due": "2400.00", "remaining_payment_amount": "2400.00",
+                                       "running_balance": "0.00", "payments": []}}],
+        "booking": {"id": int(uid[:8], 16), "account": account, "contact": contact, "status": "LOST",
+                    "lost_reason": {"id": 12, "name": "Went with another venue"}, "created_at": "2026-10-01T12:00:00Z",
+                    "created_by": 5, "creator": creator, "booking_forecast": None, "category_forecasts": [],
+                    "payment_set": None, "total_actual_amount": "2400.00", "total_event_actual_amount": "2400.00",
+                    "total_event_grand_total": "2400.00", "total_grand_total": "2400.00",
+                    "total_food_and_beverage_min": None, "total_rental_fee": None},
+    }}
+
+
+def test_tripleseat_lost_event_with_lost_reason_object_is_saved(client, db, fake, uid):
+    r = client.post("/webhooks/tripleseat", headers=WH, json=ts_lost_event_webhook(uid))
+    assert r.status_code == 200, r.text
+    c = customer_row(db, r.json()["cluster_id"])
+    assert c["ts_turned_down_reason"] == "Went with another venue"
+    assert c["ts_lead_status"] == "LOST" and c["ts_account"] == f"Lost Event Co {uid}"
+    assert c["email"] == f"lost-{uid}@example.test" and c["in_tripleseat"] == 1
+    assert capi_rows(db, f"qb_ts_{c['cluster_id']}_%") == []  # a lost event is not a Qualified_Bowler
+
+
+def test_failed_tripleseat_webhook_is_kept_and_retried(client, db, fake, uid, monkeypatch):
+    from fastapi.testclient import TestClient
+    body = ts_lost_event_webhook(uid)
+    real = main.handle_tripleseat
+
+    def broken(raw, tasks):
+        raise RuntimeError("simulated outage")
+    monkeypatch.setattr(main, "handle_tripleseat", broken)
+    failing = TestClient(main.app, raise_server_exceptions=False)
+    for _ in range(2):  # Tripleseat re-sending the same payload is stored once
+        assert failing.post("/webhooks/tripleseat", headers=WH, json=body).status_code == 500
+    db.execute("SELECT id, attempts, resolved_at, error FROM webhook_dead_letters "
+               "WHERE source = 'tripleseat' AND payload->'event'->'contact'->>'last_name' = %s",
+               (f"Event{uid}",))
+    rows = db.fetchall()
+    assert len(rows) == 1 and rows[0]["resolved_at"] is None and "simulated outage" in rows[0]["error"]
+
+    monkeypatch.setattr(main, "handle_tripleseat", real)
+    res = client.post("/cron/retry-webhooks", headers={"X-CDP-Key": "test-cron-secret"}).json()
+    assert rows[0]["id"] in res["resolved"]
+    db.execute("SELECT attempts, resolved_at, result FROM webhook_dead_letters WHERE id = %s", (rows[0]["id"],))
+    dl = db.fetchone()
+    assert dl["resolved_at"] is not None and dl["attempts"] == 1 and dl["result"]["status"] == "tripleseat_synced"
+    assert customer_row(db, dl["result"]["cluster_id"])["ts_turned_down_reason"] == "Went with another venue"
+    again = client.post("/cron/retry-webhooks", headers={"X-CDP-Key": "test-cron-secret"}).json()
+    assert rows[0]["id"] not in again["resolved"] + again["failed"]

@@ -708,3 +708,10 @@ def test_enrichment_plan():
     matched = {**nomatch, "versium_lifestyle_flags": {"_versium_checked": "x", "pets": "Y"}}
     assert plan(matched, "new@b.com", "", {}) is None                      # matched: never bought twice
     assert plan({**nomatch, "md_city": "Detroit", "zip5": "48226"}, "new@b.com", "", {}) is None
+
+
+def test_as_text_turns_tripleseat_objects_into_text():
+    assert main.as_text({"id": 7, "name": "Went with another venue"}) == "Went with another venue"
+    assert main.as_text([{"id": 1, "name": "A"}, "B", None]) == "A, B"
+    assert main.as_text(123) == "123" and main.as_text("  x ") == "x"
+    assert main.as_text(None) is None and main.as_text("") is None and main.as_text({}) is None

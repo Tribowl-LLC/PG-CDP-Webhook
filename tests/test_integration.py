@@ -1080,8 +1080,11 @@ def test_square_then_webres_enriches_once_on_merged_details(client, db, fake, ui
     contact = [kw["params"] for m, u, kw in fake.calls if "/v2/contact" in u and kw["params"].get("email") == email]
     assert len(contact) == 1 and contact[0]["phone"] == phone   # one lookup, with the WebRes phone
     sent = {e["event_id"] for e in fake.meta_events()}
-    assert f"sq_pay_DP{uid}" in sent and f"wr_DW{uid}" in sent
+    # The same $68 is one Purchase: the Square payment's. The WebRes copy is recorded, not sent.
+    assert f"sq_pay_DP{uid}" in sent and f"wr_DW{uid}" not in sent
     assert capi_rows(db, f"sq_pay_DP{uid}")[0]["sent_to_meta"] is True
+    wr = capi_rows(db, f"wr_DW{uid}")[0]
+    assert wr["meta_response_status"] == "DUPLICATE_PURCHASE" and wr["meta_response_body"] == f"sq_pay_DP{uid}"
 
 
 def test_deferred_events_dropped_when_versium_address_is_excluded(client, db, fake, uid, deferred, monkeypatch):
@@ -1286,7 +1289,7 @@ def ts_lost_event_webhook(uid):
     values are made up). Only LOST events carry lost_reason, and it is an object, not text."""
     contact = {"id": int(uid[:6], 16), "account_id": 9001, "first_name": "Lost", "last_name": f"Event{uid}",
                "email_addresses": [{"id": 1, "address": f"lost-{uid}@example.test"}],
-               "phone_numbers": [{"id": 2, "number": "(248) 555-0142", "extension": None,
+               "phone_numbers": [{"id": 2, "number": "248" + str(int(uid[:6], 16) % 10_000_000).zfill(7), "extension": None,
                                   "phone_number_type": "Work"}],
                "websites": [{"id": 3, "url": "https://example.test"}]}
     account = {"id": 9001, "name": f"Lost Event Co {uid}"}
@@ -1429,3 +1432,52 @@ def test_slow_older_webhook_does_not_supersede_a_newer_failure(client, db, fake,
     client.post("/cron/retry-webhooks", headers={"X-CDP-Key": "test-cron-secret"})
     db.execute("SELECT cluster_id FROM master_customers WHERE email = %s", (f"lost-{uid}@example.test",))
     assert customer_row(db, db.fetchone()["cluster_id"])["ts_lead_status"] == "LOST"
+
+
+# --- WebRes + Square: one Purchase for the same money ------------------------------------------
+
+def webres_body(uid, email, amount, rid=None):
+    return {"reservation_id": rid or f"W{uid}", "first_name": "Lane", "last_name": f"Booker{uid}", "email": email,
+            "amount": amount, "reservation_date": "2026-11-22T18:00:00"}
+
+
+def purchases_sent(fake):
+    return [e for e in fake.meta_events() if e["event_name"] == "Purchase"]
+
+
+def test_webres_booking_paid_in_square_sends_one_purchase(client, db, fake, uid):
+    email = f"double-{uid}@example.test"
+    sq = square_post(client, payment(f"SP{uid}", 8750, email=email, name=f"BOOKER/LANE{uid}")).json()
+    wr = client.post("/webhooks/webres", headers=WH, json=webres_body(uid, email, 87.50)).json()
+    assert wr["cluster_id"] == sq["cluster_id"]
+    assert [e["event_id"] for e in purchases_sent(fake)] == [f"sq_pay_SP{uid}"]
+    row = capi_rows(db, f"wr_W{uid}")[0]
+    assert row["sent_to_meta"] is False and row["meta_response_status"] == "DUPLICATE_PURCHASE"
+    # Re-sends and the hourly retry never send the skipped copy.
+    client.post("/webhooks/webres", headers=WH, json=webres_body(uid, email, 87.50))
+    with main.get_conn() as conn, conn.cursor() as cur:
+        main.retry_unsent_events(cur)
+    assert [e["event_id"] for e in purchases_sent(fake)] == [f"sq_pay_SP{uid}"]
+    # Spend still counts the money once, as before.
+    assert float(customer_row(db, sq["cluster_id"])["true_lifetime_spend"]) == 87.5
+
+
+def test_webres_without_a_matching_square_payment_still_sends_purchase(client, db, fake, uid):
+    email = f"solo-{uid}@example.test"
+    client.post("/webhooks/webres", headers=WH, json=webres_body(uid, email, 60))
+    assert [e["event_id"] for e in purchases_sent(fake)] == [f"wr_W{uid}"]
+
+
+def test_different_amounts_same_day_are_two_purchases(client, db, fake, uid):
+    email = f"two-{uid}@example.test"
+    square_post(client, payment(f"SP{uid}", 371, email=email, name=f"BOOKER/LANE{uid}"))  # a snack in store
+    client.post("/webhooks/webres", headers=WH, json=webres_body(uid, email, 92.50))
+    assert {e["event_id"] for e in purchases_sent(fake)} == {f"sq_pay_SP{uid}", f"wr_W{uid}"}
+
+
+def test_webres_sent_first_then_square_sends_one_purchase(client, db, fake, uid):
+    email = f"rev-{uid}@example.test"
+    client.post("/webhooks/webres", headers=WH, json=webres_body(uid, email, 45))
+    square_post(client, payment(f"SP{uid}", 4500, email=email, name=f"BOOKER/LANE{uid}"))
+    assert [e["event_id"] for e in purchases_sent(fake)] == [f"wr_W{uid}"]
+    assert capi_rows(db, f"sq_pay_SP{uid}")[0]["meta_response_status"] == "DUPLICATE_PURCHASE"

@@ -215,8 +215,8 @@ def test_grosse_pointe_is_marketed_detroit_is_not(client, db, fake, uid):
     dt = square_post(client, payment(f"DT{uid}", 3000, email=f"detroit-{uid}@example.test")).json()
     assert len(capi_rows(db, f"sq_pay_GP{uid}")) == 1
     assert len(capi_rows(db, f"sq_pay_DT{uid}")) == 0
-    assert customer_row(db, gp["cluster_id"])["bowler_value_score"] > 25
-    assert customer_row(db, dt["cluster_id"])["bowler_value_score"] == 25
+    assert not customer_row(db, gp["cluster_id"])["pg_mosaic_persona"].startswith("PG-4")
+    assert customer_row(db, dt["cluster_id"])["pg_mosaic_persona"].startswith("PG-4")
 
 
 # --- WebRes / Tripleseat / Partywirks ----------------------------------------------------------
@@ -329,7 +329,69 @@ def test_partywirks_without_a_total_sends_no_value(client, db, fake, uid, everyo
     qb = capi_rows(db, f"qb_pw_{oid}")
     assert len(qb) == 1 and float(qb[0]["event_value"]) == 0.0
 
-def test_partywirks_webhook_uses_api_and_counts_once(client, db, fake, uid):
+# --- Personas, scoring and seeds ------------------------------------------------------------------
+
+def test_score_goes_down_when_the_facts_change(db, uid):
+    db.execute("INSERT INTO master_customers (cluster_id, email, md_city, zip5, pw_bookings, true_lifetime_spend, "
+               "bowler_value_score) VALUES (nextval('master_cluster_id_seq'), %s, 'Novi', '48375', 1, 650, 99) "
+               "RETURNING *", (f"down-{uid}@example.test",))
+    cust = db.fetchone()
+    up = main.rescore_customer(db, cust)
+    assert up["bowler_value_score"] == 45 and up["pg_mosaic_persona"].startswith("PG-2")  # booker 25 + $600+ 20
+    db.execute("UPDATE master_customers SET pw_bookings = 0, true_lifetime_spend = 300 WHERE cluster_id = %s "
+               "RETURNING *", (cust["cluster_id"],))
+    down = main.rescore_customer(db, db.fetchone())
+    assert down["bowler_value_score"] == 15 and down["pg_mosaic_persona"].startswith("PG-3")  # no ratchet
+
+
+def test_score_counts_separate_visit_days_and_recency(db, uid):
+    db.execute("INSERT INTO master_customers (cluster_id, email, md_city, zip5) "
+               "VALUES (nextval('master_cluster_id_seq'), %s, 'Novi', '48375') RETURNING *", (f"visits-{uid}@example.test",))
+    cust = db.fetchone()
+    for i, (days_ago, amt) in enumerate(((1, 20), (1, 15), (40, 30), (200, 25))):  # two payments on one day
+        db.execute("INSERT INTO unified_transactions (transaction_id, cluster_id, source_system, total_amount, "
+                   "transaction_date) VALUES (%s, %s, 'square', %s, NOW() - make_interval(days => %s))",
+                   (f"sq_pay_V{uid}{i}", cust["cluster_id"], amt, days_ago))
+    assert main.customer_facts(db, cust) == {"visit_days": 3, "recent": True}
+    assert main.rescore_customer(db, cust)["bowler_value_score"] == 15  # recent 10 + 3 separate days 5
+
+
+def test_qualified_bowler_carries_the_winning_goal(client, db, fake, uid, everyone_qualifies):
+    client.post("/webhooks/tripleseat", headers=WH, json={"event": {
+        "id": f"G{uid}", "first_name": "Org", "last_name": f"Planner{uid}", "status": "DEFINITE",
+        "email_address": f"org-{uid}@example.test", "event_date": "2026-12-22", "grand_total": "900",
+        "account": {"name": "Comerica Bank"}}})
+    qb = [e for e in fake.meta_events() if e["event_name"] == "Qualified_Bowler"]
+    assert len(qb) == 1 and qb[0]["custom_data"]["qb_goal"] == "corporate"
+    assert qb[0]["custom_data"]["pg_persona"].startswith("PG-1")
+    assert all("qb_goal" not in e["custom_data"] for e in fake.meta_events() if e["event_name"] != "Qualified_Bowler")
+
+
+def test_tripleseat_lead_then_definite_sends_one_of_each(client, db, fake, uid, everyone_qualifies):
+    base = {"first_name": "Grow", "last_name": f"Planner{uid}", "email_address": f"grow-{uid}@example.test"}
+    r = client.post("/webhooks/tripleseat", headers=WH, json={"lead": {
+        **base, "id": f"GL{uid}", "status": "prospect", "event_date": "12/19/2026"}}).json()
+    client.post("/webhooks/tripleseat", headers=WH, json={"event": {
+        **base, "id": f"GT{uid}", "status": "tentative", "event_date": "2026-12-19"}})   # same date, other format
+    client.post("/webhooks/tripleseat", headers=WH, json={"event": {
+        **base, "id": f"GT{uid}", "status": "DEFINITE", "event_date": "2026-12-19", "grand_total": "500"}})
+    cid = r["cluster_id"]
+    leads, qbs = capi_rows(db, f"lead_ts_{cid}_%"), capi_rows(db, f"qb_ts_{cid}_%")
+    assert [x["event_id"] for x in leads] == [f"lead_ts_{cid}_2026-12-19"]
+    assert [x["event_id"] for x in qbs] == [f"qb_ts_{cid}_2026-12-19"]
+    assert [e["event_name"] for e in fake.meta_events()] == ["Lead", "Qualified_Bowler"]
+
+
+def test_below_threshold_customer_still_joins_seed_audiences(client, db, fake, uid, monkeypatch):
+    monkeypatch.setattr(main, "get_threshold", lambda cur: 100)
+    client.post("/webhooks/webres", headers=WH, json={
+        "reservation_id": f"SA{uid}", "first_name": "Seed", "last_name": f"Only{uid}",
+        "email": f"seed-{uid}@example.test", "amount": 30})
+    assert capi_rows(db, f"qb_wr_SA{uid}") == []          # the event gate still applies
+    assert fake.count("/users") >= 1                      # the seed doesn't need the score
+
+
+def test_partywirks_webhook_uses_api_and_counts_once(client, db, fake, uid, everyone_qualifies):
     oid = f"26{int(uid, 16)}"
     body = fake.add_partywirks(uid, oid, package="BIRTHDAY EXTRAVAGANZA", event_date="2026-12-05")
     body["data"] = {"order_id": oid}  # even a bare notification works: details come from the API
@@ -491,7 +553,7 @@ def test_catch_up_retries_when_customer_lookup_fails(db, fake, uid, monkeypatch)
     assert db.fetchone()["md_address1"]
 
 
-def test_catch_up_pushes_recovered_customers_to_audiences(db, fake, uid, monkeypatch):
+def test_catch_up_pushes_recovered_customers_to_audiences(db, fake, uid, monkeypatch, everyone_qualifies):
     monkeypatch.setattr(main.time, "sleep", lambda s: None)
     fake.add_partywirks(uid, f"60{int(uid, 16)}", event_date="2099-04-01", created_at="2026-11-16 09:00:00")
     main.run_partywirks_sync(days_back=1, count_bookings_created_since="2026-11-15 00:00:00")
@@ -870,7 +932,7 @@ def test_melissa_geocode_fills_distance_and_census_once(client, db, fake, uid):
         assert ok["md_city"] == "Farmington Hills" and float(ok["distance_miles"]) < 2
         assert ok["md_census_tract"] == "152300" and ok["md_unified_school_district_name"] == "Farmington Public School District"
         assert ok["md_results"].endswith(",GEO_TRIED") and "VS40" not in ok["md_results"]
-        assert det["zip5"] == "48226" and det["bowler_value_score"] == 25      # verified into an excluded area
+        assert det["zip5"] == "48226" and det["pg_mosaic_persona"].startswith("PG-4")  # verified into an excluded area
         before = fake.count("personator.melissadata.net")
         client.post("/cron/melissa-geocode?limit=2", headers={"X-CDP-Key": "test-cron-secret"})
         assert fake.count("personator.melissadata.net") - before <= 2            # ours are never re-sent

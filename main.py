@@ -103,6 +103,8 @@ AUDIENCE_PG1_CORP = os.getenv("AUDIENCE_PG1_CORP", "120246555016470358")
 AUDIENCE_PG2_FAMILIES = os.getenv("AUDIENCE_PG2_FAMILIES", "120246555006040358")
 AUDIENCE_PRIME_SUBURBS = os.getenv("AUDIENCE_PRIME_SUBURBS", "120246555019320358")
 AUDIENCE_ALL_NONDETROIT = os.getenv("AUDIENCE_ALL_NONDETROIT", "120246555027130358")
+# Optional 5th seed: High-Value Open Bowlers / Celebrations. Not uploaded until its Meta audience ID is set.
+AUDIENCE_PG3_CELEBRATIONS = os.getenv("AUDIENCE_PG3_CELEBRATIONS", "")
 
 ALLEY_LAT, ALLEY_LON = 42.4705, -83.3932
 EXCLUDED_CITIES = {
@@ -866,83 +868,201 @@ def run_melissa_and_versium_waterfall(first_name: str, last_name: str, email: st
 # Scoring
 # ---------------------------------------------------------------------------
 
-def score_and_assign_persona(cust: dict) -> tuple:
-    kids_raw = str(cust.get("md_presence_of_children") or "").strip().upper()
-    has_kids = (
-        kids_raw.startswith("Y")
-        or (kids_raw.startswith("CHILDREN") and "NO" not in kids_raw)
-        or int(cust.get("in_partywirks") or 0) == 1
-    )
+# Personas are first-match labels for reporting. The score is 0-100, recomputed from current facts every time
+# (it can go down), and is the best of three goal propensities: behaviour (proven money, shared by all three)
+# plus that goal's fit. Behaviour leads because it covers everyone and predicts far better than demographics.
+# Verified against the customer base on 2026-11-19 (spend-correlators-2026-11-19.md).
+PERSONA_CORPORATE = "PG-1: Corporate & Group Organisers"
+PERSONA_BIRTHDAY = "PG-2: Birthday Party Families"
+PERSONA_CELEBRATION = "PG-3: High-Value Open Bowlers / Celebrations"
+PERSONA_EXCLUDED = "PG-4: Excluded Geo (Detroit / Southfield / Downriver)"
+PERSONA_NOT_ENOUGH_DATA = "PG-5: Not Enough Data Yet"
 
-    income_str = str(cust.get("md_household_income") or "")
-    high_income = any(k in income_str for k in ["100,", "125,", "150,", "200,", "250,"])
-    mid_income = any(k in income_str for k in ["60,", "75,", "80,", "90,"])
+GOALS = ("birthday", "corporate", "celebration")
+TOP_QUARTER_SPEND = 279.0   # lifetime spend at the top quarter of spenders
+HIGH_SPEND = 600.0
+RECENT_DAYS = 90
+# Words that make an account named after its contact still an organisation ("Noonan Electrical Services").
+_ORG_WORDS = re.compile(
+    r"\b(inc|llc|ltd|corp|corporation|company|co|group|services?|foundation|church|school|academy|"
+    r"association|club|team|league|center|centre|council|society|university|college|hospital|clinic|"
+    r"dental|law|bank|insurance|realty|construction|electric(al)?|plumbing|consulting|solutions|"
+    r"partners|agency|department|dept|city|township|ministries|pta|pto)\b", re.I)
 
-    dist = cust.get("distance_miles")
-    total_spend = float(cust.get("true_lifetime_spend") or 0)
-    guest_count = int(cust.get("ts_max_guests") or 0)
-    excluded_geo = is_detroit_excluded(cust.get("md_city"), cust.get("zip5"))
 
-    is_corp = (
-        bool(cust.get("ts_account"))
-        or bool(cust.get("versium_b2b_company"))
-        or cust.get("md_delivery_indicator") == "B"
-        or guest_count >= 25
-    )
+def _letters(v) -> str:
+    return re.sub(r"[^a-z]", "", str(v or "").lower())
 
-    if is_corp:
-        persona = "PG-1: Corporate & Org Event Planners"
-    elif excluded_geo:
-        persona = "PG-5: Excluded Geo (Detroit / Southfield / Downriver)"
-    elif has_kids and high_income:
-        persona = "PG-2: Affluent Suburban Party Families"
-    elif has_kids:
-        persona = "PG-3: Core Suburban Family Bowlers"
-    elif cust.get("md_address1"):
-        persona = "PG-4: Adult Social, Date Night & League"
+
+def _band_floor(v) -> Optional[float]:
+    """Lower bound of a band like '$150,000-199,999', '$150,001+', '> $250,000', '< $20,000' or a raw number."""
+    s = str(v or "").strip()
+    if not s:
+        return None
+    if s.startswith("<"):
+        return 0.0
+    m = re.search(r"\d[\d,]*(\.\d+)?", s)
+    return float(m.group(0).replace(",", "")) if m else None
+
+
+def is_real_organisation(cust: dict) -> bool:
+    """A Tripleseat account that is an organisation, not the contact's own name, or a business mailing address."""
+    if cust.get("md_delivery_indicator") == "B":
+        return True
+    acct = str(cust.get("ts_account") or "").strip()
+    a = _letters(acct)
+    if len(a) < 2:
+        return False
+    fn, ln = _letters(cust.get("first_name")), _letters(cust.get("last_name"))
+    personal = (fn and fn in a) or (ln and ln in a) or a in (fn + ln, ln + fn)
+    return not personal or bool(_ORG_WORDS.search(acct))
+
+
+def is_party_booker(cust: dict) -> bool:
+    """A Partywirks booking, or a DEFINITE/CLOSED Tripleseat event."""
+    return int(cust.get("pw_bookings") or 0) > 0 or \
+        str(cust.get("ts_lead_status") or "").upper() in TRIPLESEAT_BOOKED_STATUSES
+
+
+def _fit_facts(cust: dict) -> dict:
+    """Demographic facts, Versium first and Melissa as fallback. Never ethnicity, religion, politics or credit."""
+    vf = cust.get("versium_lifestyle_flags") or {}
+    if isinstance(vf, str):
+        try:
+            vf = json.loads(vf)
+        except ValueError:
+            vf = {}
+    age = str(vf.get("age_range") or "")
+    income = _band_floor(vf.get("household_income"))
+    if income is None:
+        income = _band_floor(cust.get("md_household_income"))
+    home = _band_floor(vf.get("home_value"))
+    if home is None:
+        home = _band_floor(cust.get("versium_home_market_value"))
+    lor = vf.get("length_of_residence")
+    if lor:
+        tenure = lor in ("5-10 Years", "11-14 Years")
     else:
-        persona = "PG-6: Digital-Only (Need Versium Append)"
-
-    if excluded_geo and not is_corp:
-        return persona, 25
-
-    score = 30
-    if persona == "PG-1: Corporate & Org Event Planners":
-        score += 35
-    elif persona == "PG-2: Affluent Suburban Party Families":
-        score += 25
-    elif has_kids:
-        score += 15
-
-    if high_income:
-        score += 15
-    elif mid_income:
-        score += 10
-
-    if dist is not None and float(dist) <= 12.0 and not excluded_geo:
-        score += 15
-    if total_spend >= 400:
-        score += 15
-
-    return persona, min(100, score)
+        lo = _band_floor(cust.get("md_length_of_residence"))
+        tenure = lo is not None and 5 <= lo <= 11  # Melissa bands "5-6 years" .. "11-12 years"
+    kids = str(cust.get("md_children_age_range") or "")
+    dist = cust.get("distance_miles")
+    dist = float(dist) if dist is not None else None
+    return {
+        "age_35_55": age in ("35-45", "45-55"),
+        "age_35_65": age in ("35-45", "45-55", "55-65"),
+        "affluent": (income or 0) >= 150000 or (home or 0) >= 450000,
+        "tenure_5_14": tenure,
+        "kids_3_10": "3-5" in kids or "6-10" in kids,
+        "female": vf.get("gender") == "Female",
+        "married": vf.get("marital_status") == "Married",
+        "household_2": str(vf.get("household_size") or "") == "2",
+        "young_adult": vf.get("young_adult_in_household") == "Yes",
+        "within_5": dist is not None and dist <= 5,
+        "within_12": dist is not None and dist <= 12,
+        "within_15": dist is not None and dist <= 15,
+        "org": is_real_organisation(cust),
+    }
 
 
-def rescore_customer(cur, cust: dict, exact: bool = False) -> dict:
-    """Recalculates persona & score. Scores only ratchet upward unless `exact` (used by repairs)
-    or the customer is in an excluded area (always pinned to 25)."""
-    persona, score = score_and_assign_persona(cust)
-    cur.execute(
-        """
-        UPDATE master_customers
-        SET pg_mosaic_persona = %(persona)s,
-            bowler_value_score = CASE
-                WHEN %(exact)s OR %(score)s = 25 THEN %(score)s
-                ELSE GREATEST(COALESCE(bowler_value_score, 0), %(score)s)
-            END
-        WHERE cluster_id = %(cid)s RETURNING *;
-        """,
-        {"persona": persona, "score": score, "exact": exact, "cid": cust["cluster_id"]},
-    )
+def _near(f: dict, five: int, twelve: int, fifteen: int = 0) -> int:
+    return five if f["within_5"] else twelve if f["within_12"] else fifteen if f["within_15"] else 0
+
+
+def goal_fits(cust: dict) -> dict:
+    """Each goal's fit points (added to the shared behaviour points)."""
+    f = _fit_facts(cust)
+    birthday = (10 * f["age_35_55"] + 10 * f["kids_3_10"] + 5 * f["affluent"] + 5 * f["tenure_5_14"]
+                + 5 * f["female"] + _near(f, 10, 5) + 5 * f["married"] + 5 * f["household_2"]
+                - 10 * f["young_adult"])
+    corporate = 15 * f["org"] + 10 * f["age_35_65"] + 5 * f["female"] + _near(f, 10, 5, 2) + 5 * f["married"]
+    celebration = (_near(f, 10, 5) + 5 * f["age_35_55"] + 5 * f["affluent"] + 5 * f["tenure_5_14"]
+                   + 5 * f["household_2"] + 5 * f["married"])
+    return {"birthday": birthday, "corporate": corporate, "celebration": celebration}
+
+
+def behaviour_points(cust: dict, facts: dict) -> int:
+    """Proven money. `facts`: visit_days (separate days with a payment) and recent (bought/booked in 90 days)."""
+    spend = float(cust.get("true_lifetime_spend") or 0)
+    return (25 * is_party_booker(cust)
+            + (20 if spend >= HIGH_SPEND else 15 if spend >= TOP_QUARTER_SPEND else 0)
+            + 10 * bool(facts.get("recent"))
+            + 5 * (int(facts.get("visit_days") or 0) >= 3))
+
+
+def assign_persona(cust: dict, facts: dict) -> str:
+    f = _fit_facts(cust)
+    if f["org"] or str(cust.get("ts_lead_status") or "").upper() in TRIPLESEAT_BOOKED_STATUSES:
+        return PERSONA_CORPORATE
+    if int(cust.get("pw_bookings") or 0) > 0 or \
+            (f["kids_3_10"] and f["age_35_55"] and f["within_12"] and f["affluent"]):
+        return PERSONA_BIRTHDAY
+    if float(cust.get("true_lifetime_spend") or 0) >= TOP_QUARTER_SPEND or \
+            (int(facts.get("visit_days") or 0) >= 3 and f["within_15"]):
+        return PERSONA_CELEBRATION
+    if is_detroit_excluded(cust.get("md_city"), cust.get("zip5")):
+        return PERSONA_EXCLUDED
+    return PERSONA_NOT_ENOUGH_DATA
+
+
+_PERSONA_GOAL = {PERSONA_CORPORATE: "corporate", PERSONA_BIRTHDAY: "birthday"}
+
+
+def winning_goal(cust: dict, persona: Optional[str] = None) -> str:
+    """The goal with the best fit (behaviour is shared, so it doesn't change the winner). Ties go to the
+    persona's own goal, then celebration."""
+    fits = goal_fits(cust)
+    best = max(fits.values())
+    persona = persona if persona is not None else (cust.get("pg_mosaic_persona") or "")
+    preferred = [g for p, g in _PERSONA_GOAL.items() if persona.startswith(p[:4])]
+    for g in preferred + ["celebration", "birthday", "corporate"]:
+        if fits[g] == best:
+            return g
+    return "celebration"
+
+
+def score_and_assign_persona(cust: dict, facts: Optional[dict] = None) -> tuple:
+    """(persona, score). No free base: no behaviour and no fit scores 0."""
+    facts = facts or {}
+    behaviour = behaviour_points(cust, facts)
+    score = max(behaviour + fit for fit in goal_fits(cust).values())
+    return assign_persona(cust, facts), max(0, min(100, score))
+
+
+def _recent_date(v) -> bool:
+    d = ts_date(v) if isinstance(v, str) else (v.isoformat() if isinstance(v, (date, datetime)) else None)
+    if not d:
+        return False
+    try:
+        return (date.fromisoformat(d[:10]) - date.today()).days >= -RECENT_DAYS
+    except ValueError:
+        return False
+
+
+def customer_facts(cur, cust: dict) -> dict:
+    """Behaviour facts from the transaction ledger. Partywirks/Tripleseat ledger rows carry the date they were
+    first recorded (a backfill makes them all look recent), and WebRes rows from the Nov 16-17 backfill too,
+    so those sources' recency comes from the booking's own date (party/reservation/event, past 90 days or
+    upcoming). Several payments on one day (deposit + balance, split checks) are one visit."""
+    cur.execute("""SELECT COUNT(DISTINCT transaction_date::date) FILTER (
+                              WHERE total_amount > 0 AND source_system IN ('square', 'webres')) AS visit_days,
+                          COALESCE(BOOL_OR(total_amount > 0 AND source_system = 'square'
+                                           AND transaction_date >= NOW() - make_interval(days => %s)), FALSE) AS recent
+                   FROM unified_transactions WHERE cluster_id = %s;""", (RECENT_DAYS, cust["cluster_id"]))
+    row = cur.fetchone() or {}
+    booked_ts = str(cust.get("ts_lead_status") or "").upper() in TRIPLESEAT_BOOKED_STATUSES
+    recent = bool(row.get("recent")) or _recent_date(cust.get("wr_last_reservation_date")) or \
+        _recent_date(cust.get("pw_last_party_date")) or (booked_ts and _recent_date(cust.get("ts_last_event_date")))
+    return {"visit_days": int(row.get("visit_days") or 0), "recent": recent}
+
+
+def rescore_customer(cur, cust: dict, exact: bool = True) -> dict:
+    """Recomputes persona & score from the customer's current facts. Scores go down as well as up
+    (`exact` is kept for callers; there is no ratchet any more)."""
+    persona, score = score_and_assign_persona(cust, customer_facts(cur, cust))
+    cur.execute("UPDATE master_customers SET pg_mosaic_persona = %(persona)s, bowler_value_score = %(score)s "
+                "WHERE cluster_id = %(cid)s RETURNING *;",
+                {"persona": persona, "score": score, "cid": cust["cluster_id"]})
     return cur.fetchone()
 
 
@@ -981,24 +1101,39 @@ AUDIENCE_SCHEMA = ["EMAIL", "PHONE", "FN", "LN", "CT", "ST", "ZIP", "COUNTRY", "
 
 def audience_names() -> dict:
     return {AUDIENCE_ALL_NONDETROIT: "All Non-Detroit", AUDIENCE_PG1_CORP: "PG-1 Corporate",
-            AUDIENCE_PG2_FAMILIES: "PG-2 Families", AUDIENCE_PRIME_SUBURBS: "Prime Suburbs"}
+            AUDIENCE_PG2_FAMILIES: "PG-2 Families", AUDIENCE_PRIME_SUBURBS: "Prime Suburbs",
+            **({AUDIENCE_PG3_CELEBRATIONS: "PG-3 Celebrations"} if AUDIENCE_PG3_CELEBRATIONS else {})}
 
 
-def audience_targets(cust: dict) -> tuple:
-    """Which of the 4 audiences a customer belongs in, plus the LTV sent as LOOKALIKE_VALUE.
+def seed_memberships(cust: dict, facts: Optional[dict] = None) -> dict:
+    """Which goal seeds a customer belongs in. Built from who the customer is (overlapping, so a corporate
+    organiser with young kids is in both), never from the score cutoff or distance: the ad set's radius does the
+    geography, and a party-age family 20 miles away still teaches Meta what a birthday family looks like."""
+    f = _fit_facts(cust)
+    spend = float(cust.get("true_lifetime_spend") or 0)
+    booked_ts = str(cust.get("ts_lead_status") or "").upper() in TRIPLESEAT_BOOKED_STATUSES
+    return {
+        "corporate": f["org"] or booked_ts,
+        "birthday": int(cust.get("pw_bookings") or 0) > 0 or (f["kids_3_10"] and f["age_35_55"] and f["affluent"]),
+        "celebration": spend >= TOP_QUARTER_SPEND or int((facts or {}).get("visit_days") or 0) >= 3
+                       or (cust.get("pg_mosaic_persona") or "").startswith("PG-3"),
+    }
+
+
+def audience_targets(cust: dict, facts: Optional[dict] = None) -> tuple:
+    """Which audiences a customer belongs in, plus the LTV sent as LOOKALIKE_VALUE: their real lifetime spend.
     Excluded-area customers belong in none."""
     if is_detroit_excluded(cust.get("md_city"), cust.get("zip5")):
         return [], 0.0
-    persona = cust.get("pg_mosaic_persona") or ""
-    ltv = max(
-        float(cust.get("true_lifetime_spend") or 0),
-        450.0 if (cust.get("in_tripleseat") or cust.get("in_partywirks")) else 0.0,
-    )
+    ltv = float(cust.get("true_lifetime_spend") or 0)
+    seeds = seed_memberships(cust, facts)
     targets = [AUDIENCE_ALL_NONDETROIT]
-    if persona.startswith("PG-1") or cust.get("in_tripleseat") == 1 or ltv >= 600:
+    if seeds["corporate"]:
         targets.append(AUDIENCE_PG1_CORP)
-    if persona.startswith("PG-2") or cust.get("in_partywirks") == 1:
+    if seeds["birthday"]:
         targets.append(AUDIENCE_PG2_FAMILIES)
+    if seeds["celebration"]:
+        targets.append(AUDIENCE_PG3_CELEBRATIONS)
     if (cust.get("zip5") or "") in PRIME_SUBURB_ZIPS:
         targets.append(AUDIENCE_PRIME_SUBURBS)
     return [a for a in dict.fromkeys(targets) if a], ltv
@@ -1048,7 +1183,7 @@ def upload_audience_rows(aud_id: str, rows: list) -> dict:
 
 
 def sync_customer_to_meta_custom_audiences(cust: dict):
-    """Pushes one qualified non-excluded customer into the Meta value-based Custom Audiences they belong in."""
+    """Pushes one non-excluded customer into the Meta value-based Custom Audiences they belong in (any score)."""
     if not META_ACCESS_TOKEN or cust.get("enrich_after"):
         return  # a customer waiting for enrichment is synced by the worker once it's done
     targets, ltv = audience_targets(cust)
@@ -1107,6 +1242,9 @@ def fire_meta_capi_event(cur, cust: dict, event_name: str, value: float, thresho
             },
         }]
     }
+    if event_name == "Qualified_Bowler":
+        # Which goal won the score (birthday / corporate / celebration), for per-goal custom conversions.
+        payload["data"][0]["custom_data"]["qb_goal"] = winning_goal(cust)
     if value and float(value) > 0:
         # Only real money for this transaction. No money known = no value, never a made-up estimate:
         # Meta treats value as revenue in bidding and in reporting.
@@ -1951,11 +2089,12 @@ def handle_square_payment(cur, payment: dict, background_tasks: BackgroundTasks)
     cust, newly_enriched = upsert_and_enrich_customer(cur, data)
     cur.execute("UPDATE unified_transactions SET cluster_id = %s WHERE transaction_id = %s;",
                 (cust["cluster_id"], txn_id))
+    cust = rescore_customer(cur, cust)  # the score now includes this payment (visit, recency)
 
     thresh = get_threshold(cur)
     if net > 0 and not is_detroit_excluded(cust.get("md_city"), cust.get("zip5")):
         fire_meta_capi_event(cur, cust, "Purchase", net, thresh, event_id=txn_id, action_source="physical_store")
-        if cust["bowler_value_score"] >= thresh and newly_enriched:
+        if newly_enriched:
             background_tasks.add_task(sync_customer_to_meta_custom_audiences, dict(cust))
     return {"status": "payment_attributed", "cluster_id": cust["cluster_id"], "amount": net}
 
@@ -1985,7 +2124,7 @@ def handle_square_customer(cur, event_type: str, c_obj: dict, background_tasks: 
         "source": "Square_Customer",
     })
     thresh = get_threshold(cur)
-    if not is_detroit_excluded(cust.get("md_city"), cust.get("zip5")) and cust["bowler_value_score"] >= thresh:
+    if not is_detroit_excluded(cust.get("md_city"), cust.get("zip5")):
         background_tasks.add_task(sync_customer_to_meta_custom_audiences, dict(cust))
     return {"status": "customer_synced", "cluster_id": cust["cluster_id"]}
 
@@ -2061,6 +2200,7 @@ def handle_webres(data: dict, background_tasks: BackgroundTasks) -> dict:
                 })
                 cur.execute("UPDATE unified_transactions SET cluster_id = %s WHERE transaction_id = %s;",
                             (cust["cluster_id"], txn_id))
+                cust = rescore_customer(cur, cust)  # the score now includes this booking
                 thresh = get_threshold(cur)
 
                 if not is_detroit_excluded(cust.get("md_city"), cust.get("zip5")):
@@ -2069,7 +2209,7 @@ def handle_webres(data: dict, background_tasks: BackgroundTasks) -> dict:
                     if cust["bowler_value_score"] >= thresh or cust.get("enrich_after"):
                         fire_meta_capi_event(cur, cust, "Qualified_Bowler", amount, thresh,
                                              event_id=f"qb_wr_{booking_id}")
-                        background_tasks.add_task(sync_customer_to_meta_custom_audiences, dict(cust))
+                    background_tasks.add_task(sync_customer_to_meta_custom_audiences, dict(cust))
 
         return {"status": "webres_synced", "cluster_id": cust["cluster_id"], "score": cust["bowler_value_score"]}
     finally:
@@ -2096,7 +2236,7 @@ def _count_record_once(cur, cust: dict, txn_id: str, source_system: str, counter
         return cust, True
     cur.execute(f"UPDATE master_customers SET {counter} = COALESCE({counter}, 0) + 1 "
                 f"WHERE cluster_id = %s RETURNING *;", (cust["cluster_id"],))
-    return cur.fetchone(), True
+    return rescore_customer(cur, cur.fetchone()), True
 
 
 # Temporary (Nov 2026): learn what Tripleseat's webhooks contain before building the API sync.
@@ -2252,8 +2392,12 @@ def handle_tripleseat(raw: dict, background_tasks: BackgroundTasks) -> dict:
                                                  bump=bump)
 
                 thresh = get_threshold(cur)
+                excluded = is_detroit_excluded(cust.get("md_city"), cust.get("zip5"))
+                if not excluded:
+                    # Seeds are who the customer is (an organiser stays one after a lost event), not the score.
+                    background_tasks.add_task(sync_customer_to_meta_custom_audiences, dict(cust))
                 if (
-                    not is_detroit_excluded(cust.get("md_city"), cust.get("zip5"))
+                    not excluded
                     and (cust["bowler_value_score"] >= thresh or cust.get("enrich_after"))
                     and status not in ("LOST", "TURNED_DOWN")
                 ):
@@ -2261,14 +2405,13 @@ def handle_tripleseat(raw: dict, background_tasks: BackgroundTasks) -> dict:
                     # lead/event (a lead and the event it turns into share the date). Only a definite booking
                     # is a Qualified_Bowler, worth its contracted total (or no value); a prospect or tentative
                     # lead is a Lead with no value. A lead that later becomes definite sends both, once each.
-                    key = event_date or (f"{kind}_{record_id}" if record_id else "undated")
+                    key = ts_date(event_date) or event_date or (f"{kind}_{record_id}" if record_id else "undated")
                     if kind in ("event", "booking") and status in TRIPLESEAT_BOOKED_STATUSES:
                         fire_meta_capi_event(cur, cust, "Qualified_Bowler", tripleseat_contract_value(kind, obj),
                                              thresh, event_id=f"qb_ts_{cust['cluster_id']}_{key}")
                     else:
                         fire_meta_capi_event(cur, cust, "Lead", 0.0, thresh,
                                              event_id=f"lead_ts_{cust['cluster_id']}_{key}")
-                    background_tasks.add_task(sync_customer_to_meta_custom_audiences, dict(cust))
 
         return {
             "status": "tripleseat_synced",
@@ -3109,12 +3252,12 @@ def ingest_partywirks(cur, rec: dict, background_tasks: BackgroundTasks = None, 
     thresh = get_threshold(cur)
     if not is_new:
         retry_unsent_event(cur, f"qb_pw_{key}")  # a Meta failure last time gets another try
-    elif (count_booking and not is_detroit_excluded(cust.get("md_city"), cust.get("zip5"))
-            and (cust["bowler_value_score"] >= thresh or cust.get("enrich_after"))):
-        # The real order total, or no value. Not a Purchase: the deposit/balance arrive as Square payments,
-        # so a Partywirks Purchase would need the same twin check as WebRes (purchase_twin) first.
-        fire_meta_capi_event(cur, cust, "Qualified_Bowler", rec.get("total") or 0.0, thresh,
-                             event_id=f"qb_pw_{key}")
+    elif count_booking and not is_detroit_excluded(cust.get("md_city"), cust.get("zip5")):
+        if cust["bowler_value_score"] >= thresh or cust.get("enrich_after"):
+            # The real order total, or no value. Not a Purchase: the deposit/balance arrive as Square payments,
+            # so a Partywirks Purchase would need the same twin check as WebRes (purchase_twin) first.
+            fire_meta_capi_event(cur, cust, "Qualified_Bowler", rec.get("total") or 0.0, thresh,
+                                 event_id=f"qb_pw_{key}")
         if background_tasks is not None:
             background_tasks.add_task(sync_customer_to_meta_custom_audiences, dict(cust))
         else:
@@ -3344,8 +3487,7 @@ def enrich_pending_customer(conn, rec: dict) -> str:
                     "WHERE cluster_id = %s RETURNING *;", (rec["cluster_id"],))
         cust = rescore_customer(cur, cur.fetchone(), exact=True)
         released = release_deferred_events(cur, cust)
-        qualified = not is_detroit_excluded(cust.get("md_city"), cust.get("zip5")) and \
-            int(cust.get("bowler_value_score") or 0) >= get_threshold(cur)
+        qualified = not is_detroit_excluded(cust.get("md_city"), cust.get("zip5"))  # seeds don't need the score
     if qualified:
         try:
             sync_customer_to_meta_custom_audiences(dict(cust))

@@ -414,8 +414,8 @@ def test_tripleseat_api_sync_scores_with_the_booking_date(db, uid):
     assert how == "created" and cust["bowler_value_score"] == 35  # booker 25 + upcoming event 10
 
 
-def test_live_sync_puts_repeat_visitors_in_the_celebration_seed(db, fake, uid, monkeypatch):
-    monkeypatch.setattr(main, "AUDIENCE_PG3_CELEBRATIONS", "999000111")
+def test_live_sync_puts_repeat_visitors_in_broad_local(db, fake, uid, monkeypatch):
+    monkeypatch.setattr(main, "AUDIENCE_BROAD_LOCAL", "999000111")
     db.execute("INSERT INTO master_customers (cluster_id, email, md_city, zip5, true_lifetime_spend) "
                "VALUES (nextval('master_cluster_id_seq'), %s, 'Novi', '48375', 60) RETURNING *",
                (f"repeat-{uid}@example.test",))

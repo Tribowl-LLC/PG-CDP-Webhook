@@ -103,8 +103,9 @@ AUDIENCE_PG1_CORP = os.getenv("AUDIENCE_PG1_CORP", "120246555016470358")
 AUDIENCE_PG2_FAMILIES = os.getenv("AUDIENCE_PG2_FAMILIES", "120246555006040358")
 AUDIENCE_PRIME_SUBURBS = os.getenv("AUDIENCE_PRIME_SUBURBS", "120246555019320358")
 AUDIENCE_ALL_NONDETROIT = os.getenv("AUDIENCE_ALL_NONDETROIT", "120246555027130358")
-# Optional 5th seed: High-Value Open Bowlers / Celebrations. Not uploaded until its Meta audience ID is set.
-AUDIENCE_PG3_CELEBRATIONS = os.getenv("AUDIENCE_PG3_CELEBRATIONS", "")
+# Optional 5th seed: Broad Local (top-quarter spenders, frequent visitors, affluent 35-55). Not uploaded until its
+# Meta audience ID is set.
+AUDIENCE_BROAD_LOCAL = os.getenv("AUDIENCE_BROAD_LOCAL", "")
 
 ALLEY_LAT, ALLEY_LON = 42.4705, -83.3932
 EXCLUDED_CITIES = {
@@ -1119,20 +1120,22 @@ AUDIENCE_SCHEMA = ["EMAIL", "PHONE", "FN", "LN", "CT", "ST", "ZIP", "COUNTRY", "
 def audience_names() -> dict:
     return {AUDIENCE_ALL_NONDETROIT: "All Non-Detroit", AUDIENCE_PG1_CORP: "PG-1 Corporate",
             AUDIENCE_PG2_FAMILIES: "PG-2 Families", AUDIENCE_PRIME_SUBURBS: "Prime Suburbs",
-            **({AUDIENCE_PG3_CELEBRATIONS: "PG-3 Celebrations"} if AUDIENCE_PG3_CELEBRATIONS else {})}
+            **({AUDIENCE_BROAD_LOCAL: "Broad Local"} if AUDIENCE_BROAD_LOCAL else {})}
 
 
 def seed_memberships(cust: dict, facts: Optional[dict] = None) -> dict:
     """Which goal seeds a customer belongs in. Built from who the customer is (overlapping, so a corporate
     organiser with young kids is in both), never from the score cutoff or distance: the ad set's radius does the
-    geography, and a party-age family 20 miles away still teaches Meta what a birthday family looks like."""
+    geography, and a party-age family 20 miles away still teaches Meta what a birthday family looks like.
+    Never reads the stored persona label."""
     f = _fit_facts(cust)
     spend = float(cust.get("true_lifetime_spend") or 0)
     return {
         "corporate": f["org"] or ts_confirmed_booker(cust, facts),
         "birthday": int(cust.get("pw_bookings") or 0) > 0 or (f["kids_3_10"] and f["age_35_55"] and f["affluent"]),
-        "celebration": spend >= TOP_QUARTER_SPEND or int((facts or {}).get("visit_days") or 0) >= 3
-                       or (cust.get("pg_mosaic_persona") or "").startswith("PG-3"),
+        # Broad Local: the old celebration seed (top-quarter spend or 3+ visit days) plus the demographic gate.
+        "broad_local": spend >= TOP_QUARTER_SPEND or int((facts or {}).get("visit_days") or 0) >= 3
+                       or (f["age_35_55"] and f["affluent"]),
     }
 
 
@@ -1148,8 +1151,8 @@ def audience_targets(cust: dict, facts: Optional[dict] = None) -> tuple:
         targets.append(AUDIENCE_PG1_CORP)
     if seeds["birthday"]:
         targets.append(AUDIENCE_PG2_FAMILIES)
-    if seeds["celebration"]:
-        targets.append(AUDIENCE_PG3_CELEBRATIONS)
+    if seeds["broad_local"]:
+        targets.append(AUDIENCE_BROAD_LOCAL)
     if (cust.get("zip5") or "") in PRIME_SUBURB_ZIPS:
         targets.append(AUDIENCE_PRIME_SUBURBS)
     return [a for a in dict.fromkeys(targets) if a], ltv

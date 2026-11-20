@@ -3,7 +3,8 @@
 Qualifying = the same rule the webhooks use: not in an excluded area, and with an email or phone Meta
 can match on. Seeds are built from who the customer is (main.seed_memberships), not from the score
 threshold or distance. Re-uploading a customer who is already in an audience is harmless (Meta
-de-duplicates). Uploading adds members; it never removes anyone who no longer belongs.
+de-duplicates). Uploading adds members; it never removes anyone who no longer belongs. Each customer can be
+several rows: their own email/phone, then Versium's extra (incl. Facebook-linked) identifiers (main.audience_rows).
 
 Run it where META_ACCESS_TOKEN is available (e.g. `render ssh <service> --ephemeral`):
     python scripts/backfill_audiences.py --webhook-customers-only            # dry run: counts, uploads nothing
@@ -54,22 +55,24 @@ def run(apply: bool, webhook_only: bool = False):
         conn.close()
 
     rows_by_audience = collections.defaultdict(list)
+    customers_by_audience = collections.Counter()
     excluded = 0
     for c in customers:
         targets, ltv = main.audience_targets(c, {"visit_days": c["visit_days"], "ts_booked": c["ts_booked"]})
         if not targets:
             excluded += 1
             continue
-        row = main.audience_row(c, ltv)
+        rows = main.audience_rows(c, ltv)  # own email/phone first, then Versium's extra identifiers
+        customers_by_audience.update(targets)
         for aud in targets:
-            rows_by_audience[aud].append(row)
+            rows_by_audience[aud].extend(rows)
 
     names = main.audience_names()
     scope = "touched by a webhook" if webhook_only else "in total"
     print(f"{len(customers)} customers {scope} with an email/phone "
           f"({excluded} skipped as excluded area)")
     for aud, rows in rows_by_audience.items():
-        print(f"  {names.get(aud, aud)}: {len(rows)} customers")
+        print(f"  {names.get(aud, aud)}: {customers_by_audience[aud]} customers, {len(rows)} rows")
 
     if not apply:
         print("Dry run: nothing uploaded. Re-run with --apply to upload.")

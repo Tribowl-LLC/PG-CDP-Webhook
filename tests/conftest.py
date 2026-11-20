@@ -26,8 +26,10 @@ os.environ.update({
     "ENRICH_DELAY_MINUTES": "0",  # most flows enrich inside the webhook; deferred tests set it explicitly
 })
 os.environ.pop("VERSIUM_API_KEY", None)
+os.environ["VERSIUM_REQUIRED"] = "false"  # flows without a Versium key count as fully enriched; fix #9 tests opt in
 
 import main  # noqa: E402
+main._provider_sleep = lambda seconds: None  # no real backoff waits in tests
 
 
 class FakeResponse:

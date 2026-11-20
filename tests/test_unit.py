@@ -984,3 +984,136 @@ def test_tripleseat_booking_conversion_time_is_its_status_change():
     assert main.ts_conversion_time("booking", obj, "DEFINITE") == _dt(2026, 11, 19, 18, 30, tzinfo=_tz.utc)
     assert main.ts_conversion_time("event", {"created_at": "2026-11-19T18:30:00Z", "event_date": "12/05/2026"},
                                    "DEFINITE") == _dt(2026, 11, 19, 18, 30, tzinfo=_tz.utc)
+
+
+# --- Fix #9: provider retries, diagnosable failure logs ---------------------------------------
+
+import requests as _requests
+
+
+class _Resp:
+    def __init__(self, status, payload=None, text=None, headers=None):
+        self.status_code, self._payload = status, payload
+        self.text = text if text is not None else str(payload)
+        self.headers = headers or {}
+
+    def json(self):
+        if self._payload is None:
+            raise ValueError("no json")
+        return self._payload
+
+
+def _sequence(monkeypatch, answers):
+    """requests.get returns (or raises) each answer in turn; returns the list of calls made."""
+    calls, seq = [], list(answers)
+    def fake_get(url, **kw):
+        calls.append(url)
+        a = seq.pop(0)
+        if isinstance(a, Exception):
+            raise a
+        return a
+    monkeypatch.setattr(main.requests, "get", fake_get)
+    return calls
+
+
+V_OK = {"versium": {"results": [{"Phone": "2485550101"}]}}
+
+
+def test_transient_versium_failures_are_retried_until_it_answers(monkeypatch, caplog):
+    calls = _sequence(monkeypatch, [_requests.exceptions.ReadTimeout("slow"),
+                                    _Resp(500, {"versium": {"errors": ["internal"]}}), _Resp(200, V_OK)])
+    waits = []
+    monkeypatch.setattr(main, "_provider_sleep", waits.append)
+    out = {}
+    with caplog.at_level("INFO", logger="pg_cdp"):
+        res = main.versium_call("contact", {}, {"email": "a@example.test"}, outcome=out)
+    assert res == {"Phone": "2485550101"} and len(calls) == 3
+    assert waits == list(main.PROVIDER_BACKOFF_SECONDS)                      # short backoff between attempts
+    assert out["attempts"] == 3 and out["status"] == 200
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any("Versium contact failed (attempt 1 of 3): ReadTimeout" in m for m in msgs)
+    assert any("attempt 2 of 3): HTTP 500" in m and "internal" in m for m in msgs)   # status + body
+    assert any("answered (HTTP 200) on attempt 3 of 3" in m for m in msgs)
+
+
+def test_429_waits_for_retry_after(monkeypatch):
+    _sequence(monkeypatch, [_Resp(429, {"errors": ["rate"]}, headers={"Retry-After": "2"}), _Resp(200, V_OK)])
+    waits = []
+    monkeypatch.setattr(main, "_provider_sleep", waits.append)
+    assert main.versium_call("contact", {}, {}) == {"Phone": "2485550101"}
+    assert waits == [2.0]
+
+
+def test_permanent_versium_error_is_not_retried_and_logs_status_and_body(monkeypatch, caplog):
+    calls = _sequence(monkeypatch, [_Resp(400, {"versium": {"errors": ["Invalid output value"]}})])
+    out = {}
+    with caplog.at_level("ERROR", logger="pg_cdp"):
+        assert main.versium_call("demographic", {}, {}, outcome=out) is None
+    assert len(calls) == 1 and out["status"] == 400
+    rec = [r for r in caplog.records if "Versium demographic rejected" in r.getMessage()][0]
+    assert "HTTP 400" in rec.getMessage() and "Invalid output value" in rec.getMessage()
+
+
+def test_versium_giving_up_after_every_attempt_times_out(monkeypatch, caplog):
+    calls = _sequence(monkeypatch, [_requests.exceptions.ReadTimeout()] * 3)
+    with caplog.at_level("WARNING", logger="pg_cdp"):
+        assert main.versium_call("contact", {}, {}) is None
+    assert len(calls) == 3 and "giving up" in caplog.records[-1].getMessage()
+
+
+def test_melissa_rejection_is_not_retried_and_5xx_is(monkeypatch, caplog):
+    monkeypatch.setattr(main, "MELISSA_API_KEY", "k")
+    monkeypatch.setattr(main, "MELISSA_ACT", "Check,Verify,Append")
+    calls = _sequence(monkeypatch, [_Resp(200, {"TransmissionResults": "GE05", "Records": [{}]})])
+    out = {}
+    with caplog.at_level("ERROR", logger="pg_cdp"):
+        assert main.melissa_lookup("A", "B", "a@example.test", "", outcome=out) == {}
+    assert len(calls) == 1 and out["result"] == "rejected:GE05"
+    assert any("TransmissionResults=GE05" in r.getMessage() for r in caplog.records)
+    calls = _sequence(monkeypatch, [_Resp(503, None, text="Service Unavailable"),
+                                    _Resp(200, {"Records": [{"Results": "AS01", "City": "Novi"}]})])
+    out = {}
+    assert main.melissa_lookup("A", "B", "a@example.test", "", "1 Main St", "Novi", "MI", "48375",
+                               outcome=out)["md_results"] == "AS01"
+    assert len(calls) == 2 and out["result"] == "answered"
+
+
+def test_melissa_http_error_logs_status_and_body(monkeypatch, caplog):
+    monkeypatch.setattr(main, "MELISSA_API_KEY", "k")
+    monkeypatch.setattr(main, "MELISSA_ACT", "Check,Verify,Append")
+    _sequence(monkeypatch, [_Resp(403, None, text="Forbidden: license expired")])
+    with caplog.at_level("ERROR", logger="pg_cdp"):
+        assert main.melissa_lookup("A", "B", "a@example.test", "") == {}
+    msg = [r.getMessage() for r in caplog.records if "Melissa Personator failed" in r.getMessage()][0]
+    assert "HTTP 403" in msg and "license expired" in msg
+
+
+def test_melissa_without_any_input_spends_nothing(monkeypatch):
+    monkeypatch.setattr(main, "MELISSA_API_KEY", "k")
+    monkeypatch.setattr(main, "MELISSA_ACT", "Check,Verify,Append")
+    calls = _sequence(monkeypatch, [])
+    out = {}
+    assert main.melissa_lookup("A", "B", "", "", outcome=out) == {} and calls == [] and out["result"] == "skipped_no_inputs"
+
+
+def test_logged_bodies_carry_no_contact_details():
+    red = main._redact("bad email jane.doe@example.com phone (248) 555-0101 " + "x" * 400)
+    assert "jane.doe" not in red and "555-0101" not in red and len(red) <= 300
+
+
+def test_missing_versium_key_is_a_failure_when_versium_is_required(monkeypatch):
+    monkeypatch.setattr(main, "VERSIUM_API_KEY", None)
+    monkeypatch.setattr(main, "VERSIUM_REQUIRED", True)
+    res = main.run_versium_enrichment({}, "A", "B", "a@example.test", "", "", "Novi", "MI", "48375", {}, 0)
+    assert res["_versium_failed"] and res["_outcome"]["versium"] == "failed:not_configured"
+    monkeypatch.setattr(main, "VERSIUM_REQUIRED", False)
+    assert not main.run_versium_enrichment({}, "A", "B", "a@example.test", "", "", "Novi", "MI", "48375", {}, 0).get("_versium_failed")
+
+
+def test_enrichment_complete_needs_a_versium_answer(monkeypatch):
+    monkeypatch.setattr(main, "VERSIUM_REQUIRED", True)
+    assert not main.enrichment_complete({"md_city": "Novi", "zip5": "48375", "versium_lifestyle_flags": {}})
+    assert not main.enrichment_complete({"versium_lifestyle_flags": {"_versium_contact_done": "2026-11-20"}})
+    assert main.enrichment_complete({"versium_lifestyle_flags": {"_versium_checked": "2026-11-20"}})
+    assert main.enrichment_complete({"versium_lifestyle_flags": {"_source": "csv"}})
+    assert main.enrichment_complete({"md_city": "Detroit", "zip5": "48201"})      # Versium never runs there

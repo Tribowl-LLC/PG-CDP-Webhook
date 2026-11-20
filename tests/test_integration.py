@@ -2464,3 +2464,24 @@ def test_webres_and_partywirks_keys_work_as_before(client, db, fake, uid):
     assert client.post("/webhooks/partywirks?key=test-webhook-secret", json=pw).status_code == 200
     assert client.post("/webhooks/partywirks", headers=WH, json=pw).status_code == 200
     assert client.post("/webhooks/partywirks", json=pw).status_code == 401
+
+
+def test_body_only_scheme_can_never_replace_the_shared_key(client, db, fake, uid, ts_signing, monkeypatch, caplog):
+    monkeypatch.setattr(main, "TRIPLESEAT_SIGNATURE_ENFORCE", True, raising=False)
+    monkeypatch.setattr(main, "TRIPLESEAT_SIGNATURE_SCHEME", "body:hex", raising=False)
+    body = _ts_lead_body(uid)
+    replay = f"t=1,v1={_ts_sig(body, '1', 'body')}"                        # captured long ago, timestamp unsigned
+    with caplog.at_level("INFO", logger="pg_cdp"):
+        assert _post_ts(client, body, replay, key=False).status_code == 401   # no key: refused
+        assert _post_ts(client, body, replay).status_code == 200             # with the key: check-only as before
+    assert "not a timestamp-signed construction" in caplog.text and "can't replace the shared key" in caplog.text
+
+
+def test_non_finite_signature_timestamps_do_not_crash(client, db, fake, uid, ts_signing, monkeypatch):
+    body = _ts_lead_body(uid)
+    for t in ("nan", "inf", "-inf", "1e999", "abc"):
+        assert _post_ts(client, body, f"t={t},v1=deadbeef").status_code == 200, t          # check-only + key
+    monkeypatch.setattr(main, "TRIPLESEAT_SIGNATURE_ENFORCE", True, raising=False)
+    monkeypatch.setattr(main, "TRIPLESEAT_SIGNATURE_SCHEME", "t.body:hex", raising=False)
+    for t in ("nan", "1e999"):
+        assert _post_ts(client, body, f"t={t},v1={_ts_sig(body, t)}", key=False).status_code == 401, t

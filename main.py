@@ -3567,13 +3567,17 @@ def tripleseat_signature_scheme(body: bytes, header: str, secret: str, only: str
 
 
 def _signature_skew(t: Optional[str]) -> Optional[int]:
+    """Seconds between the signed timestamp and our clock, or None when it isn't a usable number (nan, inf,
+    1e999, text), so a malformed header follows the normal MISMATCH / 401 path instead of a 500."""
     try:
         ts = float(t)
-    except (TypeError, ValueError):
+        if not math.isfinite(ts):
+            return None
+        if ts > 1e12:  # milliseconds
+            ts /= 1000.0
+        return int(time.time() - ts)
+    except (TypeError, ValueError, OverflowError):
         return None
-    if ts > 1e12:  # milliseconds
-        ts /= 1000.0
-    return int(time.time() - ts)
 
 
 def check_tripleseat_signature(request: Request, body: bytes) -> bool:
@@ -3585,16 +3589,24 @@ def check_tripleseat_signature(request: Request, body: bytes) -> bool:
             log.error("TRIPLESEAT_SIGNATURE_ENFORCE is on but TRIPLESEAT_WEBHOOK_SECRET is not set: refusing")
             raise HTTPException(status_code=401, detail="Unauthorized")
         return False
-    enforce = TRIPLESEAT_SIGNATURE_ENFORCE and bool(TRIPLESEAT_SIGNATURE_SCHEME)
-    if TRIPLESEAT_SIGNATURE_ENFORCE and not TRIPLESEAT_SIGNATURE_SCHEME:
-        log.error("TRIPLESEAT_SIGNATURE_ENFORCE is on but TRIPLESEAT_SIGNATURE_SCHEME is not set: still check-only")
+    # Only a construction that signs the timestamp can replace the shared key: with a body-only signature a captured
+    # delivery could be replayed forever. Body-only candidates stay available for diagnostics (check-only).
+    pinned_ok = bool(TRIPLESEAT_SIGNATURE_SCHEME) and TRIPLESEAT_SIGNATURE_SCHEME.split(":")[0] in ("t.body", "tbody")
+    enforce = TRIPLESEAT_SIGNATURE_ENFORCE and pinned_ok
+    if TRIPLESEAT_SIGNATURE_ENFORCE and not pinned_ok:
+        log.error("TRIPLESEAT_SIGNATURE_ENFORCE is on but TRIPLESEAT_SIGNATURE_SCHEME is %s: still check-only",
+                  "not set" if not TRIPLESEAT_SIGNATURE_SCHEME else "not a timestamp-signed construction")
     header = request.headers.get("x-signature", "")
     t, sigs = parse_tripleseat_signature(header)
     skew = _signature_skew(t)
     scheme = tripleseat_signature_scheme(body, header, TRIPLESEAT_WEBHOOK_SECRET,
                                          only=TRIPLESEAT_SIGNATURE_SCHEME if enforce else None)
     fresh = skew is not None and abs(skew) <= TRIPLESEAT_SIGNATURE_MAX_SKEW_SECONDS
-    if scheme and (fresh or scheme.startswith("body:")):
+    if scheme and scheme.startswith("body:"):
+        log.info("Tripleseat signature verified (scheme %s: the timestamp is not signed, so it can't replace the "
+                 "shared key); not enforced", scheme)
+        return False
+    if scheme and fresh:
         log.info("Tripleseat signature verified (scheme %s, timestamp skew %ss)%s", scheme, skew,
                  "" if enforce else "; not enforced yet")
         return enforce

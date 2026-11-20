@@ -98,14 +98,15 @@ ENRICH_MAX_ATTEMPTS = 5            # Versium failures retried 15, 30, 45, 60 min
 ENRICH_WORKER_INTERVAL_SECONDS = 60
 ENRICH_BATCH = 20                  # customers per worker run
 
-# Your 4 Live Non-Detroit Meta Custom Audience IDs
-AUDIENCE_PG1_CORP = os.getenv("AUDIENCE_PG1_CORP", "120246555016470358")
-AUDIENCE_PG2_FAMILIES = os.getenv("AUDIENCE_PG2_FAMILIES", "120246555006040358")
+# The live Meta Custom Audiences (non-Detroit). The env var names are historical: AUDIENCE_PG1_CORP is the
+# Corporate audience and AUDIENCE_PG2_FAMILIES the Birthday audience (both recreated 2026-11-20, replacing the old
+# PG-1 / PG-2 audiences). Defaults are the current IDs; Render sets the same values.
+AUDIENCE_PG1_CORP = os.getenv("AUDIENCE_PG1_CORP", "120246630337620358")       # Corporate
+AUDIENCE_PG2_FAMILIES = os.getenv("AUDIENCE_PG2_FAMILIES", "120246630337610358")  # Birthday
 AUDIENCE_PRIME_SUBURBS = os.getenv("AUDIENCE_PRIME_SUBURBS", "120246555019320358")
-AUDIENCE_ALL_NONDETROIT = os.getenv("AUDIENCE_ALL_NONDETROIT", "120246555027130358")
-# Optional 5th seed: Broad Local (top-quarter spenders, frequent visitors, affluent 35-55). Not uploaded until its
-# Meta audience ID is set.
-AUDIENCE_BROAD_LOCAL = os.getenv("AUDIENCE_BROAD_LOCAL", "")
+AUDIENCE_ALL_NONDETROIT = os.getenv("AUDIENCE_ALL_NONDETROIT", "120246555027130358")  # Master
+# Broad Local (top-quarter spenders, frequent visitors, affluent 35-55). Empty = not uploaded.
+AUDIENCE_BROAD_LOCAL = os.getenv("AUDIENCE_BROAD_LOCAL", "120246630337600358")
 
 ALLEY_LAT, ALLEY_LON = 42.4705, -83.3932
 EXCLUDED_CITIES = {
@@ -1118,8 +1119,8 @@ AUDIENCE_SCHEMA = ["EMAIL", "PHONE", "FN", "LN", "CT", "ST", "ZIP", "COUNTRY", "
 
 
 def audience_names() -> dict:
-    return {AUDIENCE_ALL_NONDETROIT: "All Non-Detroit", AUDIENCE_PG1_CORP: "PG-1 Corporate",
-            AUDIENCE_PG2_FAMILIES: "PG-2 Families", AUDIENCE_PRIME_SUBURBS: "Prime Suburbs",
+    return {AUDIENCE_ALL_NONDETROIT: "Master (All Non-Detroit)", AUDIENCE_PG1_CORP: "Corporate",
+            AUDIENCE_PG2_FAMILIES: "Birthday", AUDIENCE_PRIME_SUBURBS: "Prime Suburbs",
             **({AUDIENCE_BROAD_LOCAL: "Broad Local"} if AUDIENCE_BROAD_LOCAL else {})}
 
 
@@ -1158,10 +1159,24 @@ def audience_targets(cust: dict, facts: Optional[dict] = None) -> tuple:
     return [a for a in dict.fromkeys(targets) if a], ltv
 
 
-def audience_row(cust: dict, ltv: float) -> list:
-    return [
-        sha256_hash(cust.get("email")),
-        sha256_hash(meta_phone(cust.get("phone"))),
+# Extra rows per customer beyond the first (each carries one more email and/or phone).
+AUDIENCE_EXTRA_ROWS_MAX = 10
+
+
+def audience_rows(cust: dict, ltv: float) -> list:
+    """The customer's audience rows. The upload schema holds one email and one phone per row, so every other
+    known identifier goes on an extra row with the same name/city/state/zip and LOOKALIKE_VALUE; Meta matches
+    each row to the same person. Extras: Versium's alternate emails/phones and its Facebook-linked emails/phones
+    (already SHA-256, sent as they are), the same identifiers the CAPI events carry (build_meta_user_identifiers).
+    The first row is always the customer's own email and phone."""
+    first_email = sha256_hash(cust.get("email"))
+    first_phone = sha256_hash(meta_phone(cust.get("phone")))
+    v_em, v_ph = versium_meta_hashes(cust)
+    emails = [sha256_hash(e) for e in cust.get("versium_alt_emails") or [] if e] + v_em
+    phones = [sha256_hash(meta_phone(p)) for p in cust.get("versium_alt_phones") or [] if meta_phone(p)] + v_ph
+    emails = [e for e in dict.fromkeys(emails) if e and e != first_email]
+    phones = [p for p in dict.fromkeys(phones) if p and p != first_phone]
+    rest = [
         sha256_hash(cust.get("first_name")),
         sha256_hash(cust.get("last_name")),
         sha256_hash(meta_city(cust.get("md_city"))),
@@ -1170,6 +1185,10 @@ def audience_row(cust: dict, ltv: float) -> list:
         sha256_hash("us"),
         round(ltv, 2),
     ]
+    rows = [[first_email, first_phone] + rest]
+    for i in range(min(max(len(emails), len(phones)), AUDIENCE_EXTRA_ROWS_MAX)):
+        rows.append([emails[i] if i < len(emails) else "", phones[i] if i < len(phones) else ""] + rest)
+    return rows
 
 
 def upload_audience_rows(aud_id: str, rows: list) -> dict:
@@ -1217,9 +1236,9 @@ def sync_customer_to_meta_custom_audiences(cust: dict, facts: Optional[dict] = N
         except Exception as e:
             log.warning("Audience sync could not read customer facts: %s", type(e).__name__)
     targets, ltv = audience_targets(cust, facts)
-    row = audience_row(cust, ltv)
+    rows = audience_rows(cust, ltv)
     for aud_id in targets:
-        upload_audience_rows(aud_id, [row])
+        upload_audience_rows(aud_id, rows)
 
 
 def fire_meta_capi_event(cur, cust: dict, event_name: str, value: float, threshold: int,

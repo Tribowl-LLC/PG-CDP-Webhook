@@ -165,7 +165,7 @@ def test_rejected_audience_upload_is_logged(fake, caplog):
     with caplog.at_level("ERROR", logger="pg_cdp"):
         res = main.upload_audience_rows(main.AUDIENCE_PG1_CORP, [["x"] * 9])
     assert res["ok"] is False
-    assert "PG-1 Corporate rejected (HTTP 500)" in caplog.text
+    assert "Corporate rejected (HTTP 500)" in caplog.text and "PG-1" not in caplog.text
 
 
 def test_accepted_audience_upload_reports_counts(fake, monkeypatch):
@@ -872,3 +872,46 @@ def test_stored_personas_never_affect_seed_membership():
         base = main.seed_memberships(cust, {"visit_days": 1})
         for label in labels:
             assert main.seed_memberships({**cust, "pg_mosaic_persona": label}, {"visit_days": 1}) == base, label
+
+
+# --- Audience uploads carry every known identifier ---------------------------------------------
+
+H = lambda v: main.sha256_hash(v)
+FB_E = ["a" * 64, "b" * 64]
+FB_P = ["c" * 64]
+
+
+def test_audience_rows_add_versium_identifiers_as_extra_rows():
+    cust = {"email": "Own@Example.test", "phone": "(248) 555-0101", "first_name": "Ann", "last_name": "Lee",
+            "md_city": "Novi", "md_state": "MI", "zip5": "48375",
+            "versium_alt_emails": ["alt@example.test", "own@example.test"],   # the own email isn't repeated
+            "versium_alt_phones": ["248-555-0199"],
+            "versium_online_audience": {"facebook": {"email": FB_E + ["NOT-A-HASH"], "phone": FB_P + FB_P}}}
+    rows = main.audience_rows(cust, 432.1)
+    assert all(len(r) == len(main.AUDIENCE_SCHEMA) for r in rows)
+    assert rows[0][:2] == [H("own@example.test"), H(main.meta_phone("2485550101"))]   # own details first
+    extra_emails = [r[0] for r in rows[1:] if r[0]]
+    extra_phones = [r[1] for r in rows[1:] if r[1]]
+    assert extra_emails == [H("alt@example.test")] + FB_E                    # Facebook hashes sent as they are
+    assert extra_phones == [H(main.meta_phone("248-555-0199"))] + FB_P       # no duplicates
+    assert len(rows) == 1 + 3
+    assert all(r[2:] == rows[0][2:] for r in rows)                           # same name/place and LOOKALIKE_VALUE
+    assert rows[0][-1] == 432.1
+
+
+def test_audience_rows_without_extras_is_one_row():
+    rows = main.audience_rows({"email": "solo@example.test", "zip5": "48375"}, 0)
+    assert len(rows) == 1 and rows[0][0] == H("solo@example.test") and rows[0][1] == ""
+
+
+def test_audience_rows_cap_extra_identifiers():
+    many = {"email": "x@example.test",
+            "versium_online_audience": {"facebook": {"email": [f"{i:064x}" for i in range(30)]}}}
+    assert len(main.audience_rows(many, 0)) == 1 + main.AUDIENCE_EXTRA_ROWS_MAX
+
+
+def test_audience_labels_are_the_new_names():
+    names = main.audience_names()
+    assert names[main.AUDIENCE_PG1_CORP] == "Corporate" and names[main.AUDIENCE_PG2_FAMILIES] == "Birthday"
+    assert names[main.AUDIENCE_BROAD_LOCAL] == "Broad Local"
+    assert not any("PG-" in n for n in names.values())

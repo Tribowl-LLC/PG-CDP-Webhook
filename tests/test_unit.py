@@ -1423,6 +1423,8 @@ def test_access_log_never_shows_a_key():
 # are replaced, so "the correct key works" means the request got past authentication (anything but 401).
 
 import pytest  # noqa: E402
+import re  # noqa: E402
+from fastapi import Request  # noqa: E402
 
 CRON_KEY_ROUTES = [  # every route guarded by require_cron_key
     ("GET", "/oauth/tripleseat/login"), ("GET", "/cron/tripleseat-status"), ("POST", "/cron/sync-tripleseat"),
@@ -1430,7 +1432,7 @@ CRON_KEY_ROUTES = [  # every route guarded by require_cron_key
     ("POST", "/cron/melissa-geocode"), ("POST", "/cron/versium-enrich"), ("POST", "/cron/versium-online-audience"),
     ("POST", "/cron/adjust-thermostat"), ("POST", "/cron/sync-partywirks"), ("POST", "/cron/sync-square-catalog"),
     ("POST", "/cron/retry-webhooks"), ("POST", "/cron/melissa-batch"),
-    ("POST", "/cron/melissa-batch/999999/emailed"),
+    ("POST", "/cron/melissa-batch/{batch_id}/emailed"),
 ]
 FAKE_CRON_KEY, FAKE_HOOK_KEY = "fake-cron-key-for-tests", "fake-webhook-key-for-tests"
 
@@ -1449,22 +1451,61 @@ def cron_client(monkeypatch):
     return TestClient(main.app, raise_server_exceptions=False)
 
 
+def _norm_path(path: str) -> str:
+    """A route template with every path parameter as "{}", so templates compare whatever their parameter names."""
+    return re.sub(r"\{[^}]*\}", "{}", path)
+
+
 def _call(client, method, path, header=None, query=None):
-    url = path + (f"?key={query}" if query is not None else "")
+    url = re.sub(r"\{[^}]*\}", "999999", path) + (f"?key={query}" if query is not None else "")
     headers = {"X-CDP-Key": header} if header is not None else {}
     return client.request(method, url, headers=headers, follow_redirects=False)
 
 
-def test_cron_route_list_is_complete():
+def _cron_route_problems(app, expected) -> dict:
+    """Routes guarded by require_cron_key that the list misses, and /cron/* routes (parametrised ones included)
+    that aren't in the list, i.e. that are not known to be guarded."""
     import inspect
-    guarded = set()
-    for r in main.app.routes:
-        if getattr(r, "endpoint", None) and "require_cron_key(" in inspect.getsource(r.endpoint):
-            for m in r.methods - {"HEAD"}:
-                guarded.add((m, r.path.replace("{batch_id}", "999999")))
-    assert guarded == set(CRON_KEY_ROUTES)
-    assert all(p in {x for _, x in CRON_KEY_ROUTES} for r in main.app.routes
-               for p in [getattr(r, "path", "")] if p.startswith("/cron/") and "{" not in p)
+    want = {(m, _norm_path(p)) for m, p in expected}
+    guarded, cron = set(), set()
+    for r in app.routes:
+        path, endpoint = getattr(r, "path", ""), getattr(r, "endpoint", None)
+        if not endpoint:
+            continue
+        for m in (getattr(r, "methods", None) or set()) - {"HEAD"}:
+            key = (m, _norm_path(path))
+            if "require_cron_key(" in inspect.getsource(endpoint):
+                guarded.add(key)
+            if path.startswith("/cron/"):
+                cron.add(key)
+    return {"guarded_not_listed": guarded - want, "listed_not_guarded": want - guarded,
+            "cron_route_not_listed": cron - want}
+
+
+def test_cron_route_list_is_complete():
+    assert _cron_route_problems(main.app, CRON_KEY_ROUTES) == {
+        "guarded_not_listed": set(), "listed_not_guarded": set(), "cron_route_not_listed": set()}
+
+
+def test_route_guard_check_catches_unguarded_plain_and_parametrised_routes():
+    from fastapi import FastAPI
+    app = FastAPI()
+
+    @app.post("/cron/guarded/{thing_id}/run")
+    def guarded(thing_id: int, request: Request):
+        main.require_cron_key(request)
+
+    @app.post("/cron/future-thing")
+    def unguarded_plain():
+        return {}
+
+    @app.post("/cron/future-thing/{thing_id}/run")
+    def unguarded_param(thing_id: int):
+        return {}
+
+    problems = _cron_route_problems(app, [("POST", "/cron/guarded/{other_name}/run")])
+    assert problems["cron_route_not_listed"] == {("POST", "/cron/future-thing"), ("POST", "/cron/future-thing/{}/run")}
+    assert problems["guarded_not_listed"] == set() and problems["listed_not_guarded"] == set()
 
 
 def test_unset_cron_secret_refuses_every_cron_route(cron_client, monkeypatch, caplog):

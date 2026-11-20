@@ -1416,3 +1416,165 @@ def test_access_log_never_shows_a_key():
     main._RedactKeyInAccessLog().filter(rec2)
     assert "fake-cron-key" not in rec2.getMessage()
     assert any(isinstance(f, main._RedactKeyInAccessLog) for f in _logging.getLogger("uvicorn.access").filters)
+
+
+# --- Cron key fails closed: an unset CRON_SECRET refuses every request (like WEBHOOK_SECRET since PR #35) ------
+# All keys below are obviously fake. Nothing reaches a database or the network: get_conn and outbound requests
+# are replaced, so "the correct key works" means the request got past authentication (anything but 401).
+
+import pytest  # noqa: E402
+import re  # noqa: E402
+from fastapi import Request  # noqa: E402
+
+CRON_KEY_ROUTES = [  # every route guarded by require_cron_key
+    ("GET", "/oauth/tripleseat/login"), ("GET", "/cron/tripleseat-status"), ("POST", "/cron/sync-tripleseat"),
+    ("POST", "/cron/enrich-partywirks"), ("POST", "/cron/recover-square-avs-zips"), ("POST", "/cron/census-geocode"),
+    ("POST", "/cron/melissa-geocode"), ("POST", "/cron/versium-enrich"), ("POST", "/cron/versium-online-audience"),
+    ("POST", "/cron/adjust-thermostat"), ("POST", "/cron/sync-partywirks"), ("POST", "/cron/sync-square-catalog"),
+    ("POST", "/cron/retry-webhooks"), ("POST", "/cron/melissa-batch"),
+    ("POST", "/cron/melissa-batch/{batch_id}/emailed"),
+]
+FAKE_CRON_KEY, FAKE_HOOK_KEY = "fake-cron-key-for-tests", "fake-webhook-key-for-tests"
+
+
+@pytest.fixture
+def cron_client(monkeypatch):
+    from fastapi.testclient import TestClient
+
+    def offline(*_a, **_k):
+        raise RuntimeError("offline in unit tests")
+    monkeypatch.setattr(main, "get_conn", offline)
+    monkeypatch.setattr(main.requests, "get", offline)
+    monkeypatch.setattr(main.requests, "post", offline)
+    monkeypatch.setattr(main, "CRON_SECRET", FAKE_CRON_KEY)
+    monkeypatch.setattr(main, "WEBHOOK_SECRET", FAKE_HOOK_KEY)
+    return TestClient(main.app, raise_server_exceptions=False)
+
+
+def _norm_path(path: str) -> str:
+    """A route template with every path parameter as "{}", so templates compare whatever their parameter names."""
+    return re.sub(r"\{[^}]*\}", "{}", path)
+
+
+def _call(client, method, path, header=None, query=None):
+    url = re.sub(r"\{[^}]*\}", "999999", path) + (f"?key={query}" if query is not None else "")
+    headers = {"X-CDP-Key": header} if header is not None else {}
+    return client.request(method, url, headers=headers, follow_redirects=False)
+
+
+def _cron_route_problems(app, expected) -> dict:
+    """Routes guarded by require_cron_key that the list misses, and /cron/* routes (parametrised ones included)
+    that aren't in the list, i.e. that are not known to be guarded."""
+    import inspect
+    want = {(m, _norm_path(p)) for m, p in expected}
+    guarded, cron = set(), set()
+    for r in app.routes:
+        path, endpoint = getattr(r, "path", ""), getattr(r, "endpoint", None)
+        if not endpoint:
+            continue
+        for m in (getattr(r, "methods", None) or set()) - {"HEAD"}:
+            key = (m, _norm_path(path))
+            if "require_cron_key(" in inspect.getsource(endpoint):
+                guarded.add(key)
+            if path.startswith("/cron/"):
+                cron.add(key)
+    return {"guarded_not_listed": guarded - want, "listed_not_guarded": want - guarded,
+            "cron_route_not_listed": cron - want}
+
+
+def test_cron_route_list_is_complete():
+    assert _cron_route_problems(main.app, CRON_KEY_ROUTES) == {
+        "guarded_not_listed": set(), "listed_not_guarded": set(), "cron_route_not_listed": set()}
+
+
+def test_route_guard_check_catches_unguarded_plain_and_parametrised_routes():
+    from fastapi import FastAPI
+    app = FastAPI()
+
+    @app.post("/cron/guarded/{thing_id}/run")
+    def guarded(thing_id: int, request: Request):
+        main.require_cron_key(request)
+
+    @app.post("/cron/future-thing")
+    def unguarded_plain():
+        return {}
+
+    @app.post("/cron/future-thing/{thing_id}/run")
+    def unguarded_param(thing_id: int):
+        return {}
+
+    problems = _cron_route_problems(app, [("POST", "/cron/guarded/{other_name}/run")])
+    assert problems["cron_route_not_listed"] == {("POST", "/cron/future-thing"), ("POST", "/cron/future-thing/{}/run")}
+    assert problems["guarded_not_listed"] == set() and problems["listed_not_guarded"] == set()
+
+
+def test_unset_cron_secret_refuses_every_cron_route(cron_client, monkeypatch, caplog):
+    monkeypatch.setattr(main, "CRON_SECRET", None)          # WEBHOOK_SECRET stays set: it must not rescue cron
+    with caplog.at_level("ERROR", logger="pg_cdp"):
+        for method, path in CRON_KEY_ROUTES:
+            for kw in ({}, {"header": FAKE_HOOK_KEY}, {"query": FAKE_HOOK_KEY}, {"header": "anything"}):
+                r = _call(cron_client, method, path, **kw)
+                assert r.status_code == 401, (method, path, kw, r.status_code)
+    assert "CRON_SECRET is not set: refusing POST /cron/adjust-thermostat" in caplog.text
+    assert "CRON_SECRET is not set: refusing GET /oauth/tripleseat/login" in caplog.text
+    assert FAKE_HOOK_KEY not in caplog.text and "anything" not in caplog.text
+
+
+def test_empty_cron_secret_also_refuses(cron_client, monkeypatch):
+    monkeypatch.setattr(main, "CRON_SECRET", "")
+    assert _call(cron_client, "POST", "/cron/retry-webhooks", header="").status_code == 401
+    assert _call(cron_client, "POST", "/cron/retry-webhooks", query="").status_code == 401
+
+
+def test_wrong_key_401_and_correct_key_passes_on_every_cron_route(cron_client, caplog):
+    with caplog.at_level("WARNING", logger="pg_cdp"):
+        for method, path in CRON_KEY_ROUTES:
+            assert _call(cron_client, method, path).status_code == 401, path
+            assert _call(cron_client, method, path, header="fake-wrong-key").status_code == 401, path
+            assert _call(cron_client, method, path, query="fake-wrong-key").status_code == 401, path
+            assert _call(cron_client, method, path, header=FAKE_HOOK_KEY).status_code == 401, path  # webhook key
+            assert _call(cron_client, method, path, header=FAKE_CRON_KEY).status_code != 401, path
+            assert _call(cron_client, method, path, query=FAKE_CRON_KEY).status_code != 401, path
+    assert "Rejected POST /cron/adjust-thermostat: wrong key (CRON_SECRET)" in caplog.text
+    assert "Rejected POST /cron/adjust-thermostat: no key (CRON_SECRET)" in caplog.text
+    assert "Rejected GET /oauth/tripleseat/login: wrong key (CRON_SECRET)" in caplog.text
+    for leak in ("fake-wrong-key", FAKE_CRON_KEY, FAKE_HOOK_KEY):
+        assert leak not in caplog.text
+
+
+def test_refused_cron_log_record_never_holds_the_key(cron_client, caplog):
+    with caplog.at_level("WARNING", logger="pg_cdp"):
+        _call(cron_client, "POST", "/cron/retry-webhooks", query="fake-supplied-key-123")
+    recs = [r for r in caplog.records if r.name == "pg_cdp" and "Rejected" in r.getMessage()]
+    assert recs and all("fake-supplied-key-123" not in r.getMessage() and
+                        "fake-supplied-key-123" not in repr(r.args) for r in recs)
+    assert "/cron/retry-webhooks" in recs[0].getMessage()
+
+
+def test_webhook_auth_unchanged_and_independent_of_cron_key(cron_client, monkeypatch):
+    # Webhook key: wrong 401, right one passes auth, cron key is not a webhook key.
+    for path in ("/webhooks/webres", "/webhooks/partywirks"):
+        assert cron_client.post(path, json={}).status_code == 401
+        assert cron_client.post(path, json={}, headers={"X-CDP-Key": "fake-wrong-key"}).status_code == 401
+        assert cron_client.post(path, json={}, headers={"X-CDP-Key": FAKE_CRON_KEY}).status_code == 401
+        assert cron_client.post(path, json={}, headers={"X-CDP-Key": FAKE_HOOK_KEY}).status_code != 401
+    # Unset WEBHOOK_SECRET still fails closed (PR #35), and a set CRON_SECRET doesn't rescue it ...
+    monkeypatch.setattr(main, "WEBHOOK_SECRET", None)
+    for path in ("/webhooks/webres", "/webhooks/tripleseat", "/webhooks/partywirks"):
+        assert cron_client.post(path, json={}, headers={"X-CDP-Key": FAKE_CRON_KEY}).status_code == 401
+    # ... nor does an unset WEBHOOK_SECRET affect cron.
+    assert _call(cron_client, "POST", "/cron/adjust-thermostat", header=FAKE_CRON_KEY).status_code != 401
+
+
+def test_access_log_redacts_a_cron_key_in_the_request_line():
+    rec = _logging.LogRecord("uvicorn.access", _logging.INFO, "", 0, '%s - "%s %s HTTP/%s" %d', (
+        "1.2.3.4:0", "POST", "/cron/retry-webhooks?key=fake-cron-key-in-url", "1.1", 401), None)
+    main._RedactKeyInAccessLog().filter(rec)
+    assert "fake-cron-key-in-url" not in rec.getMessage() and "/cron/retry-webhooks?key=<redacted>" in rec.getMessage()
+
+
+def test_health_still_reports_cron_key_check_without_the_value(cron_client, monkeypatch):
+    assert cron_client.get("/health").json()["cron_key_check"] is True
+    monkeypatch.setattr(main, "CRON_SECRET", None)
+    body = cron_client.get("/health").text
+    assert '"cron_key_check":false' in body and FAKE_CRON_KEY not in body

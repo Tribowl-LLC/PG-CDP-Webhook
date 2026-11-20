@@ -459,11 +459,14 @@ def _reject(request: Request, name: str, why: str):
 
 
 def _require_key(request: Request, expected: Optional[str], name: str):
+    """Fails closed: with the key unset every request is refused (401), the same as an unset WEBHOOK_SECRET.
+    A missing key must be a loud failure, never an open endpoint."""
     if not expected:
-        log.warning("%s is not set; %s is accepting unauthenticated requests", name, request.url.path)
-        return
-    if not hmac.compare_digest(_provided_key(request).encode(), expected.encode()):
-        _reject(request, name, "wrong key" if _provided_key(request) else "no key")
+        log.error("%s is not set: refusing %s %s", name, request.method, request.url.path)
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    provided = _provided_key(request)
+    if not hmac.compare_digest(provided.encode(), expected.encode()):
+        _reject(request, name, "wrong key" if provided else "no key")
 
 
 def require_webhook_key(request: Request):
@@ -488,7 +491,7 @@ def require_cron_key(request: Request):
 
 # Declared on every /cron/* route so the /docs page shows a "key" box for "Try it out".
 # The value itself is read from the request by require_cron_key (header X-CDP-Key or ?key=).
-CRON_KEY_PARAM = Query(None, description="Your CRON_SECRET (needed when it is set in Render)")
+CRON_KEY_PARAM = Query(None, description="Your CRON_SECRET (required; or send it as the X-CDP-Key header)")
 
 
 def square_signature(body: bytes, key: str, url: str) -> str:

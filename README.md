@@ -189,7 +189,7 @@ Manual Melissa.com uploads (requires `migrations/009`). Customers with a first a
 Failed-webhook retry (requires `migrations/010`). A Tripleseat webhook that fails still answers 500, but its full payload is kept in `webhook_dead_letters` (the same payload re-sent is stored once). Each is tied to its Tripleseat record (`record_key`, e.g. `event:123`): when a newer webhook for that record succeeds, older failed copies are marked `superseded` and never replayed, and the retry only replays the newest failed copy of a record. This call processes the open ones again, oldest first: a success is marked `resolved_at` with the result; a failure counts an attempt and stops being retried after 5 (it stays in the table with its last error). Returns `{checked, resolved, failed}`.
 `POST /cron/recover-square-avs-zips`
 Finds card billing ZIPs for Square profiles with no address and enriches them via Melissa.
-All `/cron/*` endpoints require `CRON_SECRET` (when set). The cron-job.org jobs must send it.
+All `/cron/*` endpoints and `/oauth/tripleseat/login` require `CRON_SECRET`, sent as the `X-CDP-Key` header (preferred) or `?key=`. If `CRON_SECRET` isn't set in Render they all refuse every request (401, logged as `CRON_SECRET is not set: refusing …`), so the cron-job.org jobs stop until it's set: before deploying, check `/health` shows `cron_key_check: true`. A refused call is logged with its path and reason (`no key` / `wrong key`), never the key.
 `POST /cron/sync-partywirks?days_back=3`
 Nightly catch-up: saves Partywirks reservations (party date from `days_back` days ago onward) that no webhook delivered. Runs in the background and logs its totals.
 `GET /health`
@@ -227,7 +227,7 @@ Webhook routes read the body asynchronously and run all blocking work in a worke
 2. Merge the PR (deploys).
 3. `DATABASE_URL=... python scripts/repair_after_deploy.py` (dry run), then again with `--apply`.
 4. Set `SQUARE_WEBHOOK_SIGNATURE_KEY` in Render.
-5. Set `WEBHOOK_SECRET` and `CRON_SECRET` in Render at the same time as adding the key to the WebRes/Tripleseat/Partywirks webhook URLs and the cron-job.org jobs.
+5. Set `WEBHOOK_SECRET` and `CRON_SECRET` in Render at the same time as adding the key to the WebRes/Tripleseat/Partywirks webhook URLs and the cron-job.org jobs. Both fail closed: with either unset, its endpoints refuse every request. Before a deploy goes live, `/health` must show `webhook_key_check: true` and `cron_key_check: true`.
 
 **Rotating `WEBHOOK_SECRET` (no 401s).** `CRON_SECRET` is separate and not part of this.
 1. In Render set `WEBHOOK_SECRET_PREVIOUS` = the current key and `WEBHOOK_SECRET` = a new random key (one save = one deploy).

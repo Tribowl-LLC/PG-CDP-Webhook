@@ -846,6 +846,9 @@ def run_versium_enrichment(result: dict, first_name: str, last_name: str, email:
         outcome["versium"] = "skipped_excluded_area"
         return result
     if not VERSIUM_API_KEY:
+        if versium_checked(known):
+            outcome["versium"] = "already"   # an answer already stored stays valid without the key
+            return result
         if VERSIUM_REQUIRED:
             # Not an answer: enrichment can't finish, so held events wait (and the customer is retried) instead
             # of being judged on a score that's missing Versium's data.
@@ -3884,10 +3887,19 @@ def run_partywirks_sync(days_back: int = 3, count_bookings_created_since: str = 
 _VERSIUM_MARKERS = ("_versium_checked", "_versium_contact_done", "_versium_demo_done")
 
 
+def versium_queryable(cust: dict) -> bool:
+    """Whether there's anything to look up: the same test run_melissa_and_versium_waterfall applies before
+    calling a provider (an email, a phone, a street, or a full name with a ZIP)."""
+    c = cust or {}
+    return any([str(c.get("email") or "").strip(), clean_phone(c.get("phone")), str(c.get("md_address1") or "").strip(),
+                c.get("first_name") and c.get("last_name") and c.get("zip5")])
+
+
 def enrichment_complete(cust: dict) -> bool:
     """True when the customer's score can be trusted for a drop: Versium has answered (match or no match, live or
-    the CSV import), or Versium doesn't apply (an excluded area, or a deployment without Versium)."""
-    if versium_checked(cust) or not VERSIUM_REQUIRED:
+    the CSV import), or Versium doesn't apply (an excluded area, nothing to look up, or a deployment without
+    Versium). Nothing to look up is final: re-queueing such a customer would never change the answer."""
+    if versium_checked(cust) or not VERSIUM_REQUIRED or not versium_queryable(cust):
         return True
     return is_detroit_excluded(cust.get("md_city"), cust.get("zip5"))
 
@@ -4033,6 +4045,10 @@ def enrich_pending_customer(conn, rec: dict) -> str:
         # After the last attempt (failed): an event that would be dropped on this understated score is dropped as
         # enrichment_exhausted, which the Versium catch-up re-evaluates.
         released = release_deferred_events(cur, cust, exhausted=failed)
+        if not failed:
+            # Events dropped as enrichment_exhausted on an earlier run are judged again now that it finished
+            # (the Versium catch-up does the same for customers the worker doesn't see again).
+            released.update(reevaluate_exhausted(cur, cust))
         qualified = not is_detroit_excluded(cust.get("md_city"), cust.get("zip5"))  # seeds don't need the score
     if qualified:
         try:

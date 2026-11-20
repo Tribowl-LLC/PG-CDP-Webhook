@@ -1112,8 +1112,39 @@ def test_missing_versium_key_is_a_failure_when_versium_is_required(monkeypatch):
 
 def test_enrichment_complete_needs_a_versium_answer(monkeypatch):
     monkeypatch.setattr(main, "VERSIUM_REQUIRED", True)
-    assert not main.enrichment_complete({"md_city": "Novi", "zip5": "48375", "versium_lifestyle_flags": {}})
-    assert not main.enrichment_complete({"versium_lifestyle_flags": {"_versium_contact_done": "2026-11-20"}})
+    assert not main.enrichment_complete({"md_city": "Novi", "zip5": "48375", "email": "a@example.test",
+                                         "versium_lifestyle_flags": {}})
+    assert not main.enrichment_complete({"phone": "2485550101",
+                                         "versium_lifestyle_flags": {"_versium_contact_done": "2026-11-20"}})
     assert main.enrichment_complete({"versium_lifestyle_flags": {"_versium_checked": "2026-11-20"}})
     assert main.enrichment_complete({"versium_lifestyle_flags": {"_source": "csv"}})
     assert main.enrichment_complete({"md_city": "Detroit", "zip5": "48201"})      # Versium never runs there
+
+
+def test_customer_with_nothing_to_look_up_counts_as_enriched(monkeypatch):
+    monkeypatch.setattr(main, "VERSIUM_REQUIRED", True)
+    assert main.enrichment_complete({"first_name": "Al", "zip5": "48375"})          # final: never re-queued
+    assert not main.enrichment_complete({"first_name": "Al", "email": "al@example.test", "zip5": "48375"})
+
+
+def test_missing_key_keeps_a_stored_versium_answer(monkeypatch):
+    monkeypatch.setattr(main, "VERSIUM_API_KEY", None)
+    monkeypatch.setattr(main, "VERSIUM_REQUIRED", True)
+    for known in ({"versium_lifestyle_flags": {"_versium_checked": "2026-11-18"}},
+                  {"versium_lifestyle_flags": {"_source": "csv"}}):
+        res = main.run_versium_enrichment({}, "A", "B", "a@example.test", "", "", "Novi", "MI", "48375", known, 0)
+        assert not res.get("_versium_failed") and res["_outcome"]["versium"] == "already"
+
+
+def test_audit_judges_completion_at_the_drop_not_now():
+    import importlib.util, os as _os
+    from datetime import datetime as _d, timezone as _z
+    path = _os.path.join(_os.path.dirname(__file__), "..", "scripts", "reevaluate_dropped_events.py")
+    spec = importlib.util.spec_from_file_location("reevaluate_dropped_events", path)
+    mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+    dropped = _d(2026, 11, 20, 1, 21, tzinfo=_z.utc)
+    base = {"dropped_at": dropped, "email": "a@example.test"}
+    assert mod.complete_at_drop({**base, "versium_lifestyle_flags": {"_versium_checked": "2026-11-18"}})
+    assert mod.complete_at_drop({**base, "versium_lifestyle_flags": {"_versium_checked": "2026-11-20"}})  # same day
+    assert not mod.complete_at_drop({**base, "versium_lifestyle_flags": {"_versium_checked": "2026-11-21"}})  # later
+    assert mod.complete_at_drop({**base, "versium_lifestyle_flags": {"_source": "csv"}})

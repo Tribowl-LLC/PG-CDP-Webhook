@@ -2323,3 +2323,30 @@ def test_never_enriched_customer_with_held_qb_is_requeued_not_dropped(client, db
     main.process_pending_enrichment(limit=0)                          # only the release sweep runs
     assert capi_rows(db, f"qb_wr_RQ{uid}")[0]["meta_response_status"] == "DEFERRED_ENRICHMENT"
     assert customer_row(db, cid)["enrich_after"] is not None          # queued for enrichment again
+
+
+def test_worker_enrichment_after_exhaustion_recovers_the_exhausted_event(client, db, fake, uid, deferred,
+                                                                         versium_required, monkeypatch):
+    monkeypatch.setattr(main, "get_threshold", lambda cur: 100)
+    cid = _held_qb(client, uid, f"vdown-{uid}@example.test", f"WX{uid}")
+    db.execute("UPDATE master_customers SET enrich_attempts = %s WHERE cluster_id = %s",
+               (main.ENRICH_MAX_ATTEMPTS - 1, cid))
+    run_worker_now(db, cid)
+    assert capi_rows(db, f"qb_wr_WX{uid}")[0]["meta_response_body"] == "enrichment_exhausted"
+    # A later webhook brings a working email; the worker enriches them successfully.
+    db.execute("UPDATE master_customers SET email = %s, enrich_after = NOW(), enrich_attempts = 0 WHERE cluster_id = %s",
+               (f"works-{uid}@example.test", cid))
+    monkeypatch.setattr(main, "get_threshold", lambda cur: 0)
+    run_worker_now(db, cid)
+    assert capi_rows(db, f"qb_wr_WX{uid}")[0]["sent_to_meta"] is True
+
+
+def test_customer_with_no_usable_inputs_is_not_requeued_forever(client, db, fake, uid, deferred, versium_required,
+                                                                 monkeypatch):
+    monkeypatch.setattr(main, "get_threshold", lambda cur: 100)
+    cid = client.post("/webhooks/webres", headers=WH, json={
+        "reservation_id": f"NI{uid}", "first_name": f"Only{uid}", "zip": "48375", "amount": 20}).json()["cluster_id"]
+    run_worker_now(db, cid)
+    qb = capi_rows(db, f"qb_wr_NI{uid}")
+    assert not qb or qb[0]["meta_response_status"] == "DROPPED_AFTER_ENRICHMENT"     # a final outcome
+    assert customer_row(db, cid)["enrich_after"] is None                             # not queued again

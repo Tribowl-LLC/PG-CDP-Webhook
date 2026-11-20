@@ -2194,3 +2194,17 @@ def test_stale_capture_is_not_sent(client, db, fake, uid, everyone_qualifies):
         "id": f"SE{uid}", "first_name": "Form", "last_name": f"Lead{uid}", "email_address": f"form-{uid}@example.test",
         "status": "DEFINITE", "event_date": "2027-06-01", "grand_total": "300"}})
     assert "fbp" not in _ev(fake, f"qb_ts_{r['cluster_id']}_2027-06-01")[0]["user_data"]
+
+
+def test_held_event_that_aged_past_metas_limit_is_sent_with_the_send_time(client, db, fake, uid, deferred):
+    paid = (_dt.now(_tz.utc) - _td(hours=3)).replace(microsecond=0)
+    body = payment(f"EX{uid}", 2700, email=f"etexp-{uid}@example.test", name=f"EXP/SAM{uid}", etype="payment.created")
+    body["data"]["object"]["payment"]["created_at"] = _iso(paid)
+    r = square_post(client, body).json()
+    # The hold outlived Meta's 7 days (e.g. a payment first seen near the limit).
+    db.execute("UPDATE capi_events_log SET event_time = NOW() - INTERVAL '7 days 5 minutes' WHERE event_id = %s",
+               (f"sq_pay_EX{uid}",))
+    run_worker_now(db, r["cluster_id"])
+    ev = _ev(fake, f"sq_pay_EX{uid}")[0]
+    assert _close_to_now(ev["event_time"])          # sendable, not a rejected 7-day-old timestamp
+    assert capi_rows(db, f"sq_pay_EX{uid}")[0]["sent_to_meta"] is True

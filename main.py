@@ -1361,7 +1361,14 @@ def fire_meta_capi_event(cur, cust: dict, event_name: str, value: float, thresho
     prior = cur.fetchone()
     if prior and prior["sent_to_meta"]:
         return
-    stamped = (prior or {}).get("event_time") or meta_event_time(event_time)
+    # A stored time is reused (retries, release after the enrichment hold) while Meta still accepts it. One that
+    # aged past Meta's 7 days while waiting (a hold or retry near the limit) goes through the same rule as a new
+    # event: it becomes now, when it's actually sent, instead of being rejected and then never retried.
+    stored = (prior or {}).get("event_time")
+    stamped = meta_event_time(stored) if stored else meta_event_time(event_time)
+    if stored and stamped != stored:
+        log.info("Meta event %s: stored event_time is past Meta's 7-day limit; sending it with the send time",
+                 event_id[:12])
     twin, dup_status = purchase_twin(cur, cust["cluster_id"], event_name, event_id, value), "DUPLICATE_PURCHASE"
     if not twin:
         twin, dup_status = party_qb_twin(cur, cust["cluster_id"], event_name, event_id), "DUPLICATE_QUALIFIED_BOWLER"

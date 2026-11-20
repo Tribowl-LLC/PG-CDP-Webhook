@@ -42,9 +42,14 @@
     }
     return "";
   }
-  var fbc = cookie("_fbc");
-  if (!fbc) { var clid = urlParam("fbclid"); if (clid) fbc = "fb.1." + Date.now() + "." + clid; }
-  var values = { fbp: cookie("_fbp"), fbc: fbc, user_agent: navigator.userAgent || "" };
+  // fbc from an ad click in the URL, built once (its timestamp is the landing time) and used only while the Pixel
+  // hasn't set a _fbc cookie.
+  var clid = urlParam("fbclid");
+  var urlFbc = clid ? "fb.1." + Date.now() + "." + clid : "";
+  // Read the cookies on every fill, not once: the Pixel (or a consent banner) may set them after this runs.
+  function currentValues() {
+    return { fbp: cookie("_fbp"), fbc: cookie("_fbc") || urlFbc, user_agent: navigator.userAgent || "" };
+  }
 
   function labelFor(el) {
     var t = "";
@@ -60,6 +65,7 @@
     return "";
   }
   function fill() {
+    var values = currentValues();
     var form = document.getElementById("tripleseat_embed_form_inline") || document;
     var filled = 0;
     var els = form.querySelectorAll("input, textarea");
@@ -74,7 +80,7 @@
     return filled >= 3;
   }
   var tries = 0;
-  var timer = setInterval(function () { if (fill() || ++tries > 80) clearInterval(timer); }, 250);
-  document.addEventListener("submit", fill, true);
+  var timer = setInterval(function () { fill(); if (++tries > 240) clearInterval(timer); }, 250);  // ~60 s
+  document.addEventListener("submit", fill, true);  // and once more, with the cookies as they are at submit
 })();
 </script>

@@ -1165,8 +1165,8 @@ def test_tripleseat_signature_header_is_parsed():
 
 def test_each_candidate_construction_is_recognised_by_name():
     body, t = b'{"lead": {"id": 1}}', "1763600000"
-    for scheme in main.TRIPLESEAT_SIGNATURE_SCHEMES:
-        for enc in main.TRIPLESEAT_SIGNATURE_ENCODINGS:
+    for scheme in ("t.body", "tbody", "body"):              # the six PR #35 checked, names and behaviour unchanged
+        for enc in ("hex", "base64"):
             header = f"t={t},v1={_ts_sig(body, t, scheme, enc)}"
             assert main.tripleseat_signature_scheme(body, header, FAKE_TS_SECRET) == f"{scheme}:{enc}"
             assert main.tripleseat_signature_scheme(body, header, FAKE_TS_SECRET, only="t.body:hex") == \
@@ -1174,6 +1174,236 @@ def test_each_candidate_construction_is_recognised_by_name():
     reformatted = b'{"lead":{"id":1}}'                     # a re-serialised body never verifies
     assert main.tripleseat_signature_scheme(reformatted, f"t={t},v1={_ts_sig(body, t)}", FAKE_TS_SECRET) is None
     assert main.tripleseat_signature_scheme(body, f"t={t},v1={_ts_sig(body, t, secret='other')}", FAKE_TS_SECRET) is None
+
+
+# --- Tripleseat signature format determination: the widened candidate set (check-only) ----------------------
+# Fixtures are synthetic: fake secrets, fake bodies, a fake URL. The expected signed strings are written out here
+# independently of main's builders, so a builder that drifts from its name fails.
+
+_TS_URL = "https://cdp.example.test/webhooks/tripleseat?key=fake-shared-key"
+_TS_BODY = b'{"lead": {"id": 7, "note": "<a&b>"}}\n'
+
+
+def _ts_expected_message(payload: str, t: str, body: bytes, url: str) -> bytes:
+    T = t.encode()
+    noq = url.split("?")[0]
+    path = "/webhooks/tripleseat"
+    compact = b'{"lead":{"id":7,"note":"<a&b>"}}'
+    rails = b'{"lead":{"id":7,"note":"\\u003ca\\u0026b\\u003e"}}'
+    bodyhash = _hashlib.sha256(body).hexdigest().encode()
+    return {
+        "t.body": T + b"." + body, "tbody": T + body, "body": body,
+        "t:body": T + b":" + body, "t-nl-body": T + b"\n" + body, "t-sp-body": T + b" " + body,
+        "body.t": body + b"." + T,
+        "t.body-rstrip": T + b"." + body.rstrip(b"\n"), "t.body+nl": T + b"." + body + b"\n",
+        "body-rstrip": body.rstrip(b"\n"),
+        "t.url.body": T + b"." + url.encode() + b"." + body,
+        "t.urlnoq.body": T + b"." + noq.encode() + b"." + body,
+        "t.path.body": T + b"." + path.encode() + b"." + body,
+        "t.pathq.body": T + b"." + (path + "?key=fake-shared-key").encode() + b"." + body,
+        "url.body": url.encode() + body, "urlnoq.body": noq.encode() + body,
+        "t.json": T + b"." + compact, "t.json-rails": T + b"." + rails,
+        "t.bodyhash": T + b"." + bodyhash, "bodyhash": bodyhash,
+    }[payload]
+
+
+def _ts_encode_ref(digest: bytes, enc: str) -> str:
+    return {"hex": digest.hex(), "base64": _b64.b64encode(digest).decode(),
+            "base64url": _b64.urlsafe_b64encode(digest).decode().rstrip("=")}[enc]
+
+
+def test_every_new_candidate_verifies_a_fixture_built_that_way():
+    t = "1763600000"
+    assert set(main.TRIPLESEAT_SIGNATURE_PAYLOADS) == {
+        "t.body", "tbody", "body", "t:body", "t-nl-body", "t-sp-body", "body.t", "t.body-rstrip", "t.body+nl",
+        "body-rstrip", "t.url.body", "t.urlnoq.body", "t.path.body", "t.pathq.body", "url.body", "urlnoq.body",
+        "t.json", "t.json-rails", "t.bodyhash", "bodyhash"}
+    for payload in main.TRIPLESEAT_SIGNATURE_PAYLOADS:
+        for enc in main.TRIPLESEAT_SIGNATURE_ENCODINGS:
+            d = _hmac.new(FAKE_TS_SECRET.encode(), _ts_expected_message(payload, t, _TS_BODY, _TS_URL),
+                          _hashlib.sha256).digest()
+            header = f"t={t},v1={_ts_encode_ref(d, enc)}"
+            got = main.tripleseat_signature_scheme(_TS_BODY, header, FAKE_TS_SECRET, url=_TS_URL)
+            assert got == f"{payload}:{enc}", (payload, enc, got)
+            assert main.tripleseat_signature_scheme(_TS_BODY, header, FAKE_TS_SECRET, url=_TS_URL,
+                                                    only=f"{payload}:{enc}") == f"{payload}:{enc}"
+            assert main.tripleseat_signature_scheme(_TS_BODY, header, "fake-other-secret", url=_TS_URL) is None
+
+
+def test_url_candidates_need_the_url_and_padded_base64url_also_matches():
+    t = "1763600000"
+    d = _hmac.new(FAKE_TS_SECRET.encode(), _ts_expected_message("t.url.body", t, _TS_BODY, _TS_URL),
+                  _hashlib.sha256).digest()
+    assert main.tripleseat_signature_scheme(_TS_BODY, f"t={t},v1={d.hex()}", FAKE_TS_SECRET) is None  # no url
+    padded = _b64.urlsafe_b64encode(d).decode()
+    assert padded.endswith("=")
+    assert main.tripleseat_signature_scheme(_TS_BODY, f"t={t},v1={padded}", FAKE_TS_SECRET, url=_TS_URL) == \
+        "t.url.body:base64url"
+
+
+def test_decoded_secret_key_forms_verify():
+    t, msg = "1763600000", _ts_expected_message("t.body", "1763600000", _TS_BODY, _TS_URL)
+    raw = bytes(range(32))
+    cases = {"b64key": _b64.b64encode(raw).decode(), "hexkey": raw.hex(),
+             "b64urlkey": _b64.urlsafe_b64encode(bytes([251] * 32)).decode().rstrip("="),
+             "whsec": "whsec_" + _b64.b64encode(raw).decode()}
+    for form, secret in cases.items():
+        key = bytes([251] * 32) if form == "b64urlkey" else raw
+        d = _hmac.new(key, msg, _hashlib.sha256).digest()
+        got = main.tripleseat_signature_scheme(_TS_BODY, f"t={t},v1={d.hex()}", secret)
+        assert got == f"t.body:hex@{form}", (form, got)
+    # the raw-text key is still tried first, under the old name
+    d = _hmac.new(cases["hexkey"].encode(), msg, _hashlib.sha256).digest()
+    assert main.tripleseat_signature_scheme(_TS_BODY, f"t={t},v1={d.hex()}", cases["hexkey"]) == "t.body:hex"
+
+
+def test_only_timestamp_signed_candidates_can_be_pinned():
+    for name in ("t.body:hex", "tbody:base64", "t:body:hex", "body.t:base64url", "t.url.body:hex@b64key",
+                 "t.json-rails:base64", "t.bodyhash:hex"):
+        assert main.tripleseat_scheme_signs_timestamp(name), name
+    for name in ("body:hex", "body-rstrip:base64", "url.body:base64", "urlnoq.body:hex", "bodyhash:hex@hexkey",
+                 "", "t.body", "t.body:sha1", "nonsense:hex", "t.body:hex@unknown"):
+        assert not main.tripleseat_scheme_signs_timestamp(name), name
+    # an unknown pinned name verifies nothing
+    assert main.tripleseat_signature_scheme(_TS_BODY, "t=1,v1=ab", FAKE_TS_SECRET, only="t.body:sha1") is None
+
+
+def _ts_request(headers: dict, query: str = "key=fake-shared-key"):
+    from starlette.requests import Request as _Req
+    return _Req({"type": "http", "method": "POST", "path": "/webhooks/tripleseat", "query_string": query.encode(),
+                 "scheme": "http", "server": ("cdp.example.test", 80),
+                 "headers": [(k.lower().encode(), v.encode()) for k, v in
+                             {"host": "cdp.example.test", "x-forwarded-proto": "https", **headers}.items()]})
+
+
+def test_mismatch_log_names_the_candidates_and_leaks_nothing(monkeypatch, caplog):
+    monkeypatch.setattr(main, "TRIPLESEAT_WEBHOOK_SECRET", FAKE_TS_SECRET)
+    monkeypatch.setattr(main, "TRIPLESEAT_SIGNATURE_ENFORCE", False)
+    monkeypatch.setattr(main, "TRIPLESEAT_SIGNATURE_SCHEME", "")
+    t = str(int(__import__("time").time()))
+    bogus = "ab" * 32
+    header = f"t={t},v1={bogus}"
+    with caplog.at_level("INFO", logger="pg_cdp"):
+        assert main.check_tripleseat_signature(_ts_request({"x-signature": header}), _TS_BODY) is False
+    text = caplog.text
+    assert "Tripleseat signature MISMATCH" in text and "none matched" in text and "not enforced yet" in text
+    assert "1 v1 value(s) [64 chars hex (SHA-256 size)]" in text and f"body {len(_TS_BODY)} bytes" in text
+    for name in ("t.body", "t-nl-body", "t.url.body", "t.json-rails", "t.bodyhash", "base64url"):
+        assert name in text, name
+    # 20 payloads x 3 encodings x 2 keys (the fake secret's text, and the same text base64url-decoded)
+    assert "120 candidates" in text and "keys [raw, b64urlkey]" in text
+    for leak in (FAKE_TS_SECRET, bogus, header, "fake-shared-key", '"lead"', "<a&b>"):
+        assert leak not in text, leak
+    for payload in main.TRIPLESEAT_SIGNATURE_PAYLOADS:      # nor any HMAC value we computed
+        for key in main._ts_key_forms(FAKE_TS_SECRET).values():
+            msg = main.TRIPLESEAT_SIGNATURE_PAYLOADS[payload][0](main._ts_context(t, _TS_BODY, _TS_URL))
+            if msg is None:
+                continue
+            d = _hmac.new(key, msg, _hashlib.sha256).digest()
+            for enc in main.TRIPLESEAT_SIGNATURE_ENCODINGS:
+                assert main._ts_encode(d, enc) not in text
+
+
+def test_v1_shape_reports_length_and_alphabet_only():
+    d = _hashlib.sha256(b"fake").digest()
+    assert main.tripleseat_v1_shape(d.hex()) == "64 chars hex (SHA-256 size)"
+    assert main.tripleseat_v1_shape(_b64.b64encode(d).decode()) == "44 chars base64 (SHA-256 size)"
+    url = _b64.urlsafe_b64encode(bytes([251] * 32)).decode().rstrip("=")
+    assert main.tripleseat_v1_shape(url) == "43 chars base64url (SHA-256 size)"
+    assert main.tripleseat_v1_shape(_hashlib.sha1(b"fake").hexdigest()) == "40 chars hex (not SHA-256 size)"
+    assert main.tripleseat_v1_shape("not a sig!") == "10 chars other (not SHA-256 size)"
+
+
+def test_startup_logs_the_secret_shape_even_when_unset(monkeypatch, caplog):
+    import asyncio
+    monkeypatch.setattr(main, "TRIPLESEAT_WEBHOOK_SECRET", None)
+    monkeypatch.setattr(main, "_TS_SECRET_AS_SET", "")
+    monkeypatch.setattr(main, "sync_cluster_sequence", lambda: None)
+    monkeypatch.setattr(main, "DATABASE_URL", None)                 # no enrichment worker
+
+    async def run():
+        async with main.lifespan(main.app):
+            pass
+    with caplog.at_level("INFO", logger="pg_cdp"):
+        asyncio.run(run())
+    assert "TRIPLESEAT_WEBHOOK_SECRET: not set" in caplog.text
+
+
+def test_json_candidate_with_an_unencodable_string_is_skipped_not_a_crash():
+    body, t = b'{"lead": {"note": "\\ud800"}}', "1763600000"
+    assert main.tripleseat_signature_scheme(body, f"t={t},v1={'ab' * 32}", FAKE_TS_SECRET, url=_TS_URL) is None
+    assert main.tripleseat_signature_scheme(body, f"t={t},v1={_ts_sig(body, t)}", FAKE_TS_SECRET) == "t.body:hex"
+
+
+def test_padded_base64url_secret_is_decoded():
+    raw = bytes([251] * 31)                                   # encodes with '-'/'_' and '=' padding
+    secret = _b64.urlsafe_b64encode(raw).decode()
+    assert secret.endswith("=") and ("-" in secret or "_" in secret)
+    t = "1763600000"
+    d = _hmac.new(raw, _ts_expected_message("t.body", t, _TS_BODY, _TS_URL), _hashlib.sha256).digest()
+    assert main.tripleseat_signature_scheme(_TS_BODY, f"t={t},v1={d.hex()}", secret) == "t.body:hex@b64urlkey"
+
+
+def test_ambiguous_encoding_is_reported_not_presented_as_unique(monkeypatch, caplog):
+    monkeypatch.setattr(main, "TRIPLESEAT_WEBHOOK_SECRET", FAKE_TS_SECRET)
+    monkeypatch.setattr(main, "TRIPLESEAT_SIGNATURE_ENFORCE", False)
+    monkeypatch.setattr(main, "TRIPLESEAT_SIGNATURE_SCHEME", "")
+    t0 = int(__import__("time").time())
+    for i in range(500):                                      # find a fresh timestamp whose padded encoding has no + / - _
+        t = str(t0 - i)
+        d = _hmac.new(FAKE_TS_SECRET.encode(), t.encode() + b"." + _TS_BODY, _hashlib.sha256).digest()
+        sig = _b64.urlsafe_b64encode(d).decode()
+        if not set(sig) & set("+/-_"):
+            break
+    else:
+        raise AssertionError("no unambiguous fixture found")
+    assert list(main.tripleseat_signature_matches(_TS_BODY, f"t={t},v1={sig}", FAKE_TS_SECRET)) == \
+        ["t.body:base64", "t.body:base64url"]
+    with caplog.at_level("INFO", logger="pg_cdp"):
+        main.check_tripleseat_signature(_ts_request({"x-signature": f"t={t},v1={sig}"}), _TS_BODY)
+    assert "verified (scheme t.body:base64" in caplog.text
+    assert "AMBIGUOUS, also matches t.body:base64url" in caplog.text and sig not in caplog.text
+
+
+def test_check_uses_the_public_url_tripleseat_posted_to(monkeypatch, caplog):
+    monkeypatch.setattr(main, "TRIPLESEAT_WEBHOOK_SECRET", FAKE_TS_SECRET)
+    monkeypatch.setattr(main, "TRIPLESEAT_SIGNATURE_ENFORCE", False)
+    monkeypatch.setattr(main, "TRIPLESEAT_SIGNATURE_SCHEME", "")
+    t = str(int(__import__("time").time()))
+    d = _hmac.new(FAKE_TS_SECRET.encode(), _ts_expected_message("t.url.body", t, _TS_BODY, _TS_URL),
+                  _hashlib.sha256).digest()
+    with caplog.at_level("INFO", logger="pg_cdp"):
+        assert main.check_tripleseat_signature(_ts_request({"x-signature": f"t={t},v1={d.hex()}"}), _TS_BODY) is False
+    assert "Tripleseat signature verified (scheme t.url.body:hex" in caplog.text and "not enforced yet" in caplog.text
+    assert "fake-shared-key" not in caplog.text
+
+
+def test_body_only_new_candidates_never_count_as_authenticated(monkeypatch, caplog):
+    monkeypatch.setattr(main, "TRIPLESEAT_WEBHOOK_SECRET", FAKE_TS_SECRET)
+    monkeypatch.setattr(main, "TRIPLESEAT_SIGNATURE_ENFORCE", True)
+    monkeypatch.setattr(main, "TRIPLESEAT_SIGNATURE_SCHEME", "url.body:base64")
+    d = _hmac.new(FAKE_TS_SECRET.encode(), _ts_expected_message("url.body", "1", _TS_BODY, _TS_URL),
+                  _hashlib.sha256).digest()
+    with caplog.at_level("INFO", logger="pg_cdp"):
+        ok = main.check_tripleseat_signature(_ts_request({"x-signature": f"t=1,v1={_b64.b64encode(d).decode()}"}),
+                                             _TS_BODY)
+    assert ok is False                                       # the shared key is still required
+    assert "not a timestamp-signed construction" in caplog.text and "can't replace the shared key" in caplog.text
+
+
+def test_secret_is_read_stripped_and_its_shape_never_shows_the_value():
+    import subprocess, sys as _sys
+    code = ("import main; print(repr(main.TRIPLESEAT_WEBHOOK_SECRET)); "
+            "print(main.tripleseat_secret_shape(main.TRIPLESEAT_WEBHOOK_SECRET, main._TS_SECRET_AS_SET))")
+    env = {**__import__("os").environ, "TRIPLESEAT_WEBHOOK_SECRET": "  fakeSecret123\n"}
+    out = subprocess.run([_sys.executable, "-c", code], env=env, capture_output=True, text=True,
+                         cwd=__import__("os").path.dirname(main.__file__), check=True).stdout.splitlines()
+    assert out[0] == "'fakeSecret123'"
+    assert out[1] == "13 characters, alphanumeric, whitespace trimmed from the Render value: yes"
+    assert main.tripleseat_secret_shape("fake-se_cret", "fake-se_cret") == \
+        "12 characters, URL-safe (letters, digits, - _), whitespace trimmed from the Render value: no"
+    assert main.tripleseat_secret_shape(None, "") == "not set"
+    assert "fake" not in main.tripleseat_secret_shape("fake+/x=", "fake+/x=")
 
 
 def test_access_log_never_shows_a_key():

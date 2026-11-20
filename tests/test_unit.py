@@ -1287,7 +1287,7 @@ def test_mismatch_log_names_the_candidates_and_leaks_nothing(monkeypatch, caplog
         assert main.check_tripleseat_signature(_ts_request({"x-signature": header}), _TS_BODY) is False
     text = caplog.text
     assert "Tripleseat signature MISMATCH" in text and "none matched" in text and "not enforced yet" in text
-    assert "1 v1 value(s)" in text and f"body {len(_TS_BODY)} bytes" in text
+    assert "1 v1 value(s) [64 chars hex (SHA-256 size)]" in text and f"body {len(_TS_BODY)} bytes" in text
     for name in ("t.body", "t-nl-body", "t.url.body", "t.json-rails", "t.bodyhash", "base64url"):
         assert name in text, name
     # 20 payloads x 3 encodings x 2 keys (the fake secret's text, and the same text base64url-decoded)
@@ -1302,6 +1302,31 @@ def test_mismatch_log_names_the_candidates_and_leaks_nothing(monkeypatch, caplog
             d = _hmac.new(key, msg, _hashlib.sha256).digest()
             for enc in main.TRIPLESEAT_SIGNATURE_ENCODINGS:
                 assert main._ts_encode(d, enc) not in text
+
+
+def test_v1_shape_reports_length_and_alphabet_only():
+    d = _hashlib.sha256(b"fake").digest()
+    assert main.tripleseat_v1_shape(d.hex()) == "64 chars hex (SHA-256 size)"
+    assert main.tripleseat_v1_shape(_b64.b64encode(d).decode()) == "44 chars base64 (SHA-256 size)"
+    url = _b64.urlsafe_b64encode(bytes([251] * 32)).decode().rstrip("=")
+    assert main.tripleseat_v1_shape(url) == "43 chars base64url (SHA-256 size)"
+    assert main.tripleseat_v1_shape(_hashlib.sha1(b"fake").hexdigest()) == "40 chars hex (not SHA-256 size)"
+    assert main.tripleseat_v1_shape("not a sig!") == "10 chars other (not SHA-256 size)"
+
+
+def test_startup_logs_the_secret_shape_even_when_unset(monkeypatch, caplog):
+    import asyncio
+    monkeypatch.setattr(main, "TRIPLESEAT_WEBHOOK_SECRET", None)
+    monkeypatch.setattr(main, "_TS_SECRET_AS_SET", "")
+    monkeypatch.setattr(main, "sync_cluster_sequence", lambda: None)
+    monkeypatch.setattr(main, "DATABASE_URL", None)                 # no enrichment worker
+
+    async def run():
+        async with main.lifespan(main.app):
+            pass
+    with caplog.at_level("INFO", logger="pg_cdp"):
+        asyncio.run(run())
+    assert "TRIPLESEAT_WEBHOOK_SECRET: not set" in caplog.text
 
 
 def test_check_uses_the_public_url_tripleseat_posted_to(monkeypatch, caplog):

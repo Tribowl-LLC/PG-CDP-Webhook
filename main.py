@@ -57,10 +57,9 @@ async def _enrichment_worker():
 @asynccontextmanager
 async def lifespan(_app):
     await run_in_threadpool(sync_cluster_sequence)
-    if TRIPLESEAT_WEBHOOK_SECRET or _TS_SECRET_AS_SET:
-        # Secret-blind check that Render holds the value from Tripleseat: compare length and character class with
-        # the secret shown in Tripleseat (Settings > API/Webhooks). Never the value itself.
-        log.info("TRIPLESEAT_WEBHOOK_SECRET: %s", tripleseat_secret_shape(TRIPLESEAT_WEBHOOK_SECRET, _TS_SECRET_AS_SET))
+    # Secret-blind check that Render holds the value from Tripleseat: compare length and character class with the
+    # secret shown in Tripleseat (Settings > API/Webhooks). Never the value itself. Always logged, "not set" included.
+    log.info("TRIPLESEAT_WEBHOOK_SECRET: %s", tripleseat_secret_shape(TRIPLESEAT_WEBHOOK_SECRET, _TS_SECRET_AS_SET))
     # Always on: with ENRICH_DELAY_MINUTES=0 it just drains customers still waiting from before the switch.
     worker = asyncio.create_task(_enrichment_worker()) if DATABASE_URL else None
     yield
@@ -3718,6 +3717,21 @@ def tripleseat_signature_scheme(body: bytes, header: str, secret: str, only: str
     return None
 
 
+def tripleseat_v1_shape(sig: str) -> str:
+    """Length and alphabet of a received v1 value, never the value: tells whether it can be a SHA-256 HMAC at all
+    (64 hex characters, 44 base64 characters with '=' padding, or 43 base64url characters)."""
+    n = len(sig)
+    if re.fullmatch(r"[0-9a-fA-F]+", sig):
+        cls, sha256 = "hex", n == 64
+    elif re.fullmatch(r"[A-Za-z0-9+/]+=*", sig):
+        cls, sha256 = "base64", n == 44 or n == 43
+    elif re.fullmatch(r"[A-Za-z0-9_-]+=*", sig):
+        cls, sha256 = "base64url", n in (43, 44)
+    else:
+        cls, sha256 = "other", False
+    return f"{n} chars {cls}" + (" (SHA-256 size)" if sha256 else " (not SHA-256 size)")
+
+
 def tripleseat_secret_shape(secret: Optional[str], as_set: str) -> str:
     """Length and character class of the signing secret, and whether whitespace was trimmed from what was set in
     Render. Never the value, any part of it, or a hash of it."""
@@ -3798,7 +3812,8 @@ def check_tripleseat_signature(request: Request, body: bytes) -> bool:
     elif scheme:
         why = f"STALE (scheme {scheme} matched but timestamp skew {skew}s exceeds {TRIPLESEAT_SIGNATURE_MAX_SKEW_SECONDS}s)"
     else:
-        why = (f"MISMATCH (t present, {len(sigs)} v1 value(s), skew {skew}s, body {len(body)} bytes; none matched; "
+        why = (f"MISMATCH (t present, {len(sigs)} v1 value(s) [{'; '.join(tripleseat_v1_shape(v) for v in sigs)}], "
+               f"skew {skew}s, body {len(body)} bytes; none matched; "
                f"tried {tripleseat_candidates_tried(TRIPLESEAT_WEBHOOK_SECRET, url, only)})")
     log.warning("Tripleseat signature %s; %s", why, "rejected" if enforce else "not enforced yet")
     if enforce:

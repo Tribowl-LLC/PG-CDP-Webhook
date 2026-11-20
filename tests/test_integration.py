@@ -2001,7 +2001,8 @@ def test_expired_failed_twin_does_not_block_a_new_qb(client, db, fake, uid, ever
     fake.meta_mode = "500"
     client.post("/webhooks/partywirks", headers=WH, json=fake.add_partywirks(uid, oid))
     fake.meta_mode = "ok"
-    db.execute("UPDATE capi_events_log SET sent_at = NOW() - INTERVAL '8 days' WHERE event_id = %s", (f"qb_pw_{oid}",))
+    db.execute("UPDATE capi_events_log SET sent_at = NOW() - INTERVAL '8 days', event_time = NOW() - INTERVAL '8 days' "
+               "WHERE event_id = %s", (f"qb_pw_{oid}",))
     t = client.post("/webhooks/tripleseat", headers=WH, json=ts_event(uid)).json()
     ts = capi_rows(db, f"qb_ts_{t['cluster_id']}_2026-12-05")[0]
     assert ts["sent_to_meta"] is True                       # past the retry window, the failed twin can't win
@@ -2033,3 +2034,193 @@ def test_booking_sent_under_its_old_key_is_not_sent_again(client, db, fake, uid,
     client.post("/webhooks/tripleseat", headers=WH, json=ts_booking_webhook(uid, "DEFINITE"))
     assert len(fake.meta_events()) == n
     assert capi_rows(db, f"qb_ts_{cid}_2026-%") == [] and capi_rows(db, f"lead_ts_{cid}_2026-%") == []
+
+
+# --- Fix #8: event_time is the transaction time; fbp / fbc from the Tripleseat lead form ------------
+
+from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+
+FBP = "fb.1.1763600000000.1234567890"
+FBC = "fb.1.1763600000000.IwAR2abcdefghijklmnop"
+
+
+def _iso(dt):
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _ev(fake, event_id):
+    return [e for e in fake.meta_events() if e["event_id"] == event_id]
+
+
+def _close_to_now(ts):
+    return abs(ts - _dt.now(_tz.utc).timestamp()) < 120
+
+
+def test_square_purchase_is_stamped_at_the_payment_time(client, db, fake, uid):
+    paid = (_dt.now(_tz.utc) - _td(hours=3)).replace(microsecond=0)
+    body = payment(f"ET{uid}", 4200, email=f"etsq-{uid}@example.test", name=f"TIME/SAM{uid}")
+    body["data"]["object"]["payment"]["created_at"] = _iso(paid)
+    square_post(client, body)
+    ev = _ev(fake, f"sq_pay_ET{uid}")[0]
+    assert ev["event_time"] == int(paid.timestamp())                         # not the send time
+    assert capi_rows(db, f"sq_pay_ET{uid}")[0]["event_time"] == paid
+    assert not {"fbp", "fbc", "client_user_agent"} & set(ev["user_data"])   # in-store: no browser ids
+
+
+def test_webres_events_use_the_booking_time_not_the_lane_date(client, db, fake, uid, everyone_qualifies):
+    booked = (_dt.now(_tz.utc) - _td(minutes=40)).replace(microsecond=0)
+    client.post("/webhooks/webres", headers=WH, json={
+        "reservation_id": f"ETW{uid}", "first_name": "Lane", "last_name": f"Time{uid}", "email": f"etwr-{uid}@example.test",
+        "amount": 55, "reservation_date": (_dt.now(_tz.utc) + _td(days=9)).strftime("%Y-%m-%dT18:00:00"),
+        "booked_at": _iso(booked)})
+    assert _ev(fake, f"wr_ETW{uid}")[0]["event_time"] == int(booked.timestamp())
+    assert _ev(fake, f"qb_wr_ETW{uid}")[0]["event_time"] == int(booked.timestamp())
+
+
+def test_webres_without_a_booking_time_is_stamped_now_never_the_future_lane_date(client, db, fake, uid):
+    client.post("/webhooks/webres", headers=WH, json={
+        "reservation_id": f"ETN{uid}", "first_name": "Lane", "last_name": f"Now{uid}", "email": f"etnow-{uid}@example.test",
+        "amount": 30, "reservation_date": (_dt.now(_tz.utc) + _td(days=20)).strftime("%Y-%m-%dT18:00:00")})
+    assert _close_to_now(_ev(fake, f"wr_ETN{uid}")[0]["event_time"])
+
+
+def test_partywirks_qb_is_stamped_at_the_order_time_not_the_party_date(client, db, fake, uid, everyone_qualifies):
+    ordered_local = (_dt.now(main.VENUE_TZ) - _td(hours=5)).replace(microsecond=0, tzinfo=None)
+    oid = f"60{int(uid, 16)}"
+    body = fake.add_partywirks(uid, oid, created_at=ordered_local.strftime("%Y-%m-%d %H:%M:%S"),
+                               event_date=(_dt.now() + _td(days=30)).strftime("%Y-%m-%d"))
+    client.post("/webhooks/partywirks", headers=WH, json=body)
+    ev = _ev(fake, f"qb_pw_{oid}")[0]
+    assert ev["event_time"] == int(ordered_local.replace(tzinfo=main.VENUE_TZ).timestamp())
+
+
+def test_partywirks_without_order_time_is_not_stamped_with_its_future_party_date(client, db, fake, uid, everyone_qualifies):
+    oid = f"61{int(uid, 16)}"
+    body = fake.add_partywirks(uid, oid, event_date=(_dt.now() + _td(days=30)).strftime("%Y-%m-%d"))
+    fake.pw_reservations[oid]["created_at"] = None
+    client.post("/webhooks/partywirks", headers=WH, json=body)
+    assert _close_to_now(_ev(fake, f"qb_pw_{oid}")[0]["event_time"])
+
+
+def test_tripleseat_event_is_stamped_at_its_record_time_not_the_event_date(client, db, fake, uid, everyone_qualifies):
+    made = (_dt.now(_tz.utc) - _td(days=2)).replace(microsecond=0)
+    r = client.post("/webhooks/tripleseat", headers=WH, json={"event": {
+        "id": f"ET{uid}", "first_name": "Time", "last_name": f"Planner{uid}", "status": "DEFINITE",
+        "email_address": f"etts-{uid}@example.test", "event_date": "2027-02-14", "grand_total": "900",
+        "created_at": _iso(made)}}).json()
+    ev = _ev(fake, f"qb_ts_{r['cluster_id']}_2027-02-14")[0]
+    assert ev["event_time"] == int(made.timestamp())
+
+
+def test_tripleseat_record_in_the_future_or_too_old_is_stamped_now(client, db, fake, uid, everyone_qualifies):
+    for i, when in enumerate((_dt.now(_tz.utc) + _td(days=3), _dt.now(_tz.utc) - _td(days=40))):
+        r = client.post("/webhooks/tripleseat", headers=WH, json={"lead": {
+            "id": f"EL{i}{uid}", "first_name": "Odd", "last_name": f"Time{i}{uid}", "status": "prospect",
+            "email_address": f"etodd{i}-{uid}@example.test", "event_date": "2027-03-0{}".format(i + 1),
+            "created_at": _iso(when)}}).json()
+        assert _close_to_now(_ev(fake, f"lead_ts_{r['cluster_id']}_2027-03-0{i + 1}")[0]["event_time"])
+
+
+def test_retried_event_keeps_its_original_transaction_time(client, db, fake, uid):
+    paid = (_dt.now(_tz.utc) - _td(hours=5)).replace(microsecond=0)
+    body = payment(f"ER{uid}", 3100, email=f"etretry-{uid}@example.test", name=f"RETRY/SAM{uid}")
+    body["data"]["object"]["payment"]["created_at"] = _iso(paid)
+    fake.meta_mode = "500"
+    square_post(client, body)
+    fake.meta_mode = "ok"
+    with main.get_conn() as conn, conn.cursor() as cur:
+        main.retry_unsent_events(cur)
+    sent = _ev(fake, f"sq_pay_ER{uid}")
+    assert len(sent) == 2 and sent[0]["event_time"] == sent[1]["event_time"] == int(paid.timestamp())
+    assert capi_rows(db, f"sq_pay_ER{uid}")[0]["sent_to_meta"] is True
+
+
+def test_event_held_for_enrichment_keeps_its_transaction_time(client, db, fake, uid, deferred):
+    paid = (_dt.now(_tz.utc) - _td(hours=1)).replace(microsecond=0)
+    body = payment(f"EH{uid}", 5100, email=f"ethold-{uid}@example.test", name=f"HOLD/SAM{uid}", etype="payment.created")
+    body["data"]["object"]["payment"]["created_at"] = _iso(paid)
+    r = square_post(client, body).json()
+    assert fake.meta_events() == []
+    run_worker_now(db, r["cluster_id"])
+    assert _ev(fake, f"sq_pay_EH{uid}")[0]["event_time"] == int(paid.timestamp())
+
+
+def ts_form_lead(uid, fields, created=None, date="2027-04-10", status="prospect", rid=None):
+    return {"lead": {"id": rid or f"FL{uid}", "first_name": "Form", "last_name": f"Lead{uid}", "status": status,
+                     "email_address": f"form-{uid}@example.test", "event_date": date,
+                     "created_at": _iso(created or _dt.now(_tz.utc) - _td(minutes=3)),
+                     "custom_fields": [{"custom_field_name": k, "value": v} for k, v in fields.items()]}}
+
+
+def test_lead_form_click_ids_are_sent_on_tripleseat_events(client, db, fake, uid, everyone_qualifies):
+    r = client.post("/webhooks/tripleseat", headers=WH, json=ts_form_lead(
+        uid, {"fbp": FBP, "fbc": FBC, "user_agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0)"})).json()
+    cid = r["cluster_id"]
+    ud = _ev(fake, f"lead_ts_{cid}_2027-04-10")[0]["user_data"]
+    assert ud["fbp"] == FBP and ud["fbc"] == FBC and ud["client_user_agent"].startswith("Mozilla/5.0")
+    assert "client_ip_address" not in ud                                   # no source gives it
+    c = customer_row(db, cid)
+    assert c["meta_fbp"] == FBP and c["meta_fbp_at"] is not None and c["meta_fbc_at"] is not None
+    # The same party later booked: its QB carries them too.
+    client.post("/webhooks/tripleseat", headers=WH, json={"event": {
+        "id": f"FE{uid}", "first_name": "Form", "last_name": f"Lead{uid}", "email_address": f"form-{uid}@example.test",
+        "status": "DEFINITE", "event_date": "2027-04-10", "grand_total": "640"}})
+    assert _ev(fake, f"qb_ts_{cid}_2027-04-10")[0]["user_data"]["fbc"] == FBC
+    # Their in-store Square payment doesn't: in-store purchases have no browser session.
+    square_post(client, payment(f"FS{uid}", 2500, email=f"form-{uid}@example.test", name=f"LEAD/FORM{uid}"))
+    sq = _ev(fake, f"sq_pay_FS{uid}")[0]["user_data"]
+    assert not {"fbp", "fbc", "client_user_agent"} & set(sq)
+
+
+def test_lead_without_click_ids_sends_none_and_bad_values_are_ignored(client, db, fake, uid, everyone_qualifies):
+    r = client.post("/webhooks/tripleseat", headers=WH, json=ts_form_lead(uid, {"fbp": "", "fbc": "garbage"})).json()
+    ud = _ev(fake, f"lead_ts_{r['cluster_id']}_2027-04-10")[0]["user_data"]
+    assert not {"fbp", "fbc", "client_user_agent", "client_ip_address"} & set(ud)   # omitted, never ""
+
+
+def test_older_capture_never_replaces_a_newer_one(client, db, fake, uid, everyone_qualifies):
+    new_fbp = "fb.1.1763700000000.9999999999"
+    client.post("/webhooks/tripleseat", headers=WH, json=ts_form_lead(uid, {"fbp": new_fbp}, rid=f"N{uid}"))
+    r = client.post("/webhooks/tripleseat", headers=WH, json=ts_form_lead(
+        uid, {"fbp": FBP}, created=_dt.now(_tz.utc) - _td(days=2), rid=f"O{uid}", date="2027-05-01")).json()
+    assert customer_row(db, r["cluster_id"])["meta_fbp"] == new_fbp
+
+
+def test_stale_capture_is_not_sent(client, db, fake, uid, everyone_qualifies):
+    r = client.post("/webhooks/tripleseat", headers=WH, json=ts_form_lead(uid, {"fbp": FBP}, rid=f"S{uid}")).json()
+    db.execute("UPDATE master_customers SET meta_fbp_at = NOW() - INTERVAL '120 days' WHERE cluster_id = %s",
+               (r["cluster_id"],))
+    client.post("/webhooks/tripleseat", headers=WH, json={"event": {
+        "id": f"SE{uid}", "first_name": "Form", "last_name": f"Lead{uid}", "email_address": f"form-{uid}@example.test",
+        "status": "DEFINITE", "event_date": "2027-06-01", "grand_total": "300"}})
+    assert "fbp" not in _ev(fake, f"qb_ts_{r['cluster_id']}_2027-06-01")[0]["user_data"]
+
+
+def test_held_event_that_aged_past_metas_limit_is_sent_with_the_send_time(client, db, fake, uid, deferred):
+    paid = (_dt.now(_tz.utc) - _td(hours=3)).replace(microsecond=0)
+    body = payment(f"EX{uid}", 2700, email=f"etexp-{uid}@example.test", name=f"EXP/SAM{uid}", etype="payment.created")
+    body["data"]["object"]["payment"]["created_at"] = _iso(paid)
+    r = square_post(client, body).json()
+    # The hold outlived Meta's 7 days (e.g. a payment first seen near the limit).
+    db.execute("UPDATE capi_events_log SET event_time = NOW() - INTERVAL '7 days 5 minutes' WHERE event_id = %s",
+               (f"sq_pay_EX{uid}",))
+    run_worker_now(db, r["cluster_id"])
+    ev = _ev(fake, f"sq_pay_EX{uid}")[0]
+    assert _close_to_now(ev["event_time"])          # sendable, not a rejected 7-day-old timestamp
+    assert capi_rows(db, f"sq_pay_EX{uid}")[0]["sent_to_meta"] is True
+
+
+def test_newer_partial_capture_keeps_the_stored_click_id(client, db, fake, uid, everyone_qualifies):
+    """A later visit not from an ad click has fbp and user agent but no fbc: the stored fbc survives, with its own
+    capture time (it isn't made to look fresh)."""
+    first = _dt.now(_tz.utc) - _td(days=2)
+    client.post("/webhooks/tripleseat", headers=WH, json=ts_form_lead(
+        uid, {"fbp": FBP, "fbc": FBC, "user_agent": "Mozilla/5.0 (Old phone)"}, created=first, rid=f"P1{uid}"))
+    new_fbp = "fb.1.1763800000000.5555555555"
+    r = client.post("/webhooks/tripleseat", headers=WH, json=ts_form_lead(
+        uid, {"fbp": new_fbp, "user_agent": "Mozilla/5.0 (New phone)"}, rid=f"P2{uid}", date="2027-07-04")).json()
+    c = customer_row(db, r["cluster_id"])
+    assert c["meta_fbc"] == FBC and abs((c["meta_fbc_at"] - first).total_seconds()) < 2   # kept, original time
+    assert c["meta_fbp"] == new_fbp and c["meta_client_user_agent"] == "Mozilla/5.0 (New phone)"
+    ud = _ev(fake, f"lead_ts_{r['cluster_id']}_2027-07-04")[0]["user_data"]
+    assert ud["fbc"] == FBC and ud["fbp"] == new_fbp

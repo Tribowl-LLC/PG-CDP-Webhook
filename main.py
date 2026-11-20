@@ -11,7 +11,8 @@ import hashlib
 import logging
 import asyncio
 import collections
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from typing import Optional
 
 import requests
@@ -1241,19 +1242,146 @@ def sync_customer_to_meta_custom_audiences(cust: dict, facts: Optional[dict] = N
         upload_audience_rows(aud_id, rows)
 
 
+# --- Event time --------------------------------------------------------------------------------------------
+# Meta attributes an event by its event_time, so it's the moment the purchase/booking/lead happened, not when we
+# send it (after the enrichment hold, or a retry hours later). Meta only accepts events up to 7 days old.
+META_MAX_EVENT_AGE = timedelta(days=7)
+# Partywirks sends local times without an offset. Checked 2026-11-20 against production: for the six orders that
+# had sent a QB, the API's created_at (read as UTC) was 5.03-16.8 h before our first record of the order
+# (unified_transactions.recorded_at). The smallest gap, 5.03 h, is the EST offset (UTC-5) plus ~2 minutes of
+# webhook delay, i.e. created_at is venue local time; the longer gaps are orders first recorded by the nightly
+# catch-up sync. Six samples, one of them real-time: re-check after deploy (see PR #33).
+VENUE_TZ = ZoneInfo("America/Detroit")
+
+
+def parse_source_time(val, naive_tz=timezone.utc) -> Optional[datetime]:
+    """A source system's timestamp as an aware datetime: ISO 8601 (with or without offset/'Z'),
+    'YYYY-MM-DD HH:MM:SS', or epoch seconds. A time without an offset is read in naive_tz. A plain date
+    (no time) is not a transaction time and returns None."""
+    if val is None or val == "":
+        return None
+    if isinstance(val, datetime):
+        return val if val.tzinfo else val.replace(tzinfo=naive_tz)
+    if isinstance(val, (int, float)):
+        return datetime.fromtimestamp(float(val), tz=timezone.utc)
+    v = str(val).strip()
+    if not re.match(r"^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}", v):
+        return None
+    try:
+        dt = datetime.fromisoformat(v.replace("Z", "+00:00").replace(" ", "T", 1))
+    except ValueError:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=naive_tz)
+
+
+def meta_event_time(txn_time: Optional[datetime], now: Optional[datetime] = None) -> datetime:
+    """The event_time to send: the transaction time when known, never in the future (clamped to now), and now
+    when unknown or older than Meta accepts (e.g. an old Tripleseat record whose status changed today: we learn
+    of the conversion now)."""
+    now = now or datetime.now(timezone.utc)
+    if not txn_time or txn_time > now:
+        return now
+    if txn_time < now - META_MAX_EVENT_AGE + timedelta(minutes=10):
+        return now
+    return txn_time
+
+
+# --- Browser identifiers (fbp / fbc / user agent) ----------------------------------------------------------
+# Only one source passes them: the Tripleseat lead form on myperfectgame.com (/groups-and-parties), whose page
+# script copies the _fbp/_fbc cookies (or builds fbc from an fbclid in the URL, Meta's documented format) and the
+# browser's user agent into hidden custom fields (site-snippets/tripleseat_lead_form_meta_ids.html). Each is
+# stored on the customer with its own capture time (a later visit without an ad click keeps the stored fbc) and
+# sent only on that customer's Tripleseat events (qb_ts_ / lead_ts_), only while younger than BROWSER_IDS_MAX_AGE. Square, WebRes and Partywirks
+# carry no browser identifiers (in-store / Gmail / server-to-server), so their events send none. No source gives
+# the client IP address: it's never sent.
+BROWSER_IDS_MAX_AGE = timedelta(days=90)
+_FBP_RE = re.compile(r"^fb\.[0-2]\.\d{10,14}\.\d{1,20}$")
+_FBC_RE = re.compile(r"^fb\.[0-2]\.\d{10,14}\.[A-Za-z0-9_\-]{10,500}$")
+_BROWSER_FIELD_NAMES = {"fbp": "fbp", "_fbp": "fbp", "meta_fbp": "fbp", "fbc": "fbc", "_fbc": "fbc",
+                        "meta_fbc": "fbc", "user_agent": "ua", "useragent": "ua", "client_user_agent": "ua"}
+
+
+def ts_browser_ids(obj: dict) -> dict:
+    """fbp / fbc / user agent from a Tripleseat record's custom fields, only values in Meta's formats."""
+    found = {}
+    fields = obj.get("custom_fields") if isinstance(obj, dict) else None
+    items = []
+    if isinstance(fields, dict):
+        items = list(fields.items())
+    elif isinstance(fields, list):
+        for f in fields:
+            if isinstance(f, dict):
+                name = f.get("custom_field_slug") or f.get("slug") or f.get("custom_field_name") or f.get("name")
+                items.append((name, f.get("value")))
+    for name, val in items:
+        key = _BROWSER_FIELD_NAMES.get(re.sub(r"[^a-z_]", "", str(name or "").strip().lower().replace(" ", "_")))
+        val = as_text(val)
+        val = val.strip() if val else ""
+        if not key or not val:
+            continue
+        if (key == "fbp" and _FBP_RE.match(val)) or (key == "fbc" and _FBC_RE.match(val)) or \
+                (key == "ua" and 10 <= len(val) <= 1000):
+            found[key] = val
+    return found
+
+
+_BROWSER_COLUMNS = {"fbp": "meta_fbp", "fbc": "meta_fbc", "ua": "meta_client_user_agent"}
+
+
+def save_browser_ids(cur, cluster_id, ids: dict, captured_at: Optional[datetime]):
+    """Stores each identifier the capture has, with its own capture time. Per field, the newest capture wins: an
+    older capture never replaces a newer value, and a field the capture lacks (a visit not from an ad click has
+    no fbc) keeps its stored value and its original capture time, so it still ages out on schedule."""
+    if not cluster_id or not ids:
+        return
+    when = min(captured_at or datetime.now(timezone.utc), datetime.now(timezone.utc))
+    for key, col in _BROWSER_COLUMNS.items():
+        if not ids.get(key):
+            continue
+        cur.execute(f"""UPDATE master_customers SET {col} = %s, {col}_at = %s
+                        WHERE cluster_id = %s AND ({col}_at IS NULL OR {col}_at <= %s);""",
+                    (ids[key], when, cluster_id, when))
+
+
+def browser_user_data(cust: dict, event_id: str) -> dict:
+    """The fbp / fbc / client_user_agent to add to this event's user_data: only Tripleseat events, only a
+    capture younger than BROWSER_IDS_MAX_AGE, and only fields that are known (never empty strings)."""
+    if not (event_id.startswith("qb_ts_") or event_id.startswith("lead_ts_")):
+        return {}
+    oldest = datetime.now(timezone.utc) - BROWSER_IDS_MAX_AGE
+    out = {}
+    for meta_key, col in (("fbp", "meta_fbp"), ("fbc", "meta_fbc"), ("client_user_agent", "meta_client_user_agent")):
+        at = cust.get(f"{col}_at")
+        if cust.get(col) and at and at >= oldest:   # each value by its own capture time
+            out[meta_key] = cust[col]
+    return out
+
+
 def fire_meta_capi_event(cur, cust: dict, event_name: str, value: float, threshold: int,
-                         event_id: str, action_source: str = "system_generated"):
+                         event_id: str, action_source: str = "system_generated",
+                         event_time: Optional[datetime] = None):
     """Sends one CAPI event, at most once per event_id.
 
     A Meta error or timeout is logged with sent_to_meta = FALSE and never raises, so it can't roll back
     the customer update. If the same event comes through again later, it's retried.
+
+    event_time is when the transaction happened (see meta_event_time). It's stored with the event the first
+    time it's logged, and a retry or a release after the enrichment hold reuses the stored time.
     """
     if not META_PIXEL_ID or not META_ACCESS_TOKEN:
         return
-    cur.execute("SELECT sent_to_meta FROM capi_events_log WHERE event_id = %s;", (event_id,))
+    cur.execute("SELECT sent_to_meta, event_time FROM capi_events_log WHERE event_id = %s;", (event_id,))
     prior = cur.fetchone()
     if prior and prior["sent_to_meta"]:
         return
+    # A stored time is reused (retries, release after the enrichment hold) while Meta still accepts it. One that
+    # aged past Meta's 7 days while waiting (a hold or retry near the limit) goes through the same rule as a new
+    # event: it becomes now, when it's actually sent, instead of being rejected and then never retried.
+    stored = (prior or {}).get("event_time")
+    stamped = meta_event_time(stored) if stored else meta_event_time(event_time)
+    if stored and stamped != stored:
+        log.info("Meta event %s: stored event_time is past Meta's 7-day limit; sending it with the send time",
+                 event_id[:12])
     twin, dup_status = purchase_twin(cur, cust["cluster_id"], event_name, event_id, value), "DUPLICATE_PURCHASE"
     if not twin:
         twin, dup_status = party_qb_twin(cur, cust["cluster_id"], event_name, event_id), "DUPLICATE_QUALIFIED_BOWLER"
@@ -1261,22 +1389,23 @@ def fire_meta_capi_event(cur, cust: dict, event_name: str, value: float, thresho
         # The same money (Purchase) or the same party (Qualified_Bowler) already went, or is going, to Meta
         # under the other source's event ID. Logged, pointing at that event, and never retried.
         cur.execute("""INSERT INTO capi_events_log (event_id, cluster_id, event_name, event_value, bowler_value_score,
-                           threshold_at_send, sent_to_meta, meta_response_status, meta_response_body)
-                       VALUES (%s, %s, %s, %s, %s, %s, FALSE, %s, %s)
+                           threshold_at_send, sent_to_meta, meta_response_status, meta_response_body, event_time)
+                       VALUES (%s, %s, %s, %s, %s, %s, FALSE, %s, %s, %s)
                        ON CONFLICT (event_id) DO UPDATE SET meta_response_status = EXCLUDED.meta_response_status,
-                           meta_response_body = EXCLUDED.meta_response_body
+                           meta_response_body = EXCLUDED.meta_response_body,
+                           event_time = COALESCE(capi_events_log.event_time, EXCLUDED.event_time)
                        WHERE NOT capi_events_log.sent_to_meta;""",
                     (event_id, cust["cluster_id"], event_name, value, int(cust.get("bowler_value_score") or 0),
-                     threshold, dup_status, twin))
+                     threshold, dup_status, twin, stamped))
         return
     if cust.get("enrich_after"):
         # Waiting for enrichment: hold the event until the address (Detroit gate) and score are known.
         cur.execute("""INSERT INTO capi_events_log (event_id, cluster_id, event_name, event_value, bowler_value_score,
-                           threshold_at_send, sent_to_meta, meta_response_status, meta_response_body)
-                       VALUES (%s, %s, %s, %s, %s, %s, FALSE, 'DEFERRED_ENRICHMENT', %s)
+                           threshold_at_send, sent_to_meta, meta_response_status, meta_response_body, event_time)
+                       VALUES (%s, %s, %s, %s, %s, %s, FALSE, 'DEFERRED_ENRICHMENT', %s, %s)
                        ON CONFLICT (event_id) DO NOTHING;""",
                     (event_id, cust["cluster_id"], event_name, value, int(cust.get("bowler_value_score") or 0),
-                     threshold, action_source))
+                     threshold, action_source, stamped))
         return
 
     cluster_id = cust["cluster_id"]
@@ -1284,10 +1413,10 @@ def fire_meta_capi_event(cur, cust: dict, event_name: str, value: float, thresho
     payload = {
         "data": [{
             "event_name": event_name,
-            "event_time": int(time.time()),
+            "event_time": int(stamped.timestamp()),
             "event_id": event_id,
             "action_source": action_source,
-            "user_data": build_meta_user_identifiers(cust),
+            "user_data": {**build_meta_user_identifiers(cust), **browser_user_data(cust, event_id)},
             "custom_data": {
                 "pg_persona": cust.get("pg_mosaic_persona"),
                 "bowler_value_score": score,
@@ -1316,16 +1445,17 @@ def fire_meta_capi_event(cur, cust: dict, event_name: str, value: float, thresho
         """
         INSERT INTO capi_events_log (
             event_id, cluster_id, event_name, event_value, bowler_value_score,
-            threshold_at_send, sent_to_meta, meta_response_status, meta_response_body
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            threshold_at_send, sent_to_meta, meta_response_status, meta_response_body, event_time
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT (event_id) DO UPDATE SET
             sent_at = NOW(),
             sent_to_meta = EXCLUDED.sent_to_meta,
             meta_response_status = EXCLUDED.meta_response_status,
-            meta_response_body = EXCLUDED.meta_response_body
+            meta_response_body = EXCLUDED.meta_response_body,
+            event_time = COALESCE(capi_events_log.event_time, EXCLUDED.event_time)
         WHERE capi_events_log.sent_to_meta = FALSE;
         """,
-        (event_id, cluster_id, event_name, value, score, threshold, ok, status, body),
+        (event_id, cluster_id, event_name, value, score, threshold, ok, status, body, stamped),
     )
 
 
@@ -1427,7 +1557,7 @@ def party_qb_twin(cur, cluster_id, event_name: str, event_id: str) -> Optional[s
                     WHERE l.cluster_id = %s AND l.event_name = 'Qualified_Bowler' AND l.event_id LIKE %s
                       AND l.event_id <> %s AND {_QB_TWIN_SKIP}
                       AND (l.sent_to_meta OR l.meta_response_status = 'DEFERRED_ENRICHMENT'
-                           OR l.sent_at > NOW() - make_interval(days => %s))
+                           OR COALESCE(l.event_time, l.sent_at) > NOW() - make_interval(days => %s))
                     ORDER BY l.sent_to_meta DESC, l.sent_at, l.event_id;""",
                 (cluster_id, other, event_id, RETRY_MAX_AGE_DAYS))
     for r in cur.fetchall():
@@ -1466,8 +1596,11 @@ RETRY_MAX_AGE_DAYS = 6
 
 def retry_unsent_events(cur, max_age_days: int = RETRY_MAX_AGE_DAYS) -> dict:
     """Re-sends every event Meta hasn't accepted yet. Meta only takes events up to 7 days old."""
+    # Age by the event's own time when known (sent_at moves on every failed attempt), so a retry never sends an
+    # event older than Meta accepts.
     cur.execute("SELECT event_id FROM capi_events_log WHERE NOT sent_to_meta "
-                f"AND {_NOT_HELD} AND sent_at > NOW() - make_interval(days => %s) ORDER BY sent_at;", (max_age_days,))
+                f"AND {_NOT_HELD} AND COALESCE(event_time, sent_at) > NOW() - make_interval(days => %s) "
+                "ORDER BY sent_at;", (max_age_days,))
     ids = [r["event_id"] for r in cur.fetchall()]
     tried = sum(1 for eid in ids if retry_unsent_event(cur, eid))
     cur.execute("SELECT COUNT(*) AS n FROM capi_events_log WHERE event_id = ANY(%s) AND NOT sent_to_meta;", (ids,))
@@ -2213,7 +2346,8 @@ def handle_square_payment(cur, payment: dict, background_tasks: BackgroundTasks)
 
     thresh = get_threshold(cur)
     if net > 0 and not is_detroit_excluded(cust.get("md_city"), cust.get("zip5")):
-        fire_meta_capi_event(cur, cust, "Purchase", net, thresh, event_id=txn_id, action_source="physical_store")
+        fire_meta_capi_event(cur, cust, "Purchase", net, thresh, event_id=txn_id, action_source="physical_store",
+                             event_time=parse_source_time(payment.get("created_at")))
         if newly_enriched:
             background_tasks.add_task(sync_customer_to_meta_custom_audiences, dict(cust))
     return {"status": "payment_attributed", "cluster_id": cust["cluster_id"], "amount": net}
@@ -2323,12 +2457,17 @@ def handle_webres(data: dict, background_tasks: BackgroundTasks) -> dict:
                 cust = rescore_customer(cur, cust)  # the score now includes this booking
                 thresh = get_threshold(cur)
 
+                # When the booking was made: the Gmail script's booking/email time if it sends one (never the
+                # reservation date, which is when they bowl). Without one, now: the script posts each confirmation
+                # email within ~5 minutes of it arriving.
+                booked = parse_source_time(data.get("booked_at") or data.get("created_at")
+                                           or data.get("email_received_at"))
                 if not is_detroit_excluded(cust.get("md_city"), cust.get("zip5")):
                     if amount > 0:
-                        fire_meta_capi_event(cur, cust, "Purchase", amount, thresh, event_id=txn_id)
+                        fire_meta_capi_event(cur, cust, "Purchase", amount, thresh, event_id=txn_id, event_time=booked)
                     if cust["bowler_value_score"] >= thresh or cust.get("enrich_after"):
                         fire_meta_capi_event(cur, cust, "Qualified_Bowler", amount, thresh,
-                                             event_id=f"qb_wr_{booking_id}")
+                                             event_id=f"qb_wr_{booking_id}", event_time=booked)
                     background_tasks.add_task(sync_customer_to_meta_custom_audiences, dict(cust))
 
         return {"status": "webres_synced", "cluster_id": cust["cluster_id"], "score": cust["bowler_value_score"]}
@@ -2437,6 +2576,20 @@ def tripleseat_contract_value(kind: str, obj: dict) -> float:
     return money(obj.get("grand_total"))
 
 
+def ts_conversion_time(kind: str, obj: dict, status: str) -> Optional[datetime]:
+    """When a Tripleseat conversion happened: for a booking, when it moved to its current status
+    (status_changes), else the record's created_at. Never the event date (that's when the party happens).
+    meta_event_time turns a time older than Meta accepts (a record created weeks ago that became definite
+    today) into now, when we learn of it."""
+    if kind == "booking":
+        changes = [c for c in obj.get("status_changes") or obj.get("booking_status_changes") or []
+                   if isinstance(c, dict) and str(c.get("status") or "").upper() == status]
+        times = [t for t in (parse_source_time(c.get("created_at")) for c in changes) if t]
+        if times:
+            return max(times)
+    return parse_source_time(obj.get("created_at"))
+
+
 def ts_event_id(cur, prefix: str, cust: dict, key: str, kind: str, record_id) -> str:
     """The Tripleseat QB/Lead event ID: <prefix>_ts_<cluster>_<date key>. Before bookings were keyed by their
     start_date, a booking's event was logged as <prefix>_ts_<cluster>_booking_<id>; if that one exists, it's
@@ -2517,6 +2670,12 @@ def handle_tripleseat(raw: dict, background_tasks: BackgroundTasks) -> dict:
                     "in_tripleseat": 1,
                     "source": "Tripleseat",
                 })
+                # fbp / fbc / user agent from the lead form's hidden fields (captured when the form was submitted).
+                browser = ts_browser_ids(obj)
+                if browser:
+                    save_browser_ids(cur, cust["cluster_id"], browser, parse_source_time(obj.get("created_at")))
+                    cur.execute("SELECT * FROM master_customers WHERE cluster_id = %s;", (cust["cluster_id"],))
+                    cust = cur.fetchone()
                 if record_id and kind in ("lead", "event", "booking"):
                     # A booking counts once: an event of an already-recorded booking (or a booking one of
                     # whose events is already recorded) is claimed without counting again.
@@ -2548,10 +2707,12 @@ def handle_tripleseat(raw: dict, background_tasks: BackgroundTasks) -> dict:
                     key = ts_date(event_date) or event_date or (f"{kind}_{record_id}" if record_id else "undated")
                     if kind in ("event", "booking") and status in TRIPLESEAT_BOOKED_STATUSES:
                         fire_meta_capi_event(cur, cust, "Qualified_Bowler", tripleseat_contract_value(kind, obj),
-                                             thresh, event_id=ts_event_id(cur, "qb", cust, key, kind, record_id))
+                                             thresh, event_id=ts_event_id(cur, "qb", cust, key, kind, record_id),
+                                             event_time=ts_conversion_time(kind, obj, status))
                     else:
                         fire_meta_capi_event(cur, cust, "Lead", 0.0, thresh,
-                                             event_id=ts_event_id(cur, "lead", cust, key, kind, record_id))
+                                             event_id=ts_event_id(cur, "lead", cust, key, kind, record_id),
+                                             event_time=ts_conversion_time(kind, obj, status))
 
         return {
             "status": "tripleseat_synced",
@@ -3461,8 +3622,10 @@ def ingest_partywirks(cur, rec: dict, background_tasks: BackgroundTasks = None, 
         if cust["bowler_value_score"] >= thresh or cust.get("enrich_after"):
             # The real order total, or no value. Not a Purchase: the deposit/balance arrive as Square payments,
             # so a Partywirks Purchase would need the same twin check as WebRes (purchase_twin) first.
+            # When the order was placed (Partywirks local time), never the party date, which is usually ahead.
             fire_meta_capi_event(cur, cust, "Qualified_Bowler", rec.get("total") or 0.0, thresh,
-                                 event_id=f"qb_pw_{key}")
+                                 event_id=f"qb_pw_{key}",
+                                 event_time=parse_source_time(rec.get("created_at"), naive_tz=VENUE_TZ))
         if background_tasks is not None:
             background_tasks.add_task(sync_customer_to_meta_custom_audiences, dict(cust))
         else:

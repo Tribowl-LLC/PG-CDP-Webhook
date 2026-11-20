@@ -915,3 +915,72 @@ def test_audience_labels_are_the_new_names():
     assert names[main.AUDIENCE_PG1_CORP] == "Corporate" and names[main.AUDIENCE_PG2_FAMILIES] == "Birthday"
     assert names[main.AUDIENCE_BROAD_LOCAL] == "Broad Local"
     assert not any("PG-" in n for n in names.values())
+
+
+# --- Fix #8: event time = transaction time; browser identifiers ---------------------------------
+
+from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+
+
+def test_parse_source_time_reads_each_source_format():
+    utc = _tz.utc
+    assert main.parse_source_time("2026-11-19T15:04:05.123Z") == _dt(2026, 11, 19, 15, 4, 5, 123000, tzinfo=utc)
+    assert main.parse_source_time("2026-11-19T10:04:05-05:00") == _dt(2026, 11, 19, 15, 4, 5, tzinfo=utc)
+    # Partywirks: no offset, venue local time (EST in November = UTC-5)
+    assert main.parse_source_time("2026-11-19 10:04:05", naive_tz=main.VENUE_TZ) == _dt(2026, 11, 19, 15, 4, 5, tzinfo=utc)
+    assert main.parse_source_time("2026-12-05") is None          # a plain date is not a transaction time
+    assert main.parse_source_time("12/05/2026") is None
+    assert main.parse_source_time(None) is None and main.parse_source_time("junk") is None
+
+
+def test_meta_event_time_never_future_never_too_old():
+    now = _dt(2026, 11, 20, 12, 0, tzinfo=_tz.utc)
+    two_hours_ago = now - _td(hours=2)
+    assert main.meta_event_time(two_hours_ago, now) == two_hours_ago
+    assert main.meta_event_time(now + _td(days=10), now) == now           # a future party date never
+    assert main.meta_event_time(None, now) == now
+    assert main.meta_event_time(now - _td(days=30), now) == now           # older than Meta accepts
+    assert main.meta_event_time(now - _td(days=6), now) == now - _td(days=6)
+
+
+FBP = "fb.1.1763600000000.1234567890"
+FBC = "fb.1.1763600000000.IwAR2abcdefghijklmnop"
+
+
+def test_tripleseat_custom_fields_give_browser_ids_only_in_meta_format():
+    obj = {"custom_fields": [
+        {"custom_field_name": "fbp", "value": FBP},
+        {"custom_field_slug": "fbc", "value": FBC},
+        {"custom_field_name": "User Agent", "value": "Mozilla/5.0 (iPhone)"},
+        {"custom_field_name": "Theme", "value": "Pirates"}]}
+    assert main.ts_browser_ids(obj) == {"fbp": FBP, "fbc": FBC, "ua": "Mozilla/5.0 (iPhone)"}
+    bad = {"custom_fields": [{"custom_field_name": "fbp", "value": "not-a-cookie"},
+                             {"custom_field_name": "fbc", "value": ""}]}
+    assert main.ts_browser_ids(bad) == {}
+    assert main.ts_browser_ids({}) == {} and main.ts_browser_ids({"custom_fields": None}) == {}
+
+
+def test_browser_ids_only_on_tripleseat_events_and_only_while_fresh():
+    recent = _dt.now(_tz.utc) - _td(days=3)
+    fresh = {"meta_fbp": FBP, "meta_fbp_at": recent, "meta_fbc": None, "meta_fbc_at": None,
+             "meta_client_user_agent": "Mozilla/5.0 (iPhone)", "meta_client_user_agent_at": recent}
+    assert main.browser_user_data(fresh, "qb_ts_1_2026-12-05") == {"fbp": FBP, "client_user_agent": "Mozilla/5.0 (iPhone)"}
+    assert main.browser_user_data(fresh, "lead_ts_1_2026-12-05")["fbp"] == FBP
+    for eid in ("sq_pay_X", "wr_W1", "qb_wr_W1", "qb_pw_123"):
+        assert main.browser_user_data(fresh, eid) == {}                    # Square / WebRes / Partywirks: none
+    old = _dt.now(_tz.utc) - _td(days=91)
+    stale = {**fresh, "meta_fbp_at": old, "meta_client_user_agent_at": old}
+    assert main.browser_user_data(stale, "qb_ts_1_2026-12-05") == {}
+    assert main.browser_user_data({"meta_fbp": FBP}, "qb_ts_1_2026-12-05") == {}   # no capture time: unknown
+    # Each value ages by its own capture time: a fresh fbp with a stale fbc sends only the fbp.
+    mixed = {"meta_fbp": FBP, "meta_fbp_at": recent, "meta_fbc": FBC, "meta_fbc_at": old}
+    assert main.browser_user_data(mixed, "qb_ts_1_2026-12-05") == {"fbp": FBP}
+
+
+def test_tripleseat_booking_conversion_time_is_its_status_change():
+    obj = {"created_at": "2026-10-01T12:00:00Z", "status_changes": [
+        {"status": "TENTATIVE", "created_at": "2026-11-01T12:00:00Z"},
+        {"status": "DEFINITE", "created_at": "2026-11-19T18:30:00Z"}]}
+    assert main.ts_conversion_time("booking", obj, "DEFINITE") == _dt(2026, 11, 19, 18, 30, tzinfo=_tz.utc)
+    assert main.ts_conversion_time("event", {"created_at": "2026-11-19T18:30:00Z", "event_date": "12/05/2026"},
+                                   "DEFINITE") == _dt(2026, 11, 19, 18, 30, tzinfo=_tz.utc)

@@ -1,0 +1,86 @@
+<!--
+  Meta browser identifiers for the Tripleseat lead form (fix #8).
+
+  WHERE IT LIVES: myperfectgame.com (Square Online) -> page "Groups and Parties" (/groups-and-parties) -> the
+  Embed Code block that holds the Tripleseat Dynamic lead form, dynamic_lead_form_id=7252:
+    <script src="https://api.tripleseat.com/ts/dynamic_leads/ts_script.js?dynamic_lead_form_id=7252&public_key=..."></script>
+  (it replaced the classic form 32890). Paste this whole file AFTER that script tag, in the same block.
+
+  TRIPLESEAT SETUP: done. Dynamic lead form 7252 has three short-text custom fields named exactly  fbp,
+  fbc  and  user_agent  (not required). This script fills and hides them; they arrive on the lead webhook as
+  custom_fields, and the CDP reads them (main.ts_browser_ids). Staff never need to look at them.
+  VERIFIED (2026-11-20): a test lead through form 7252 on the live page arrived with the fields filled, so the
+  form renders where this script can reach it and the site's cookies are readable.
+
+  WHAT IT SENDS: the visitor's own _fbp / _fbc cookies (set by the Meta Pixel already on the site). With no _fbc
+  cookie but an fbclid in the page URL (a click from a Meta ad), fbc is built the way Meta documents:
+  fb.1.<milliseconds>.<fbclid>. Plus navigator.userAgent. Nothing else; empty values are left empty.
+
+  RE-CHECK AFTER CHANGING THE PAGE OR FORM: open the page with ?fbclid=test1234567890, submit a test lead, and
+  check in Tripleseat that its fbp / fbc / user_agent fields are filled.
+-->
+<script>
+(function () {
+  function readCookie(doc, name) {
+    try {
+      var m = (doc.cookie || "").match(new RegExp("(?:^|;\\s*)" + name + "=([^;]*)"));
+      return m ? decodeURIComponent(m[1]) : "";
+    } catch (e) { return ""; }
+  }
+  function cookie(name) {
+    var v = readCookie(document, name);
+    if (!v) { try { v = readCookie(window.top.document, name); } catch (e) {} }
+    return v;
+  }
+  function urlParam(name) {
+    var hrefs = [];
+    try { hrefs.push(window.top.location.href); } catch (e) {}
+    hrefs.push(window.location.href);
+    try { if (document.referrer) hrefs.push(document.referrer); } catch (e) {}
+    for (var i = 0; i < hrefs.length; i++) {
+      try { var v = new URL(hrefs[i]).searchParams.get(name); if (v) return v; } catch (e) {}
+    }
+    return "";
+  }
+  // fbc from an ad click in the URL, built once (its timestamp is the landing time) and used only while the Pixel
+  // hasn't set a _fbc cookie.
+  var clid = urlParam("fbclid");
+  var urlFbc = clid ? "fb.1." + Date.now() + "." + clid : "";
+  // Read the cookies on every fill, not once: the Pixel (or a consent banner) may set them after this runs.
+  function currentValues() {
+    return { fbp: cookie("_fbp"), fbc: cookie("_fbc") || urlFbc, user_agent: navigator.userAgent || "" };
+  }
+
+  function labelFor(el) {
+    var t = "";
+    if (el.id) { var l = document.querySelector('label[for="' + el.id + '"]'); if (l) t = l.textContent; }
+    if (!t && el.closest) { var row = el.closest("p, div, li, tr"); if (row) { var l2 = row.querySelector("label"); if (l2) t = l2.textContent; } }
+    return (t || "").replace(/\*/g, "").trim().toLowerCase();
+  }
+  function keyOf(el) {
+    var hay = [(el.name || ""), (el.id || ""), (el.placeholder || ""), labelFor(el)].join(" ").toLowerCase();
+    if (/(^|[^a-z])user[_ ]?agent([^a-z]|$)/.test(hay)) return "user_agent";
+    if (/(^|[^a-z])_?fbp([^a-z]|$)/.test(hay)) return "fbp";
+    if (/(^|[^a-z])_?fbc([^a-z]|$)/.test(hay)) return "fbc";
+    return "";
+  }
+  function fill() {
+    var values = currentValues();
+    var form = document.getElementById("tripleseat_embed_form_inline") || document;
+    var filled = 0;
+    var els = form.querySelectorAll("input, textarea");
+    for (var i = 0; i < els.length; i++) {
+      var el = els[i], k = keyOf(el);
+      if (!k) continue;
+      if (values[k]) el.value = values[k];
+      var row = el.closest ? el.closest("p, div, li, tr") : null;
+      (row && row !== form ? row : el).style.display = "none";
+      filled++;
+    }
+    return filled >= 3;
+  }
+  var tries = 0;
+  var timer = setInterval(function () { fill(); if (++tries > 240) clearInterval(timer); }, 250);  // ~60 s
+  document.addEventListener("submit", fill, true);  // and once more, with the cookies as they are at submit
+})();
+</script>

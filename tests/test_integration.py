@@ -2224,3 +2224,129 @@ def test_newer_partial_capture_keeps_the_stored_click_id(client, db, fake, uid, 
     assert c["meta_fbp"] == new_fbp and c["meta_client_user_agent"] == "Mozilla/5.0 (New phone)"
     ud = _ev(fake, f"lead_ts_{r['cluster_id']}_2027-07-04")[0]["user_data"]
     assert ud["fbc"] == FBC and ud["fbp"] == new_fbp
+
+
+# --- Fix #9: a held QB is only dropped after enrichment really finished --------------------------
+
+@pytest.fixture
+def versium_required(monkeypatch):
+    monkeypatch.setattr(main, "VERSIUM_REQUIRED", True, raising=False)
+
+
+def _held_qb(client, uid, email, rid):
+    cid = client.post("/webhooks/webres", headers=WH, json={
+        "reservation_id": rid, "first_name": "Held", "last_name": f"Q{uid}", "email": email,
+        "amount": 40}).json()["cluster_id"]
+    return cid
+
+
+def test_held_qb_is_not_dropped_while_versium_is_missing(client, db, fake, uid, deferred, versium_required,
+                                                          monkeypatch):
+    monkeypatch.setattr(main, "get_threshold", lambda cur: 100)     # the QB can't qualify on this score
+    cid = _held_qb(client, uid, f"nokey-{uid}@example.test", f"NK{uid}")
+    assert capi_rows(db, f"qb_wr_NK{uid}")[0]["meta_response_status"] == "DEFERRED_ENRICHMENT"
+    monkeypatch.setattr(main, "VERSIUM_API_KEY", None)               # the key went missing
+    assert run_worker_now(db, cid).get("retry_later") == 1
+    assert capi_rows(db, f"qb_wr_NK{uid}")[0]["meta_response_status"] == "DEFERRED_ENRICHMENT"   # not dropped
+    c = customer_row(db, cid)
+    assert c["enrich_after"] is not None and c["enrich_outcome"]["versium"] == "failed:not_configured"
+    assert c["enrich_outcome"]["final"] == "retry_later"
+
+
+def test_held_qb_is_not_dropped_while_versium_is_failing(client, db, fake, uid, deferred, versium_required,
+                                                          monkeypatch):
+    monkeypatch.setattr(main, "get_threshold", lambda cur: 100)
+    cid = _held_qb(client, uid, f"vdown-{uid}@example.test", f"VF{uid}")
+    run_worker_now(db, cid)
+    assert capi_rows(db, f"qb_wr_VF{uid}")[0]["meta_response_status"] == "DEFERRED_ENRICHMENT"
+    out = customer_row(db, cid)["enrich_outcome"]
+    assert out["versium_contact"] == "failed:503" and out["final"] == "retry_later"
+
+
+def test_after_the_last_attempt_the_drop_says_enrichment_exhausted(client, db, fake, uid, deferred,
+                                                                    versium_required, monkeypatch):
+    monkeypatch.setattr(main, "get_threshold", lambda cur: 100)
+    cid = _held_qb(client, uid, f"vdown-{uid}@example.test", f"VX{uid}")
+    db.execute("UPDATE master_customers SET enrich_attempts = %s WHERE cluster_id = %s",
+               (main.ENRICH_MAX_ATTEMPTS - 1, cid))
+    run_worker_now(db, cid)                                            # the last attempt fails too
+    qb = capi_rows(db, f"qb_wr_VX{uid}")[0]
+    assert qb["meta_response_status"] == "DROPPED_AFTER_ENRICHMENT" and qb["meta_response_body"] == "enrichment_exhausted"
+    assert capi_rows(db, f"wr_VX{uid}")[0]["sent_to_meta"] is True    # the Purchase still goes
+    # Later the Versium catch-up answers: the exhausted QB is judged again on the complete score.
+    db.execute("UPDATE master_customers SET versium_lifestyle_flags = COALESCE(versium_lifestyle_flags, '{}'::jsonb) "
+               "|| '{\"_versium_checked\": \"2026-11-20\"}'::jsonb WHERE cluster_id = %s", (cid,))
+    monkeypatch.setattr(main, "get_threshold", lambda cur: 0)
+    with main.get_conn() as conn, conn.cursor() as cur:
+        out = main.reevaluate_exhausted(cur, customer_row(db, cid))
+    assert out["sent"] == 1 and capi_rows(db, f"qb_wr_VX{uid}")[0]["sent_to_meta"] is True
+
+
+def test_held_qb_below_threshold_after_complete_enrichment_is_dropped(client, db, fake, uid, deferred,
+                                                                       versium_required, monkeypatch):
+    monkeypatch.setattr(main, "get_threshold", lambda cur: 100)
+    cid = _held_qb(client, uid, f"vnomatch-{uid}@example.test", f"VC{uid}")   # Versium answers: no match
+    run_worker_now(db, cid)
+    qb = capi_rows(db, f"qb_wr_VC{uid}")[0]
+    assert qb["meta_response_status"] == "DROPPED_AFTER_ENRICHMENT" and qb["meta_response_body"] == "below_threshold"
+    assert customer_row(db, cid)["enrich_outcome"]["final"] == "enriched"
+
+
+def test_held_qb_whose_score_rises_with_enrichment_is_sent(client, db, fake, uid, deferred, versium_required,
+                                                           monkeypatch):
+    orig = fake._versium
+
+    def rich(url, params):
+        if "/v2/demographic" in url:
+            from conftest import FakeResponse
+            return FakeResponse(200, {"versium": {"results": [{"Age Range": "35-45", "Household Income": "$150,000+",
+                                                               "Marital Status": "Married", "Gender": "Female"}]}})
+        return orig(url, params)
+    monkeypatch.setattr(fake, "_versium", rich)
+    cid = _held_qb(client, uid, f"rises-{uid}@example.test", f"VR{uid}")
+    before = customer_row(db, cid)["bowler_value_score"]
+    monkeypatch.setattr(main, "get_threshold", lambda cur: before + 5)
+    monkeypatch.setattr(main, "VERSIUM_API_KEY", None)               # first run: Versium unavailable
+    run_worker_now(db, cid)
+    assert capi_rows(db, f"qb_wr_VR{uid}")[0]["meta_response_status"] == "DEFERRED_ENRICHMENT"
+    monkeypatch.setattr(main, "VERSIUM_API_KEY", "test-versium-key")  # it's back
+    run_worker_now(db, cid)
+    assert customer_row(db, cid)["bowler_value_score"] >= before + 5
+    assert capi_rows(db, f"qb_wr_VR{uid}")[0]["sent_to_meta"] is True
+
+
+def test_never_enriched_customer_with_held_qb_is_requeued_not_dropped(client, db, fake, uid, versium_required,
+                                                                      monkeypatch, deferred):
+    monkeypatch.setattr(main, "get_threshold", lambda cur: 100)
+    cid = _held_qb(client, uid, f"race-{uid}@example.test", f"RQ{uid}")
+    db.execute("UPDATE master_customers SET enrich_after = NULL WHERE cluster_id = %s", (cid,))  # a raced webhook
+    main.process_pending_enrichment(limit=0)                          # only the release sweep runs
+    assert capi_rows(db, f"qb_wr_RQ{uid}")[0]["meta_response_status"] == "DEFERRED_ENRICHMENT"
+    assert customer_row(db, cid)["enrich_after"] is not None          # queued for enrichment again
+
+
+def test_worker_enrichment_after_exhaustion_recovers_the_exhausted_event(client, db, fake, uid, deferred,
+                                                                         versium_required, monkeypatch):
+    monkeypatch.setattr(main, "get_threshold", lambda cur: 100)
+    cid = _held_qb(client, uid, f"vdown-{uid}@example.test", f"WX{uid}")
+    db.execute("UPDATE master_customers SET enrich_attempts = %s WHERE cluster_id = %s",
+               (main.ENRICH_MAX_ATTEMPTS - 1, cid))
+    run_worker_now(db, cid)
+    assert capi_rows(db, f"qb_wr_WX{uid}")[0]["meta_response_body"] == "enrichment_exhausted"
+    # A later webhook brings a working email; the worker enriches them successfully.
+    db.execute("UPDATE master_customers SET email = %s, enrich_after = NOW(), enrich_attempts = 0 WHERE cluster_id = %s",
+               (f"works-{uid}@example.test", cid))
+    monkeypatch.setattr(main, "get_threshold", lambda cur: 0)
+    run_worker_now(db, cid)
+    assert capi_rows(db, f"qb_wr_WX{uid}")[0]["sent_to_meta"] is True
+
+
+def test_customer_with_no_usable_inputs_is_not_requeued_forever(client, db, fake, uid, deferred, versium_required,
+                                                                 monkeypatch):
+    monkeypatch.setattr(main, "get_threshold", lambda cur: 100)
+    cid = client.post("/webhooks/webres", headers=WH, json={
+        "reservation_id": f"NI{uid}", "first_name": f"Only{uid}", "zip": "48375", "amount": 20}).json()["cluster_id"]
+    run_worker_now(db, cid)
+    qb = capi_rows(db, f"qb_wr_NI{uid}")
+    assert not qb or qb[0]["meta_response_status"] == "DROPPED_AFTER_ENRICHMENT"     # a final outcome
+    assert customer_row(db, cid)["enrich_after"] is None                             # not queued again

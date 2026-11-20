@@ -294,27 +294,94 @@ def parse_versium_online_audience(body: dict) -> dict:
     return out
 
 
-def fetch_versium_online_audience(v_headers: dict, v_input: dict, timeout: float = 4):
+# --- Provider HTTP calls (Melissa, Versium) ---------------------------------------------------------------
+# A transient failure (timeout, connection error, HTTP 5xx, 429) is retried inside the call, with a short backoff
+# that honours Retry-After on a 429; a permanent one (any other 4xx) returns at once, so a request that can't
+# succeed never spends another credit. Every failure is logged with the provider, endpoint, HTTP status,
+# response time and a redacted, truncated response body, so a burst can be diagnosed from the logs alone.
+PROVIDER_ATTEMPTS = int(os.getenv("PROVIDER_ATTEMPTS", "3"))   # 1 call + 2 retries
+PROVIDER_BACKOFF_SECONDS = (1.0, 3.0)
+PROVIDER_RETRY_AFTER_MAX = 10.0
+_TRANSIENT_STATUSES = {429, 500, 502, 503, 504}
+_REDACT_EMAIL = re.compile(r"[\w.+-]+@[\w-]+(\.[\w-]+)+")
+_REDACT_DIGITS = re.compile(r"\d[\d\s().-]{6,}\d")
+
+
+def _redact(text) -> str:
+    """A response body for the logs: no email addresses or phone-like numbers, at most 300 characters."""
+    t = _REDACT_EMAIL.sub("<email>", str(text or ""))
+    return _REDACT_DIGITS.sub("<number>", t)[:300]
+
+
+def _retry_after(resp) -> Optional[float]:
+    try:
+        return min(max(float(resp.headers.get("Retry-After")), 0.0), PROVIDER_RETRY_AFTER_MAX)
+    except (TypeError, ValueError, AttributeError):
+        return None
+
+
+_provider_sleep = time.sleep  # tests replace it, so retry backoff doesn't slow the suite
+
+
+def provider_get(provider: str, endpoint: str, url: str, *, params=None, headers=None, timeout: float,
+                 attempts: int = None, outcome: Optional[dict] = None, sleep=None):
+    """GET with retries for transient failures. Returns the last response (any status: the caller reads the
+    body), or None when every attempt failed without a response (timeouts, connection errors). `outcome`, when
+    given, gets {"status", "attempts", "seconds", "error"} for the per-customer enrichment record. The URL and
+    parameters are never logged: they carry the API key and the customer's details."""
+    attempts = max(1, attempts or PROVIDER_ATTEMPTS)
+    sleep = sleep or _provider_sleep
+    resp, err = None, None
+    for n in range(1, attempts + 1):
+        t0 = time.monotonic()
+        try:
+            resp, err = requests.get(url, params=params, headers=headers, timeout=timeout), None
+        except Exception as e:  # Timeout, ConnectionError, ...
+            resp, err = None, type(e).__name__
+        took = round(time.monotonic() - t0, 2)
+        status = getattr(resp, "status_code", None)
+        transient = err is not None or status in _TRANSIENT_STATUSES
+        if outcome is not None:
+            outcome.update(status=status, attempts=n, seconds=took, error=err)
+        if not transient:
+            if n > 1:
+                log.info("%s %s answered (HTTP %s) on attempt %d of %d", provider, endpoint, status, n, attempts)
+            return resp
+        body = _redact(getattr(resp, "text", "")) if resp is not None else ""
+        last = n == attempts
+        log.warning("%s %s failed (attempt %d of %d): %s after %.2fs%s%s", provider, endpoint, n, attempts,
+                    f"HTTP {status}" if status else err, took, f"; body: {body}" if body else "",
+                    "; giving up" if last else "; retrying")
+        if last:
+            return resp
+        wait = (_retry_after(resp) if status == 429 else None)
+        sleep(wait if wait is not None else PROVIDER_BACKOFF_SECONDS[min(n - 1, len(PROVIDER_BACKOFF_SECONDS) - 1)])
+    return resp
+
+
+VERSIUM_ONLINE_TIMEOUT = 8
+
+
+def fetch_versium_online_audience(v_headers: dict, v_input: dict, timeout: float = VERSIUM_ONLINE_TIMEOUT,
+                                  attempts: int = None, outcome: Optional[dict] = None):
     """Returns the parsed IDs plus `_checked` (today), `{"_checked": today}` when Versium has no match,
     or None when the call failed or was rejected (bad parameter, no credits, auth), which is logged
     with Versium's reason and left for /cron/versium-online-audience to retry."""
-    resp = requests.get(
-        "https://api.versium.com/v2/onlineAudience",
-        headers=v_headers,
-        params={**v_input, "rcfg_oa_services[]": list(VERSIUM_ONLINE_AUDIENCE_SERVICES)},
-        timeout=timeout,
-    )
+    resp = provider_get("Versium", "onlineAudience", "https://api.versium.com/v2/onlineAudience",
+                        headers=v_headers,
+                        params={**v_input, "rcfg_oa_services[]": list(VERSIUM_ONLINE_AUDIENCE_SERVICES)},
+                        timeout=timeout, attempts=attempts, outcome=outcome)
+    if resp is None:
+        return None  # every attempt timed out or failed to connect (logged); stays retryable
     try:
         body = resp.json()
     except ValueError:
         body = None
     if resp.status_code == 200 and not isinstance(body, dict):
-        log.error("Versium online audience returned an unreadable answer (HTTP 200)")
+        log.error("Versium online audience returned an unreadable answer (HTTP 200): %s", _redact(resp.text))
         return None  # stays retryable; never recorded as a no-match
     if resp.status_code != 200:
-        body = body if isinstance(body, dict) else {}
-        err = body.get("errors") or body.get("error") or body.get("message") if isinstance(body, dict) else None
-        log.error("Versium online audience rejected (HTTP %s): %s", resp.status_code, str(err)[:300])
+        log.error("Versium online audience rejected (HTTP %s): %s", resp.status_code, _redact(resp.text))
         return None
     return {**parse_versium_online_audience(body), "_checked": date.today().isoformat()}
 
@@ -560,18 +627,29 @@ def apply_census(result: dict, census: dict) -> dict:
     return result
 
 
+MELISSA_TIMEOUT = 10
+
+
 def melissa_lookup(first_name: str, last_name: str, email: str, phone: str,
-                   address: str = "", city: str = "", state: str = "", zip_code: str = "") -> dict:
+                   address: str = "", city: str = "", state: str = "", zip_code: str = "",
+                   outcome: Optional[dict] = None, attempts: int = None) -> dict:
     """Melissa Personator: verified address, geocode + distance, census/school fields, household demographics.
-    Returns {} when Melissa isn't configured or didn't answer (so `md_results` stays None)."""
+    Returns {} when Melissa isn't configured or didn't answer (so `md_results` stays None). `outcome`, when
+    given, says what happened: answered / failed (HTTP status or error) / rejected (TransmissionResults)."""
+    out = outcome if outcome is not None else {}
     if not MELISSA_API_KEY:
+        out["result"] = "not_configured"
         return {}
     zip_code = (zip_code or "")[:5]
     if "Append" not in MELISSA_ACT and not (address or "").strip():
+        out["result"] = "skipped_no_street"
         return {"md_results": MELISSA_NO_STREET}  # nothing Melissa can check; don't spend a credit
+    if not any([(address or "").strip(), (email or "").strip(), clean_phone(phone)]):
+        out["result"] = "skipped_no_inputs"
+        return {}  # nothing to look up: a request would only spend a credit on a rejection
     try:
-        m_resp = requests.get(
-            "https://personator.melissadata.net/v3/WEB/ContactVerify/doContactVerify",
+        m_resp = provider_get(
+            "Melissa", "Personator", "https://personator.melissadata.net/v3/WEB/ContactVerify/doContactVerify",
             params={
                 "id": MELISSA_API_KEY,
                 "act": MELISSA_ACT,
@@ -585,22 +663,32 @@ def melissa_lookup(first_name: str, last_name: str, email: str, phone: str,
                 "state": state,
                 "postal": zip_code,
             },
-            timeout=5,
+            timeout=MELISSA_TIMEOUT, attempts=attempts, outcome=out,
         )
-        m_resp.raise_for_status()
+        if m_resp is None:
+            out["result"] = "failed"
+            return {}  # timeouts / connection errors on every attempt (logged by provider_get)
+        if m_resp.status_code != 200:
+            out["result"] = "failed"
+            log.error("Melissa Personator failed (HTTP %s): %s", m_resp.status_code, _redact(m_resp.text))
+            return {}
         body = m_resp.json()
         rec = (body.get("Records") or [{}])[0]
     except Exception as e:
-        log.warning("Melissa lookup failed: %s", type(e).__name__)
+        out["result"] = "failed"
+        log.warning("Melissa Personator returned an unreadable answer: %s", type(e).__name__)
         return {}
     # Melissa pads missing values with spaces; never let a blank overwrite real data.
     rec = {k: (v.strip() if isinstance(v, str) else v) for k, v in (rec or {}).items()}
     rec = {k: v for k, v in rec.items() if v not in ("", None)}
     transmission = str((body or {}).get("TransmissionResults") or "").strip()
     if transmission:
-        # Melissa rejected the request itself (bad parameter, license, credits): not an answer; retry later.
-        log.error("Melissa rejected the request (TransmissionResults=%s)", transmission[:100])
+        # Melissa rejected the request itself (bad parameter, license, credits): permanent for this request, so
+        # it isn't retried here (a retry would fail the same way); the customer stays retryable for later.
+        out["result"] = f"rejected:{transmission[:40]}"
+        log.error("Melissa Personator rejected the request (TransmissionResults=%s)", transmission[:100])
         return {}
+    out["result"] = "answered"
     has_street = bool((rec.get("AddressLine1") or address or "").strip())
     lat = to_float(rec.get("Latitude")) if has_street else 0.0
     lon = to_float(rec.get("Longitude")) if has_street else 0.0
@@ -646,22 +734,24 @@ def melissa_lookup(first_name: str, last_name: str, email: str, phone: str,
 # full_demographic are never requested). A rejected call is logged and returns None so it stays retryable.
 # ---------------------------------------------------------------------------
 VERSIUM_DEMOGRAPHIC_OUTPUTS = ("demographic", "financial", "lifestyle")
-VERSIUM_TIMEOUT = 5
+VERSIUM_TIMEOUT = 8  # was 5: the observed ReadTimeouts were slow answers, not outages
+# Versium is required for enrichment to count as finished (production). Tests and deployments without Versium
+# set it to false; then a customer with no Versium key is treated as fully enriched, as before.
+VERSIUM_REQUIRED = os.getenv("VERSIUM_REQUIRED", "true").strip().lower() in ("1", "true", "yes")
 
 
 def versium_key(name) -> str:
     return re.sub(r"[^a-z0-9]+", "_", str(name).lower()).strip("_")
 
 
-def versium_call(endpoint: str, v_headers: dict, params: dict, timeout: float = VERSIUM_TIMEOUT):
+def versium_call(endpoint: str, v_headers: dict, params: dict, timeout: float = VERSIUM_TIMEOUT,
+                 attempts: int = None, outcome: Optional[dict] = None):
     """First result of a Versium /v2/<endpoint> call: a dict ({} = no match), or None when the call failed
-    or was rejected (logged with Versium's reason)."""
-    try:
-        resp = requests.get(f"https://api.versium.com/v2/{endpoint}", headers=v_headers, params=params,
-                            timeout=timeout)
-    except Exception as e:
-        log.warning("Versium %s lookup failed: %s", endpoint, type(e).__name__)
-        return None
+    or was rejected (logged with the HTTP status and Versium's answer). Transient failures are retried."""
+    resp = provider_get("Versium", endpoint, f"https://api.versium.com/v2/{endpoint}", headers=v_headers,
+                        params=params, timeout=timeout, attempts=attempts, outcome=outcome)
+    if resp is None:
+        return None  # every attempt timed out or failed to connect (logged)
     try:
         body = resp.json()
     except ValueError:
@@ -669,7 +759,8 @@ def versium_call(endpoint: str, v_headers: dict, params: dict, timeout: float = 
     v = body.get("versium") if isinstance(body, dict) and isinstance(body.get("versium"), dict) else {}
     errors = v.get("errors") or (body.get("errors") if isinstance(body, dict) else None)
     if resp.status_code != 200 or not isinstance(body, dict) or errors:
-        log.error("Versium %s rejected (HTTP %s): %s", endpoint, resp.status_code, str(errors)[:300])
+        log.error("Versium %s rejected (HTTP %s): %s", endpoint, resp.status_code,
+                  _redact(errors if errors else resp.text))
         return None
     results = v.get("results") or []
     first = results[0] if isinstance(results, list) and results else {}
@@ -734,9 +825,15 @@ def versium_checked(cust: dict) -> bool:
     return bool(isinstance(flags, dict) and (flags.get("_versium_checked") or flags.get("_source")))
 
 
+def _call_outcome(o: dict, answer) -> str:
+    if answer is None:
+        return f"failed:{o.get('status') or o.get('error') or 'unknown'}"
+    return "answered" if answer else "no_match"
+
+
 def run_versium_enrichment(result: dict, first_name: str, last_name: str, email: str, phone: str,
                            address: str, city: str, state: str, zip_code: str, known: dict,
-                           started: float, online_budget: float = None) -> dict:
+                           started: float, online_budget: float = None, attempts: int = None) -> dict:
     """Versium contact (alt emails/phones; the address when we have no street), then demographics, then the
     online audience append, updating `result` in place. Geography gates use the best address known so far,
     including one Versium just found, so excluded or out-of-state people aren't enriched further."""
@@ -744,7 +841,20 @@ def run_versium_enrichment(result: dict, first_name: str, last_name: str, email:
     gate = lambda: (result.get("md_city") or known.get("md_city"), result.get("md_state") or known.get("md_state"),
                     result.get("zip5") or known.get("zip5"))
     g_city, g_state, g_zip = gate()
-    if not VERSIUM_API_KEY or is_detroit_excluded(g_city, g_zip):
+    outcome = result.setdefault("_outcome", {})
+    if is_detroit_excluded(g_city, g_zip):
+        outcome["versium"] = "skipped_excluded_area"
+        return result
+    if not VERSIUM_API_KEY:
+        if versium_checked(known):
+            outcome["versium"] = "already"   # an answer already stored stays valid without the key
+            return result
+        if VERSIUM_REQUIRED:
+            # Not an answer: enrichment can't finish, so held events wait (and the customer is retried) instead
+            # of being judged on a score that's missing Versium's data.
+            log.error("Versium enrichment skipped: VERSIUM_API_KEY is not set")
+            result["_versium_failed"] = True
+            outcome["versium"] = "failed:not_configured"
         return result
     already = versium_checked(known)  # answered before (live or CSV): never buy contact/demographics again
     kflags = known.get("versium_lifestyle_flags") if isinstance(known.get("versium_lifestyle_flags"), dict) else {}
@@ -758,8 +868,11 @@ def run_versium_enrichment(result: dict, first_name: str, last_name: str, email:
         "state": result.get("md_state") or state or known.get("md_state"),
         "zip": result.get("zip5") or zip_code or known.get("zip5"), "country": "US"}.items() if v}
     outputs = ["email_multiple", "phone_multiple"] + ([] if street else ["address"])
+    oc = {}
     contact = None if contact_done else versium_call("contact", v_headers,
-                                                     {**v_input, "output[]": outputs, "rcfg_max_emails": 5})
+                                                     {**v_input, "output[]": outputs, "rcfg_max_emails": 5},
+                                                     attempts=attempts, outcome=oc)
+    outcome["versium_contact"] = "already" if contact_done else _call_outcome(oc, contact)
     if contact is None and not contact_done:
         result["_versium_failed"] = True
         result["_versium_contact_failed"] = True
@@ -781,8 +894,11 @@ def run_versium_enrichment(result: dict, first_name: str, last_name: str, email:
     g_city, g_state, g_zip = gate()
     if is_detroit_excluded(g_city, g_zip):
         return result  # Versium's address put them in an excluded area: no demographics or ad IDs
+    od = {}
     demo = None if demo_done else versium_call("demographic", v_headers,
-                                               {**v_input, "output[]": list(VERSIUM_DEMOGRAPHIC_OUTPUTS)})
+                                               {**v_input, "output[]": list(VERSIUM_DEMOGRAPHIC_OUTPUTS)},
+                                               attempts=attempts, outcome=od)
+    outcome["versium_demographic"] = "already" if demo_done else _call_outcome(od, demo)
     if demo is None and not demo_done:
         result["_versium_failed"] = True
         result["_versium_demo_failed"] = True
@@ -803,10 +919,14 @@ def run_versium_enrichment(result: dict, first_name: str, last_name: str, email:
     budget = VERSIUM_ONLINE_BUDGET_SECONDS if online_budget is None else online_budget
     if not known.get("versium_online_audience") and versium_online_append_eligible(g_city, g_state, g_zip) and \
             time.monotonic() - started < budget:
+        oo = {}
         try:
-            result["online_audience"] = fetch_versium_online_audience(v_headers, v_input) or {}
+            oa = fetch_versium_online_audience(v_headers, v_input, attempts=attempts, outcome=oo)
+            result["online_audience"] = oa or {}
+            outcome["versium_online_audience"] = _call_outcome(oo, oa)
         except Exception as e:
-            log.warning("Versium online audience lookup failed: %s", type(e).__name__)
+            log.warning("Versium onlineAudience lookup failed: %s", type(e).__name__)
+            outcome["versium_online_audience"] = f"failed:{type(e).__name__}"
     return result
 
 
@@ -839,8 +959,14 @@ def run_melissa_and_versium_waterfall(first_name: str, last_name: str, email: st
         return result
 
     # --- STEP 1: MELISSA PERSONATOR (only when MELISSA_LIVE) ---
+    # Inside a webhook (ENRICH_DELAY_MINUTES=0) someone is waiting, so one attempt per call; the deferred worker
+    # retries transient failures.
+    attempts = PROVIDER_ATTEMPTS if unhurried else 1
     if MELISSA_LIVE and not (known or {}).get("md_mik"):  # not twice: the webhook may have run it already
-        result.update(melissa_lookup(first_name, last_name, email, phone, address, city, state, zip_code))
+        mo = {}
+        result.update(melissa_lookup(first_name, last_name, email, phone, address, city, state, zip_code,
+                                     outcome=mo, attempts=attempts))
+        result.setdefault("_outcome", {})["melissa"] = mo.get("result")
 
     if address and not result.get("md_address1"):
         result["md_address1"] = address.strip()  # the customer's own street (Melissa off or no answer)
@@ -848,7 +974,7 @@ def run_melissa_and_versium_waterfall(first_name: str, last_name: str, email: st
     # --- STEP 2: VERSIUM REACH: alt contacts, the address when there's no street, demographics, ad IDs ---
     # unhurried (the deferred worker): nobody is waiting, so no step is skipped for time.
     run_versium_enrichment(result, first_name, last_name, email, phone, address, city, state, zip_code,
-                           known, started, online_budget=float("inf") if unhurried else None)
+                           known, started, online_budget=float("inf") if unhurried else None, attempts=attempts)
 
     # --- STEP 3: US CENSUS GEOCODER (free): census/school fields, coordinates + distance when none ---
     street = result.get("md_address1") or address
@@ -3761,9 +3887,31 @@ def run_partywirks_sync(days_back: int = 3, count_bookings_created_since: str = 
 _VERSIUM_MARKERS = ("_versium_checked", "_versium_contact_done", "_versium_demo_done")
 
 
-def release_deferred_events(cur, cust: dict) -> collections.Counter:
+def versium_queryable(cust: dict) -> bool:
+    """Whether there's anything to look up: the same test run_melissa_and_versium_waterfall applies before
+    calling a provider (an email, a phone, a street, or a full name with a ZIP)."""
+    c = cust or {}
+    return any([str(c.get("email") or "").strip(), clean_phone(c.get("phone")), str(c.get("md_address1") or "").strip(),
+                c.get("first_name") and c.get("last_name") and c.get("zip5")])
+
+
+def enrichment_complete(cust: dict) -> bool:
+    """True when the customer's score can be trusted for a drop: Versium has answered (match or no match, live or
+    the CSV import), or Versium doesn't apply (an excluded area, nothing to look up, or a deployment without
+    Versium). Nothing to look up is final: re-queueing such a customer would never change the answer."""
+    if versium_checked(cust) or not VERSIUM_REQUIRED or not versium_queryable(cust):
+        return True
+    return is_detroit_excluded(cust.get("md_city"), cust.get("zip5"))
+
+
+def release_deferred_events(cur, cust: dict, exhausted: bool = False) -> collections.Counter:
     """Sends the Meta events held while the customer waited for enrichment, now that the address and score are
-    known: Purchase if not in an excluded area; Qualified_Bowler and Lead also need the score threshold."""
+    known: Purchase if not in an excluded area; Qualified_Bowler and Lead also need the score threshold.
+
+    A Qualified_Bowler / Lead is only dropped as below_threshold once enrichment finished (enrichment_complete):
+    a score missing Versium's data is understated. If enrichment hasn't finished, it stays held and the customer
+    is queued for enrichment again; after the worker's last attempt (exhausted) it's dropped as
+    enrichment_exhausted, which the Versium catch-up re-evaluates once Versium answers (reevaluate_exhausted)."""
     out = collections.Counter()
     cur.execute("""SELECT * FROM capi_events_log WHERE cluster_id = %s AND NOT sent_to_meta
                    AND meta_response_status = 'DEFERRED_ENRICHMENT' ORDER BY sent_at FOR UPDATE;""",
@@ -3776,9 +3924,17 @@ def release_deferred_events(cur, cust: dict) -> collections.Counter:
     score = int(cust.get("bowler_value_score") or 0)
     cur.execute("UPDATE capi_events_log SET bowler_value_score = %s, threshold_at_send = %s "
                 "WHERE event_id = ANY(%s);", (score, thresh, [r["event_id"] for r in rows]))
+    complete = enrichment_complete(cust)
+    requeue = False
     for r in rows:
         reason = "excluded_area" if excluded else (
             "below_threshold" if r["event_name"] in ("Qualified_Bowler", "Lead") and score < thresh else None)
+        if reason == "below_threshold" and not complete:
+            if not exhausted:
+                requeue = True
+                out["held_enrichment_incomplete"] += 1
+                continue
+            reason = "enrichment_exhausted"
         if reason:
             cur.execute("UPDATE capi_events_log SET meta_response_status = 'DROPPED_AFTER_ENRICHMENT', "
                         "meta_response_body = %s WHERE event_id = %s;", (reason, r["event_id"]))
@@ -3787,7 +3943,36 @@ def release_deferred_events(cur, cust: dict) -> collections.Counter:
         fire_meta_capi_event(cur, cust, r["event_name"], float(r["event_value"] or 0), thresh, r["event_id"],
                              action_source=r.get("meta_response_body") or _action_source_for(r["event_id"]))
         out["sent"] += 1
+    if requeue:
+        # Never enriched (or enrichment didn't finish): enrich again; the worker releases the events afterwards.
+        cur.execute("UPDATE master_customers SET enrich_after = NOW() + INTERVAL '1 minute' "
+                    "WHERE cluster_id = %s AND enrich_after IS NULL;", (cust["cluster_id"],))
     return out
+
+
+def reevaluate_exhausted(cur, cust: dict) -> collections.Counter:
+    """After a later enrichment (the Versium catch-up) finished for this customer, events dropped as
+    enrichment_exhausted that Meta still accepts are judged again on the now-complete score: sent, or dropped
+    as below_threshold / excluded_area."""
+    if not enrichment_complete(cust):
+        return collections.Counter()
+    cur.execute("""UPDATE capi_events_log SET meta_response_status = 'DEFERRED_ENRICHMENT', meta_response_body = NULL
+                   WHERE cluster_id = %s AND NOT sent_to_meta AND meta_response_status = 'DROPPED_AFTER_ENRICHMENT'
+                     AND meta_response_body = 'enrichment_exhausted'
+                     AND COALESCE(event_time, sent_at) > NOW() - make_interval(days => %s)
+                   RETURNING event_id;""", (cust["cluster_id"], RETRY_MAX_AGE_DAYS))
+    if not cur.fetchall():
+        return collections.Counter()
+    return release_deferred_events(cur, cust)
+
+
+def record_enrichment_outcome(cur, cluster_id, enr: dict, attempt: int, final: str):
+    """Which providers answered or failed for this customer, after which attempt, and how it ended, readable
+    from the database (master_customers.enrich_outcome, migrations/015)."""
+    rec = {"at": datetime.now(timezone.utc).isoformat(), "attempt": attempt, "final": final,
+           **{k: v for k, v in (enr.get("_outcome") or {}).items() if v}}
+    cur.execute("UPDATE master_customers SET enrich_outcome = %s::jsonb WHERE cluster_id = %s;",
+                (json.dumps(rec), cluster_id))
 
 
 def _claim_pending(conn):
@@ -3835,6 +4020,7 @@ def enrich_pending_customer(conn, rec: dict) -> str:
         cur.execute("SELECT 1 FROM master_customers WHERE cluster_id = %s FOR UPDATE;", (rec["cluster_id"],))
         cust = save_enrichment(cur, rec["cluster_id"], enr, "enrichment")  # keeps whatever was paid for
         if failed and rec["enrich_attempts"] < ENRICH_MAX_ATTEMPTS:
+            record_enrichment_outcome(cur, rec["cluster_id"], enr, rec["enrich_attempts"], "retry_later")
             cur.execute("UPDATE master_customers SET enrich_after = NOW() + make_interval(mins => %s) "
                         "WHERE cluster_id = %s;", (15 * rec["enrich_attempts"], rec["cluster_id"]))
             return "retry_later"
@@ -3851,10 +4037,18 @@ def enrich_pending_customer(conn, rec: dict) -> str:
                                    enrich_inputs = enrich_inputs || '{"_retry": true}'::jsonb
                                WHERE cluster_id = %s;""", (rec["cluster_id"],))
                 return "rerun_new_details"
+        record_enrichment_outcome(cur, rec["cluster_id"], enr, rec["enrich_attempts"],
+                                  "gave_up_versium" if failed else "enriched")
         cur.execute("UPDATE master_customers SET enrich_after = NULL, enrich_inputs = NULL, enrich_attempts = 0 "
                     "WHERE cluster_id = %s RETURNING *;", (rec["cluster_id"],))
         cust = rescore_customer(cur, cur.fetchone(), exact=True)
-        released = release_deferred_events(cur, cust)
+        # After the last attempt (failed): an event that would be dropped on this understated score is dropped as
+        # enrichment_exhausted, which the Versium catch-up re-evaluates.
+        released = release_deferred_events(cur, cust, exhausted=failed)
+        if not failed:
+            # Events dropped as enrichment_exhausted on an earlier run are judged again now that it finished
+            # (the Versium catch-up does the same for customers the worker doesn't see again).
+            released.update(reevaluate_exhausted(cur, cust))
         qualified = not is_detroit_excluded(cust.get("md_city"), cust.get("zip5"))  # seeds don't need the score
     if qualified:
         try:
@@ -4133,7 +4327,8 @@ def melissa_geocode_catch_up(request: Request, limit: int = 100, key: Optional[s
                 LIMIT %s;
                 """, (limit,))
             rows = cur.fetchall()
-        geocoded = no_coordinates = failures = newly_excluded = skipped = 0
+        geocoded = no_coordinates = failures = newly_excluded = skipped = consecutive_failures = 0
+        stopped_early = False
         for cand in rows:
             # Lock the row for the lookup and recheck it, so overlapping runs never pay twice for one
             # customer (the lock is released on commit/rollback, so a crashed run leaves nothing behind).
@@ -4154,7 +4349,14 @@ def melissa_geocode_catch_up(request: Request, limit: int = 100, key: Optional[s
                                      r.get("md_state") or "", r.get("zip5") or "")
                 if enr.get("md_results") is None:
                     failures += 1  # Melissa didn't answer; try again next run
+                    consecutive_failures += 1
+                    if consecutive_failures >= 3:
+                        # Melissa is failing (outage, rate limit, credits): stop instead of failing the whole
+                        # batch; the reason is in the logs (HTTP status + body).
+                        stopped_early = True
+                        break
                     continue
+                consecutive_failures = 0
                 enr["md_results"] = f"{enr['md_results'].rstrip(',')},GEO_TRIED"
                 if enr.get("md_latitude"):
                     geocoded += 1
@@ -4167,7 +4369,7 @@ def melissa_geocode_catch_up(request: Request, limit: int = 100, key: Optional[s
                 newly_excluded += 1
         return {"status": "melissa_geocode", "looked_up": geocoded + no_coordinates, "geocoded": geocoded,
                 "no_coordinates": no_coordinates, "now_in_excluded_area": newly_excluded,
-                "failed_retry_later": failures, "skipped_already_handled": skipped}
+                "failed_retry_later": failures, "skipped_already_handled": skipped, "stopped_early": stopped_early}
     finally:
         conn.close()
 
@@ -4251,7 +4453,9 @@ def versium_enrich_catch_up(request: Request, limit: int = 100, key: Optional[st
                 if not MELISSA_LIVE and r.get("md_results") is None and not enr.get("_versium_failed"):
                     enr["md_results"] = MELISSA_OFF  # finished: webhooks won't look this customer up again
                 cust = save_enrichment(cur, r["cluster_id"], enr, "versium")
-                rescore_customer(cur, cust, exact=True)
+                cust = rescore_customer(cur, cust, exact=True)
+                # Events dropped because enrichment never finished are judged again now that it has.
+                stats.update({f"reevaluated_{k}": v for k, v in reevaluate_exhausted(cur, cust).items()})
         out = {"status": "versium_enrich", "eligible_in_batch": len(rows), **stats,
                "stopped_early": consecutive_failures >= 3}
         log.info("Versium enrich catch-up: %s", out)
@@ -4474,6 +4678,8 @@ def health():
         "cron_key_check": bool(CRON_SECRET),
         "partywirks_signature_check": ("enforced" if PARTYWIRKS_SIGNATURE_ENFORCE else "logging only")
                                       if PARTYWIRKS_WEBHOOK_SECRET else False,
+        # Enrichment can't finish without it (VERSIUM_REQUIRED): held events wait and customers are retried.
+        "versium_key_set": bool(VERSIUM_API_KEY),
     }
 
 

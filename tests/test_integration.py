@@ -2160,7 +2160,7 @@ def test_lead_form_click_ids_are_sent_on_tripleseat_events(client, db, fake, uid
     assert ud["fbp"] == FBP and ud["fbc"] == FBC and ud["client_user_agent"].startswith("Mozilla/5.0")
     assert "client_ip_address" not in ud                                   # no source gives it
     c = customer_row(db, cid)
-    assert c["meta_fbp"] == FBP and c["meta_browser_ids_at"] is not None
+    assert c["meta_fbp"] == FBP and c["meta_fbp_at"] is not None and c["meta_fbc_at"] is not None
     # The same party later booked: its QB carries them too.
     client.post("/webhooks/tripleseat", headers=WH, json={"event": {
         "id": f"FE{uid}", "first_name": "Form", "last_name": f"Lead{uid}", "email_address": f"form-{uid}@example.test",
@@ -2188,7 +2188,7 @@ def test_older_capture_never_replaces_a_newer_one(client, db, fake, uid, everyon
 
 def test_stale_capture_is_not_sent(client, db, fake, uid, everyone_qualifies):
     r = client.post("/webhooks/tripleseat", headers=WH, json=ts_form_lead(uid, {"fbp": FBP}, rid=f"S{uid}")).json()
-    db.execute("UPDATE master_customers SET meta_browser_ids_at = NOW() - INTERVAL '120 days' WHERE cluster_id = %s",
+    db.execute("UPDATE master_customers SET meta_fbp_at = NOW() - INTERVAL '120 days' WHERE cluster_id = %s",
                (r["cluster_id"],))
     client.post("/webhooks/tripleseat", headers=WH, json={"event": {
         "id": f"SE{uid}", "first_name": "Form", "last_name": f"Lead{uid}", "email_address": f"form-{uid}@example.test",
@@ -2208,3 +2208,19 @@ def test_held_event_that_aged_past_metas_limit_is_sent_with_the_send_time(client
     ev = _ev(fake, f"sq_pay_EX{uid}")[0]
     assert _close_to_now(ev["event_time"])          # sendable, not a rejected 7-day-old timestamp
     assert capi_rows(db, f"sq_pay_EX{uid}")[0]["sent_to_meta"] is True
+
+
+def test_newer_partial_capture_keeps_the_stored_click_id(client, db, fake, uid, everyone_qualifies):
+    """A later visit not from an ad click has fbp and user agent but no fbc: the stored fbc survives, with its own
+    capture time (it isn't made to look fresh)."""
+    first = _dt.now(_tz.utc) - _td(days=2)
+    client.post("/webhooks/tripleseat", headers=WH, json=ts_form_lead(
+        uid, {"fbp": FBP, "fbc": FBC, "user_agent": "Mozilla/5.0 (Old phone)"}, created=first, rid=f"P1{uid}"))
+    new_fbp = "fb.1.1763800000000.5555555555"
+    r = client.post("/webhooks/tripleseat", headers=WH, json=ts_form_lead(
+        uid, {"fbp": new_fbp, "user_agent": "Mozilla/5.0 (New phone)"}, rid=f"P2{uid}", date="2027-07-04")).json()
+    c = customer_row(db, r["cluster_id"])
+    assert c["meta_fbc"] == FBC and abs((c["meta_fbc_at"] - first).total_seconds()) < 2   # kept, original time
+    assert c["meta_fbp"] == new_fbp and c["meta_client_user_agent"] == "Mozilla/5.0 (New phone)"
+    ud = _ev(fake, f"lead_ts_{r['cluster_id']}_2027-07-04")[0]["user_data"]
+    assert ud["fbc"] == FBC and ud["fbp"] == new_fbp

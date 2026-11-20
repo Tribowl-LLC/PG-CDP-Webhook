@@ -19,9 +19,12 @@ WHERE l.event_time IS NULL
   AND u.transaction_date <= NOW()
   AND u.transaction_date > NOW() - INTERVAL '7 days';
 
--- fbp / fbc / user agent from the Tripleseat lead form (see site-snippets/), with when they were captured.
--- Sent only on that customer's Tripleseat events and only while the capture is younger than 90 days.
+-- fbp / fbc / user agent from the Tripleseat lead form (see site-snippets/), each with when it was captured: a
+-- newer capture that lacks one of them (no ad click = no fbc) never erases or "refreshes" the stored one.
+-- Sent only on that customer's Tripleseat events and only while that value's capture is younger than 90 days.
 ALTER TABLE master_customers ADD COLUMN IF NOT EXISTS meta_fbp TEXT;
+ALTER TABLE master_customers ADD COLUMN IF NOT EXISTS meta_fbp_at TIMESTAMPTZ;
 ALTER TABLE master_customers ADD COLUMN IF NOT EXISTS meta_fbc TEXT;
+ALTER TABLE master_customers ADD COLUMN IF NOT EXISTS meta_fbc_at TIMESTAMPTZ;
 ALTER TABLE master_customers ADD COLUMN IF NOT EXISTS meta_client_user_agent TEXT;
-ALTER TABLE master_customers ADD COLUMN IF NOT EXISTS meta_browser_ids_at TIMESTAMPTZ;
+ALTER TABLE master_customers ADD COLUMN IF NOT EXISTS meta_client_user_agent_at TIMESTAMPTZ;

@@ -1246,7 +1246,12 @@ def sync_customer_to_meta_custom_audiences(cust: dict, facts: Optional[dict] = N
 # Meta attributes an event by its event_time, so it's the moment the purchase/booking/lead happened, not when we
 # send it (after the enrichment hold, or a retry hours later). Meta only accepts events up to 7 days old.
 META_MAX_EVENT_AGE = timedelta(days=7)
-VENUE_TZ = ZoneInfo("America/Detroit")  # Partywirks sends local times without an offset
+# Partywirks sends local times without an offset. Checked 2026-11-20 against production: for the six orders that
+# had sent a QB, the API's created_at (read as UTC) was 5.03-16.8 h before our first record of the order
+# (unified_transactions.recorded_at). The smallest gap, 5.03 h, is the EST offset (UTC-5) plus ~2 minutes of
+# webhook delay, i.e. created_at is venue local time; the longer gaps are orders first recorded by the nightly
+# catch-up sync. Six samples, one of them real-time: re-check after deploy (see PR #33).
+VENUE_TZ = ZoneInfo("America/Detroit")
 
 
 def parse_source_time(val, naive_tz=timezone.utc) -> Optional[datetime]:
@@ -1284,9 +1289,9 @@ def meta_event_time(txn_time: Optional[datetime], now: Optional[datetime] = None
 # --- Browser identifiers (fbp / fbc / user agent) ----------------------------------------------------------
 # Only one source passes them: the Tripleseat lead form on myperfectgame.com (/groups-and-parties), whose page
 # script copies the _fbp/_fbc cookies (or builds fbc from an fbclid in the URL, Meta's documented format) and the
-# browser's user agent into hidden custom fields (site-snippets/tripleseat_lead_form_meta_ids.html). They're
-# stored on the customer with the time they were captured and sent only on that customer's Tripleseat events
-# (qb_ts_ / lead_ts_), only while the capture is younger than BROWSER_IDS_MAX_AGE. Square, WebRes and Partywirks
+# browser's user agent into hidden custom fields (site-snippets/tripleseat_lead_form_meta_ids.html). Each is
+# stored on the customer with its own capture time (a later visit without an ad click keeps the stored fbc) and
+# sent only on that customer's Tripleseat events (qb_ts_ / lead_ts_), only while younger than BROWSER_IDS_MAX_AGE. Square, WebRes and Partywirks
 # carry no browser identifiers (in-store / Gmail / server-to-server), so their events send none. No source gives
 # the client IP address: it's never sent.
 BROWSER_IDS_MAX_AGE = timedelta(days=90)
@@ -1320,15 +1325,22 @@ def ts_browser_ids(obj: dict) -> dict:
     return found
 
 
+_BROWSER_COLUMNS = {"fbp": "meta_fbp", "fbc": "meta_fbc", "ua": "meta_client_user_agent"}
+
+
 def save_browser_ids(cur, cluster_id, ids: dict, captured_at: Optional[datetime]):
-    """Keeps the most recent capture for a customer (an older one never replaces a newer one)."""
+    """Stores each identifier the capture has, with its own capture time. Per field, the newest capture wins: an
+    older capture never replaces a newer value, and a field the capture lacks (a visit not from an ad click has
+    no fbc) keeps its stored value and its original capture time, so it still ages out on schedule."""
     if not cluster_id or not ids:
         return
     when = min(captured_at or datetime.now(timezone.utc), datetime.now(timezone.utc))
-    cur.execute("""UPDATE master_customers SET meta_fbp = %s, meta_fbc = %s, meta_client_user_agent = %s,
-                       meta_browser_ids_at = %s
-                   WHERE cluster_id = %s AND (meta_browser_ids_at IS NULL OR meta_browser_ids_at <= %s);""",
-                (ids.get("fbp"), ids.get("fbc"), ids.get("ua"), when, cluster_id, when))
+    for key, col in _BROWSER_COLUMNS.items():
+        if not ids.get(key):
+            continue
+        cur.execute(f"""UPDATE master_customers SET {col} = %s, {col}_at = %s
+                        WHERE cluster_id = %s AND ({col}_at IS NULL OR {col}_at <= %s);""",
+                    (ids[key], when, cluster_id, when))
 
 
 def browser_user_data(cust: dict, event_id: str) -> dict:
@@ -1336,12 +1348,13 @@ def browser_user_data(cust: dict, event_id: str) -> dict:
     capture younger than BROWSER_IDS_MAX_AGE, and only fields that are known (never empty strings)."""
     if not (event_id.startswith("qb_ts_") or event_id.startswith("lead_ts_")):
         return {}
-    at = cust.get("meta_browser_ids_at")
-    if not at or at < datetime.now(timezone.utc) - BROWSER_IDS_MAX_AGE:
-        return {}
-    out = {"fbp": cust.get("meta_fbp"), "fbc": cust.get("meta_fbc"),
-           "client_user_agent": cust.get("meta_client_user_agent")}
-    return {k: v for k, v in out.items() if v}
+    oldest = datetime.now(timezone.utc) - BROWSER_IDS_MAX_AGE
+    out = {}
+    for meta_key, col in (("fbp", "meta_fbp"), ("fbc", "meta_fbc"), ("client_user_agent", "meta_client_user_agent")):
+        at = cust.get(f"{col}_at")
+        if cust.get(col) and at and at >= oldest:   # each value by its own capture time
+            out[meta_key] = cust[col]
+    return out
 
 
 def fire_meta_capi_event(cur, cust: dict, event_name: str, value: float, threshold: int,

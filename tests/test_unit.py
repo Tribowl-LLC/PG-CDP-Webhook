@@ -961,15 +961,20 @@ def test_tripleseat_custom_fields_give_browser_ids_only_in_meta_format():
 
 
 def test_browser_ids_only_on_tripleseat_events_and_only_while_fresh():
-    fresh = {"meta_fbp": FBP, "meta_fbc": None, "meta_client_user_agent": "Mozilla/5.0 (iPhone)",
-             "meta_browser_ids_at": _dt.now(_tz.utc) - _td(days=3)}
+    recent = _dt.now(_tz.utc) - _td(days=3)
+    fresh = {"meta_fbp": FBP, "meta_fbp_at": recent, "meta_fbc": None, "meta_fbc_at": None,
+             "meta_client_user_agent": "Mozilla/5.0 (iPhone)", "meta_client_user_agent_at": recent}
     assert main.browser_user_data(fresh, "qb_ts_1_2026-12-05") == {"fbp": FBP, "client_user_agent": "Mozilla/5.0 (iPhone)"}
     assert main.browser_user_data(fresh, "lead_ts_1_2026-12-05")["fbp"] == FBP
     for eid in ("sq_pay_X", "wr_W1", "qb_wr_W1", "qb_pw_123"):
         assert main.browser_user_data(fresh, eid) == {}                    # Square / WebRes / Partywirks: none
-    stale = {**fresh, "meta_browser_ids_at": _dt.now(_tz.utc) - _td(days=91)}
+    old = _dt.now(_tz.utc) - _td(days=91)
+    stale = {**fresh, "meta_fbp_at": old, "meta_client_user_agent_at": old}
     assert main.browser_user_data(stale, "qb_ts_1_2026-12-05") == {}
     assert main.browser_user_data({"meta_fbp": FBP}, "qb_ts_1_2026-12-05") == {}   # no capture time: unknown
+    # Each value ages by its own capture time: a fresh fbp with a stale fbc sends only the fbp.
+    mixed = {"meta_fbp": FBP, "meta_fbp_at": recent, "meta_fbc": FBC, "meta_fbc_at": old}
+    assert main.browser_user_data(mixed, "qb_ts_1_2026-12-05") == {"fbp": FBP}
 
 
 def test_tripleseat_booking_conversion_time_is_its_status_change():

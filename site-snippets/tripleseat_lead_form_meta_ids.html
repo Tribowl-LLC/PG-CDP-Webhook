@@ -2,13 +2,14 @@
   Meta browser identifiers for the Tripleseat lead form (fix #8).
 
   WHERE IT LIVES: myperfectgame.com (Square Online) -> page "Groups and Parties" (/groups-and-parties) -> the
-  Embed Code block that holds the Tripleseat script (lead_form_id=32890, inline_form=true). Paste this whole file
-  AFTER the existing <script src="https://api.tripleseat.com/v1/leads/ts_script.js?..."></script> tag, in the
-  same block.
+  Embed Code block that holds the Tripleseat Dynamic lead form's embed code (it replaces the old classic form,
+  lead_form_id=32890). Paste this whole file AFTER the Dynamic form's embed code, in the same block.
 
-  TRIPLESEAT SETUP (once): Settings -> Lead Forms -> form 32890 -> add three short-text custom fields named
-  exactly  fbp,  fbc  and  user_agent  (not required). This script fills and hides them; they arrive on the lead
-  webhook as custom_fields, and the CDP reads them (main.ts_browser_ids). Staff never need to look at them.
+  TRIPLESEAT SETUP: done. The Dynamic lead form already has three short-text custom fields named exactly  fbp,
+  fbc  and  user_agent  (not required). This script fills and hides them; they arrive on the lead webhook as
+  custom_fields, and the CDP reads them (main.ts_browser_ids). Staff never need to look at them.
+  If the Dynamic form renders inside a Tripleseat-hosted iframe, a script on our page can't reach its fields;
+  the test lead below shows whether it works.
 
   WHAT IT SENDS: the visitor's own _fbp / _fbc cookies (set by the Meta Pixel already on the site). With no _fbc
   cookie but an fbclid in the page URL (a click from a Meta ad), fbc is built the way Meta documents:

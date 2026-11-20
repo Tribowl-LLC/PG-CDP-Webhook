@@ -27,6 +27,22 @@ log = logging.getLogger("pg_cdp")
 logging.basicConfig(level=logging.INFO)
 
 
+class _RedactKeyInAccessLog(logging.Filter):
+    """uvicorn's access log prints the full request line, query string included, so a sender using ?key= put the
+    shared webhook (or cron) key into Render's logs. This replaces any key= value with <redacted>."""
+    _KEY = re.compile(r"((?:^|[?&])key=)[^&\s\"]*", re.I)
+
+    def filter(self, record):
+        if isinstance(record.args, tuple) and record.args:
+            record.args = tuple(self._KEY.sub(r"\1<redacted>", a) if isinstance(a, str) else a for a in record.args)
+        elif isinstance(record.msg, str):
+            record.msg = self._KEY.sub(r"\1<redacted>", record.msg)
+        return True
+
+
+logging.getLogger("uvicorn.access").addFilter(_RedactKeyInAccessLog())
+
+
 
 async def _enrichment_worker():
     """Every minute: enrich customers whose waiting window has passed (see process_pending_enrichment)."""
@@ -63,8 +79,12 @@ META_ACCESS_TOKEN = os.getenv("META_ACCESS_TOKEN")
 SQUARE_WEBHOOK_SIGNATURE_KEY = os.getenv("SQUARE_WEBHOOK_SIGNATURE_KEY")
 # Must exactly match the notification URL registered with Square (Square signs URL + body).
 SQUARE_WEBHOOK_URL = os.getenv("SQUARE_WEBHOOK_URL", "https://pg-cdp-webhook.onrender.com/webhooks/square")
-# WebRes / Tripleseat / Partywirks: send as header `X-CDP-Key` or query param `?key=`.
+# WebRes / Tripleseat / Partywirks: send as header `X-CDP-Key` or query param `?key=`. Unset = every webhook is
+# refused (401): a missing secret is a misconfiguration (/health shows webhook_key_check), never an open door.
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
+# Rotation window: while set, the previous shared key is accepted too, so senders can be moved to the new one one
+# at a time without a 401 (README: "Rotating WEBHOOK_SECRET"). Remove it once every sender uses the new key.
+WEBHOOK_SECRET_PREVIOUS = os.getenv("WEBHOOK_SECRET_PREVIOUS")
 # /cron/* endpoints: send as header `X-CDP-Key` or query param `?key=`.
 CRON_SECRET = os.getenv("CRON_SECRET")
 # Partywirks REST API (read-only use): reservations + customers.
@@ -75,6 +95,15 @@ PARTYWIRKS_API = os.getenv("PARTYWIRKS_API", "https://app.partywirks.com/api/v1"
 # PARTYWIRKS_SIGNATURE_ENFORCE=true, after a real delivery has been seen to match.
 PARTYWIRKS_WEBHOOK_SECRET = os.getenv("PARTYWIRKS_WEBHOOK_SECRET")
 PARTYWIRKS_SIGNATURE_ENFORCE = os.getenv("PARTYWIRKS_SIGNATURE_ENFORCE", "").strip().lower() in ("1", "true", "yes")
+# Tripleseat signs every webhook (header X-Signature: t=<timestamp>,v1=<HMAC-SHA256>) with the signing secret of
+# its webhook endpoint (Settings > API/Webhooks). Tripleseat can't send custom headers, so this signature is how
+# the shared key leaves its URL. Checked and logged when TRIPLESEAT_WEBHOOK_SECRET is set (the shared key is still
+# required); once TRIPLESEAT_SIGNATURE_ENFORCE=true AND TRIPLESEAT_SIGNATURE_SCHEME names the construction real
+# deliveries were seen to verify with, a valid signature is required and replaces the shared key.
+TRIPLESEAT_WEBHOOK_SECRET = os.getenv("TRIPLESEAT_WEBHOOK_SECRET")
+TRIPLESEAT_SIGNATURE_ENFORCE = os.getenv("TRIPLESEAT_SIGNATURE_ENFORCE", "").strip().lower() in ("1", "true", "yes")
+TRIPLESEAT_SIGNATURE_SCHEME = os.getenv("TRIPLESEAT_SIGNATURE_SCHEME", "").strip()
+TRIPLESEAT_SIGNATURE_MAX_SKEW_SECONDS = 300  # a signed timestamp more than 5 minutes off our clock is rejected
 # Real Partywirks order IDs are 13-14 digits; their sample/test payload uses "PW-YYYYMM-NNNN".
 REAL_PARTYWIRKS_ORDER_ID = re.compile(r"^\d{10,20}$")
 
@@ -414,16 +443,38 @@ def _provided_key(request: Request) -> str:
     return request.headers.get("x-cdp-key") or request.query_params.get("key") or ""
 
 
+def _key_matches(provided: str, expected: Optional[str]) -> bool:
+    return bool(expected) and hmac.compare_digest(provided.encode(), expected.encode())
+
+
+def _reject(request: Request, name: str, why: str):
+    # Path and reason only: the supplied key is never logged (nor is the query string).
+    log.warning("Rejected %s %s: %s (%s)", request.method, request.url.path, why, name)
+    raise HTTPException(status_code=401, detail="Unauthorized")
+
+
 def _require_key(request: Request, expected: Optional[str], name: str):
     if not expected:
         log.warning("%s is not set; %s is accepting unauthenticated requests", name, request.url.path)
         return
     if not hmac.compare_digest(_provided_key(request).encode(), expected.encode()):
-        raise HTTPException(status_code=401, detail="Unauthorized")
+        _reject(request, name, "wrong key" if _provided_key(request) else "no key")
 
 
 def require_webhook_key(request: Request):
-    _require_key(request, WEBHOOK_SECRET, "WEBHOOK_SECRET")
+    """The shared webhook key (WebRes, Tripleseat until its signature is enforced, Partywirks). Fails closed when
+    WEBHOOK_SECRET isn't set. During a rotation the previous key is accepted too, and logged as such so it's
+    visible which sender still uses it."""
+    if not WEBHOOK_SECRET:
+        log.error("WEBHOOK_SECRET is not set: refusing %s %s", request.method, request.url.path)
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    provided = _provided_key(request)
+    if _key_matches(provided, WEBHOOK_SECRET):
+        return
+    if _key_matches(provided, WEBHOOK_SECRET_PREVIOUS):
+        log.info("Accepted %s with WEBHOOK_SECRET_PREVIOUS: move this sender to the new key", request.url.path)
+        return
+    _reject(request, "WEBHOOK_SECRET", "wrong key" if provided else "no key")
 
 
 def require_cron_key(request: Request):
@@ -2624,51 +2675,6 @@ def _count_record_once(cur, cust: dict, txn_id: str, source_system: str, counter
     return rescore_customer(cur, cur.fetchone()), True
 
 
-# Temporary (Nov 2026): learn what Tripleseat's webhooks contain before building the API sync.
-# Logs field NAMES only (nested paths), plus whether the money fields are filled; never values.
-TRIPLESEAT_LOG_FIELDS = os.getenv("TRIPLESEAT_LOG_FIELDS", "1") == "1"
-_TS_MONEY_HINTS = ("total", "amount", "due", "deposit", "payment", "balance", "fee", "price", "paid")
-
-
-def field_paths(obj, prefix: str = "", depth: int = 0, out: set = None) -> set:
-    """Nested key paths of a JSON object (`a.b`, lists as `a[]`), without any values."""
-    out = set() if out is None else out
-    if depth > 6:
-        return out
-    if isinstance(obj, dict):
-        for k, v in obj.items():
-            path = f"{prefix}.{k}" if prefix else str(k)
-            out.add(path)
-            field_paths(v, path, depth + 1, out)
-    elif isinstance(obj, list):
-        for item in obj[:3]:
-            field_paths(item, f"{prefix}[]", depth + 1, out)
-    return out
-
-
-def log_tripleseat_fields(raw: dict):
-    try:
-        paths = sorted(field_paths(raw))
-        money = sorted({p for p in paths if any(h in p.rsplit(".", 1)[-1].lower() for h in _TS_MONEY_HINTS)})
-        filled = []
-        for p in money:
-            cur, ok = [raw], True
-            for part in p.split("."):
-                key, many = (part[:-2], True) if part.endswith("[]") else (part, False)
-                nxt = []
-                for c in cur:
-                    v = c.get(key) if isinstance(c, dict) else None
-                    nxt.extend(v if many and isinstance(v, list) else [v] if v not in (None, "", [], {}) else [])
-                cur = nxt
-            if any(v not in (None, "", "0", "0.0", "0.00", 0) and not isinstance(v, (dict, list)) for v in cur):
-                filled.append(p)
-        log.info("Tripleseat webhook fields (%d): %s", len(paths), ", ".join(paths)[:6000])
-        log.info("Tripleseat webhook money fields filled: %s | empty: %s",
-                 ", ".join(filled)[:1500], ", ".join(p for p in money if p not in filled)[:1500])
-    except Exception as e:  # logging must never break the webhook
-        log.warning("Tripleseat field logging failed: %s", type(e).__name__)
-
-
 def tripleseat_record(raw: dict) -> tuple:
     """(kind, object) of a Tripleseat webhook: its lead, event, booking or contact."""
     for key in ("lead", "event", "booking", "contact"):
@@ -3327,16 +3333,12 @@ def run_tripleseat_sync(days_back: Optional[int] = 3, count_created_since: Optio
         booking_params["booking_updated_start_date"] = since.strftime(TRIPLESEAT_DATE_FORMAT)
         lead_params["created_after"] = since.strftime(TRIPLESEAT_DATE_FORMAT)
     conn = get_conn()
-    shown_fields = False
     try:
         for kind, path, params in (("booking", "/bookings/search.json", booking_params),
                                    ("lead", "/leads/search.json", lead_params)):
             for rec in tripleseat_pages(path, params):
                 if not isinstance(rec, dict):
                     continue
-                if not shown_fields and kind == "booking":
-                    log_tripleseat_fields({"booking": rec})  # field names only, never values
-                    shown_fields = True
                 stats[f"{kind}s_read"] += 1
                 try:
                     with conn:
@@ -3521,13 +3523,117 @@ def retry_dead_letters(limit: int = 50) -> dict:
     return {"checked": len(rows), "resolved": resolved, "failed": failed, "superseded": superseded}
 
 
+# --- Tripleseat webhook signature (X-Signature: t=<timestamp>,v1=<hex HMAC-SHA256>) ------------------------
+# Tripleseat documents the header, the algorithm, that the timestamp is part of the signed payload and that the
+# raw body is signed, but not the exact signed string. Until a real delivery has verified, every plausible
+# construction is tried and the one that matched is logged by name; enforcement then accepts only the named one
+# (TRIPLESEAT_SIGNATURE_SCHEME), never a guess.
+TRIPLESEAT_SIGNATURE_SCHEMES = {
+    "t.body": lambda t, body: t.encode() + b"." + body,     # Stripe-style: "<timestamp>.<raw body>"
+    "tbody": lambda t, body: t.encode() + body,              # "<timestamp><raw body>"
+    "body": lambda t, body: body,                            # the raw body alone (timestamp not signed)
+}
+TRIPLESEAT_SIGNATURE_ENCODINGS = ("hex", "base64")
+
+
+def parse_tripleseat_signature(header: str) -> tuple:
+    """(timestamp, [v1 signatures]) from 't=1700000000,v1=abc[,v1=def]'; (None, []) when unreadable."""
+    t, sigs = None, []
+    for part in (header or "").split(","):
+        k, _, v = part.strip().partition("=")
+        if k == "t" and v.strip():
+            t = v.strip()
+        elif k == "v1" and v.strip():
+            sigs.append(v.strip())
+    return t, sigs
+
+
+def tripleseat_signature_scheme(body: bytes, header: str, secret: str, only: str = None) -> Optional[str]:
+    """The name ('t.body:hex', ...) of the construction this delivery's signature verifies with, or None."""
+    t, sigs = parse_tripleseat_signature(header)
+    if not t or not sigs:
+        return None
+    for name, build in TRIPLESEAT_SIGNATURE_SCHEMES.items():
+        digest = hmac.new(secret.encode("utf-8"), build(t, body), hashlib.sha256).digest()
+        for enc in TRIPLESEAT_SIGNATURE_ENCODINGS:
+            scheme = f"{name}:{enc}"
+            if only and scheme != only:
+                continue
+            expected = digest.hex() if enc == "hex" else base64.b64encode(digest).decode()
+            if any(hmac.compare_digest(sig.lower().encode() if enc == "hex" else sig.encode(), expected.encode())
+                   for sig in sigs):
+                return scheme
+    return None
+
+
+def _signature_skew(t: Optional[str]) -> Optional[int]:
+    """Seconds between the signed timestamp and our clock, or None when it isn't a usable number (nan, inf,
+    1e999, text), so a malformed header follows the normal MISMATCH / 401 path instead of a 500."""
+    try:
+        ts = float(t)
+        if not math.isfinite(ts):
+            return None
+        if ts > 1e12:  # milliseconds
+            ts /= 1000.0
+        return int(time.time() - ts)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def check_tripleseat_signature(request: Request, body: bytes) -> bool:
+    """True when the delivery is authenticated by its signature (enforcement on and the signature valid).
+    Otherwise logs the result (check-only) and returns False, so the shared key is still required; with
+    enforcement on, a missing/invalid/stale signature is a 401. Never logs the header value or the secret."""
+    if not TRIPLESEAT_WEBHOOK_SECRET:
+        if TRIPLESEAT_SIGNATURE_ENFORCE:
+            log.error("TRIPLESEAT_SIGNATURE_ENFORCE is on but TRIPLESEAT_WEBHOOK_SECRET is not set: refusing")
+            raise HTTPException(status_code=401, detail="Unauthorized")
+        return False
+    # Only a construction that signs the timestamp can replace the shared key: with a body-only signature a captured
+    # delivery could be replayed forever. Body-only candidates stay available for diagnostics (check-only).
+    pinned_ok = bool(TRIPLESEAT_SIGNATURE_SCHEME) and TRIPLESEAT_SIGNATURE_SCHEME.split(":")[0] in ("t.body", "tbody")
+    enforce = TRIPLESEAT_SIGNATURE_ENFORCE and pinned_ok
+    if TRIPLESEAT_SIGNATURE_ENFORCE and not pinned_ok:
+        log.error("TRIPLESEAT_SIGNATURE_ENFORCE is on but TRIPLESEAT_SIGNATURE_SCHEME is %s: still check-only",
+                  "not set" if not TRIPLESEAT_SIGNATURE_SCHEME else "not a timestamp-signed construction")
+    header = request.headers.get("x-signature", "")
+    t, sigs = parse_tripleseat_signature(header)
+    skew = _signature_skew(t)
+    scheme = tripleseat_signature_scheme(body, header, TRIPLESEAT_WEBHOOK_SECRET,
+                                         only=TRIPLESEAT_SIGNATURE_SCHEME if enforce else None)
+    fresh = skew is not None and abs(skew) <= TRIPLESEAT_SIGNATURE_MAX_SKEW_SECONDS
+    if scheme and scheme.startswith("body:"):
+        log.info("Tripleseat signature verified (scheme %s: the timestamp is not signed, so it can't replace the "
+                 "shared key); not enforced", scheme)
+        return False
+    if scheme and fresh:
+        log.info("Tripleseat signature verified (scheme %s, timestamp skew %ss)%s", scheme, skew,
+                 "" if enforce else "; not enforced yet")
+        return enforce
+    if not header:
+        why = "MISSING (no X-Signature header; signature-like headers: %s)" % (
+            ", ".join(sorted(h for h in request.headers.keys() if "sig" in h.lower())) or "none")
+    elif not t or not sigs:
+        why = "UNREADABLE (header present without t= and v1=)"
+    elif scheme:
+        why = f"STALE (scheme {scheme} matched but timestamp skew {skew}s exceeds {TRIPLESEAT_SIGNATURE_MAX_SKEW_SECONDS}s)"
+    else:
+        why = (f"MISMATCH (t present, {len(sigs)} v1 value(s), skew {skew}s, body {len(body)} bytes; tried "
+               + ", ".join(f"{n}:{e}" for n in TRIPLESEAT_SIGNATURE_SCHEMES for e in TRIPLESEAT_SIGNATURE_ENCODINGS
+                           if not enforce or f"{n}:{e}" == TRIPLESEAT_SIGNATURE_SCHEME) + ")")
+    log.warning("Tripleseat signature %s; %s", why, "rejected" if enforce else "not enforced yet")
+    if enforce:
+        raise HTTPException(status_code=401, detail="Invalid Tripleseat signature")
+    return False
+
+
 @app.post("/webhooks/tripleseat")
 async def tripleseat_webhook(request: Request, background_tasks: BackgroundTasks):
-    """Tripleseat Lead, Event, Booking, and Contact webhooks."""
-    require_webhook_key(request)
-    _, raw = await read_json(request)
-    if TRIPLESEAT_LOG_FIELDS and isinstance(raw, dict):
-        log_tripleseat_fields(raw)
+    """Tripleseat Lead, Event, Booking, and Contact webhooks. Authenticated by Tripleseat's X-Signature once
+    enforced; until then by the shared key (and the signature is checked and logged)."""
+    body, raw = await read_json(request)
+    if not check_tripleseat_signature(request, body):
+        require_webhook_key(request)
     record_key = tripleseat_record_key(raw)
     arrived = datetime.now(timezone.utc)  # before processing: a slower request mustn't outrank a newer one
     try:
@@ -4675,6 +4781,9 @@ def health():
         "status": "ok",
         "square_signature_check": bool(SQUARE_WEBHOOK_SIGNATURE_KEY),
         "webhook_key_check": bool(WEBHOOK_SECRET),
+        "webhook_key_rotation_window": bool(WEBHOOK_SECRET_PREVIOUS),
+        "tripleseat_signature_check": ("enforced" if TRIPLESEAT_SIGNATURE_ENFORCE and TRIPLESEAT_SIGNATURE_SCHEME
+                                       else "logging only") if TRIPLESEAT_WEBHOOK_SECRET else False,
         "cron_key_check": bool(CRON_SECRET),
         "partywirks_signature_check": ("enforced" if PARTYWIRKS_SIGNATURE_ENFORCE else "logging only")
                                       if PARTYWIRKS_WEBHOOK_SECRET else False,

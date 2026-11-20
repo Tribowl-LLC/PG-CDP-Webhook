@@ -412,18 +412,9 @@ def test_unaskable_census_address_is_not_marked_checked(monkeypatch):
     assert calls == [] and "census_checked_at" not in r
 
 
-def test_tripleseat_field_log_has_names_and_money_presence_but_no_values(caplog):
-    raw = {"event": {"id": 99, "grand_total": "1234.50", "amount_due": "0.00", "name": "Smith Party",
-                     "contact": {"email_addresses": [{"address": "secret@example.test"}]},
-                     "payments": [{"amount": 200, "payment_method": "Check"}]}}
-    with caplog.at_level("INFO", logger="pg_cdp"):
-        main.log_tripleseat_fields(raw)
-    text = caplog.text
-    assert "event.grand_total" in text and "event.contact.email_addresses[].address" in text
-    assert "filled: event.grand_total" in text and "event.payments[].amount" in text
-    assert "empty: event.amount_due" in text
-    for secret in ("secret@example.test", "Smith Party", "1234.50", "Check"):
-        assert secret not in text
+def test_temporary_tripleseat_field_logging_is_gone():
+    assert not hasattr(main, "log_tripleseat_fields") and not hasattr(main, "TRIPLESEAT_LOG_FIELDS")
+    assert not hasattr(main, "field_paths") and not hasattr(main, "_TS_MONEY_HINTS")
 
 
 def _tripleseat_on(monkeypatch):
@@ -1148,3 +1139,50 @@ def test_audit_judges_completion_at_the_drop_not_now():
     assert mod.complete_at_drop({**base, "versium_lifestyle_flags": {"_versium_checked": "2026-11-20"}})  # same day
     assert not mod.complete_at_drop({**base, "versium_lifestyle_flags": {"_versium_checked": "2026-11-21"}})  # later
     assert mod.complete_at_drop({**base, "versium_lifestyle_flags": {"_source": "csv"}})
+
+
+# --- Fix #10: Tripleseat signature, shared-key rotation, no key in access logs ---------------------
+# All secrets below are obviously fake. The signature fixtures are synthetic: no real Tripleseat delivery was
+# captured (that would need its signing secret and a customer's payload); the construction is confirmed from the
+# check-only logs of real deliveries, then pinned with TRIPLESEAT_SIGNATURE_SCHEME.
+
+import hmac as _hmac, hashlib as _hashlib, base64 as _b64, logging as _logging
+
+FAKE_TS_SECRET = "fake-tripleseat-signing-secret"
+
+
+def _ts_sig(body: bytes, t: str, scheme="t.body", enc="hex", secret=FAKE_TS_SECRET) -> str:
+    msg = {"t.body": t.encode() + b"." + body, "tbody": t.encode() + body, "body": body}[scheme]
+    d = _hmac.new(secret.encode(), msg, _hashlib.sha256).digest()
+    return d.hex() if enc == "hex" else _b64.b64encode(d).decode()
+
+
+def test_tripleseat_signature_header_is_parsed():
+    assert main.parse_tripleseat_signature("t=1763600000,v1=abc") == ("1763600000", ["abc"])
+    assert main.parse_tripleseat_signature(" t=1, v1=a ,v1=b") == ("1", ["a", "b"])
+    assert main.parse_tripleseat_signature("garbage") == (None, [])
+
+
+def test_each_candidate_construction_is_recognised_by_name():
+    body, t = b'{"lead": {"id": 1}}', "1763600000"
+    for scheme in main.TRIPLESEAT_SIGNATURE_SCHEMES:
+        for enc in main.TRIPLESEAT_SIGNATURE_ENCODINGS:
+            header = f"t={t},v1={_ts_sig(body, t, scheme, enc)}"
+            assert main.tripleseat_signature_scheme(body, header, FAKE_TS_SECRET) == f"{scheme}:{enc}"
+            assert main.tripleseat_signature_scheme(body, header, FAKE_TS_SECRET, only="t.body:hex") == \
+                (f"{scheme}:{enc}" if (scheme, enc) == ("t.body", "hex") else None)
+    reformatted = b'{"lead":{"id":1}}'                     # a re-serialised body never verifies
+    assert main.tripleseat_signature_scheme(reformatted, f"t={t},v1={_ts_sig(body, t)}", FAKE_TS_SECRET) is None
+    assert main.tripleseat_signature_scheme(body, f"t={t},v1={_ts_sig(body, t, secret='other')}", FAKE_TS_SECRET) is None
+
+
+def test_access_log_never_shows_a_key():
+    rec = _logging.LogRecord("uvicorn.access", _logging.INFO, "", 0, '%s - "%s %s HTTP/%s" %d', (
+        "1.2.3.4:0", "POST", "/webhooks/tripleseat?key=fake-shared-key&x=1", "1.1", 200), None)
+    main._RedactKeyInAccessLog().filter(rec)
+    line = rec.getMessage()
+    assert "fake-shared-key" not in line and "key=<redacted>&x=1" in line
+    rec2 = _logging.LogRecord("uvicorn.access", _logging.INFO, "", 0, "GET /cron/x?key=fake-cron-key", None, None)
+    main._RedactKeyInAccessLog().filter(rec2)
+    assert "fake-cron-key" not in rec2.getMessage()
+    assert any(isinstance(f, main._RedactKeyInAccessLog) for f in _logging.getLogger("uvicorn.access").filters)

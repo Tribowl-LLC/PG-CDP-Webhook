@@ -2350,3 +2350,138 @@ def test_customer_with_no_usable_inputs_is_not_requeued_forever(client, db, fake
     qb = capi_rows(db, f"qb_wr_NI{uid}")
     assert not qb or qb[0]["meta_response_status"] == "DROPPED_AFTER_ENRICHMENT"     # a final outcome
     assert customer_row(db, cid)["enrich_after"] is None                             # not queued again
+
+
+# --- Fix #10: Tripleseat X-Signature, shared-key rotation, fail closed -----------------------------
+
+import time as _time
+from test_unit import _ts_sig, FAKE_TS_SECRET
+
+
+def _ts_lead_body(uid):
+    return json.dumps({"lead": {"id": f"SIG{uid}", "first_name": "Sig", "last_name": f"Lead{uid}",
+                                "email_address": f"sig-{uid}@example.test", "status": "prospect",
+                                "event_date": "2027-08-08"}}).encode()
+
+
+def _post_ts(client, body, sig_header=None, key=True):
+    headers = {"content-type": "application/json", **(WH if key else {})}
+    if sig_header is not None:
+        headers["X-Signature"] = sig_header
+    return client.post("/webhooks/tripleseat", content=body, headers=headers)
+
+
+@pytest.fixture
+def ts_signing(monkeypatch):
+    monkeypatch.setattr(main, "TRIPLESEAT_WEBHOOK_SECRET", FAKE_TS_SECRET, raising=False)
+    monkeypatch.setattr(main, "TRIPLESEAT_SIGNATURE_ENFORCE", False, raising=False)
+    monkeypatch.setattr(main, "TRIPLESEAT_SIGNATURE_SCHEME", "", raising=False)
+
+
+def test_tripleseat_signature_check_only_then_enforced(client, db, fake, uid, ts_signing, monkeypatch, caplog,
+                                                       everyone_qualifies):
+    body, t = _ts_lead_body(uid), str(int(_time.time()))
+    good = f"t={t},v1={_ts_sig(body, t)}"
+    with caplog.at_level("INFO", logger="pg_cdp"):
+        r = _post_ts(client, body, good)
+    assert r.status_code == 200 and "Tripleseat signature verified (scheme t.body:hex" in caplog.text
+    assert "not enforced yet" in caplog.text
+    caplog.clear()
+    with caplog.at_level("WARNING", logger="pg_cdp"):
+        assert _post_ts(client, body, f"t={t},v1=deadbeef").status_code == 200     # check-only: still accepted
+    assert "Tripleseat signature MISMATCH" in caplog.text and "not enforced yet" in caplog.text
+    assert "deadbeef" not in caplog.text and FAKE_TS_SECRET not in caplog.text       # never the values
+    assert _post_ts(client, body, good, key=False).status_code == 401               # shared key still required
+    # Enforced, with the construction real deliveries verified with:
+    monkeypatch.setattr(main, "TRIPLESEAT_SIGNATURE_ENFORCE", True, raising=False)
+    monkeypatch.setattr(main, "TRIPLESEAT_SIGNATURE_SCHEME", "t.body:hex", raising=False)
+    assert _post_ts(client, body, f"t={t},v1=deadbeef").status_code == 401
+    assert _post_ts(client, body, None).status_code == 401                          # no signature
+    old = str(int(_time.time()) - 3600)
+    assert _post_ts(client, body, f"t={old},v1={_ts_sig(body, old)}", key=False).status_code == 401   # replayed
+    other = f"t={t},v1={_ts_sig(body, t, 'tbody')}"
+    assert _post_ts(client, body, other, key=False).status_code == 401             # only the pinned construction
+    r = _post_ts(client, body, good, key=False)                                     # signature replaces ?key=
+    assert r.status_code == 200 and r.json()["status"] == "tripleseat_synced"
+    assert len(capi_rows(db, f"lead_ts_{r.json()['cluster_id']}_2027-08-08")) == 1  # processed end to end, once
+
+
+def test_enforce_without_a_pinned_scheme_stays_check_only(client, db, fake, uid, ts_signing, monkeypatch, caplog):
+    monkeypatch.setattr(main, "TRIPLESEAT_SIGNATURE_ENFORCE", True, raising=False)
+    body, t = _ts_lead_body(uid), str(int(_time.time()))
+    with caplog.at_level("ERROR", logger="pg_cdp"):
+        assert _post_ts(client, body, f"t={t},v1=bad").status_code == 200          # never enforce on a guess
+    assert "TRIPLESEAT_SIGNATURE_SCHEME is not set" in caplog.text
+    assert _post_ts(client, body, f"t={t},v1={_ts_sig(body, t)}", key=False).status_code == 401
+
+
+def test_missing_signature_header_is_logged_with_header_names_only(client, db, fake, uid, ts_signing, caplog):
+    with caplog.at_level("WARNING", logger="pg_cdp"):
+        assert _post_ts(client, _ts_lead_body(uid), None).status_code == 200
+    assert "Tripleseat signature MISSING" in caplog.text
+
+
+def test_no_field_name_lines_for_a_tripleseat_delivery(client, db, fake, uid, caplog):
+    with caplog.at_level("INFO", logger="pg_cdp"):
+        assert _post_ts(client, _ts_lead_body(uid)).status_code == 200
+    assert "Tripleseat webhook fields" not in caplog.text and "money fields" not in caplog.text
+
+
+def test_shared_key_rotation_window(client, db, fake, uid, monkeypatch, caplog):
+    monkeypatch.setattr(main, "WEBHOOK_SECRET", "fake-new-key")
+    monkeypatch.setattr(main, "WEBHOOK_SECRET_PREVIOUS", "fake-old-key", raising=False)
+    body = {"reservation_id": f"RT{uid}", "first_name": "Rot", "last_name": f"Ate{uid}",
+            "email": f"rot-{uid}@example.test", "amount": 10}
+    assert client.post("/webhooks/webres", headers={"X-CDP-Key": "fake-new-key"}, json=body).status_code == 200
+    with caplog.at_level("INFO", logger="pg_cdp"):
+        assert client.post("/webhooks/webres?key=fake-old-key", json=body).status_code == 200
+    app_log = lambda: " ".join(r.getMessage() for r in caplog.records if r.name == "pg_cdp")  # not the test client's
+    assert "WEBHOOK_SECRET_PREVIOUS" in app_log() and "fake-old-key" not in app_log()
+    caplog.clear()
+    with caplog.at_level("WARNING", logger="pg_cdp"):
+        assert client.post("/webhooks/webres?key=fake-wrong-key", json=body).status_code == 401
+    assert "Rejected POST /webhooks/webres: wrong key" in app_log() and "fake-wrong-key" not in app_log()
+    monkeypatch.setattr(main, "WEBHOOK_SECRET_PREVIOUS", None)                      # window closed
+    assert client.post("/webhooks/webres?key=fake-old-key", json=body).status_code == 401
+
+
+def test_unset_webhook_secret_fails_closed(client, db, fake, monkeypatch, caplog):  # fake: nothing leaves
+    monkeypatch.setattr(main, "WEBHOOK_SECRET", None)
+    with caplog.at_level("ERROR", logger="pg_cdp"):
+        for path in ("/webhooks/webres", "/webhooks/tripleseat", "/webhooks/partywirks"):
+            assert client.post(path, json={"first_name": "X"}).status_code == 401, path
+    assert "WEBHOOK_SECRET is not set" in caplog.text
+
+
+def test_webres_and_partywirks_keys_work_as_before(client, db, fake, uid):
+    body = {"reservation_id": f"KW{uid}", "first_name": "Key", "last_name": f"Way{uid}",
+            "email": f"keyway-{uid}@example.test", "amount": 10}
+    assert client.post("/webhooks/webres", headers=WH, json=body).status_code == 200                 # header
+    assert client.post("/webhooks/webres?key=test-webhook-secret", json=body).status_code == 200    # query
+    assert client.post("/webhooks/webres", json=body).status_code == 401
+    oid = f"70{int(uid, 16)}"
+    pw = fake.add_partywirks(uid, oid)
+    assert client.post("/webhooks/partywirks?key=test-webhook-secret", json=pw).status_code == 200
+    assert client.post("/webhooks/partywirks", headers=WH, json=pw).status_code == 200
+    assert client.post("/webhooks/partywirks", json=pw).status_code == 401
+
+
+def test_body_only_scheme_can_never_replace_the_shared_key(client, db, fake, uid, ts_signing, monkeypatch, caplog):
+    monkeypatch.setattr(main, "TRIPLESEAT_SIGNATURE_ENFORCE", True, raising=False)
+    monkeypatch.setattr(main, "TRIPLESEAT_SIGNATURE_SCHEME", "body:hex", raising=False)
+    body = _ts_lead_body(uid)
+    replay = f"t=1,v1={_ts_sig(body, '1', 'body')}"                        # captured long ago, timestamp unsigned
+    with caplog.at_level("INFO", logger="pg_cdp"):
+        assert _post_ts(client, body, replay, key=False).status_code == 401   # no key: refused
+        assert _post_ts(client, body, replay).status_code == 200             # with the key: check-only as before
+    assert "not a timestamp-signed construction" in caplog.text and "can't replace the shared key" in caplog.text
+
+
+def test_non_finite_signature_timestamps_do_not_crash(client, db, fake, uid, ts_signing, monkeypatch):
+    body = _ts_lead_body(uid)
+    for t in ("nan", "inf", "-inf", "1e999", "abc"):
+        assert _post_ts(client, body, f"t={t},v1=deadbeef").status_code == 200, t          # check-only + key
+    monkeypatch.setattr(main, "TRIPLESEAT_SIGNATURE_ENFORCE", True, raising=False)
+    monkeypatch.setattr(main, "TRIPLESEAT_SIGNATURE_SCHEME", "t.body:hex", raising=False)
+    for t in ("nan", "1e999"):
+        assert _post_ts(client, body, f"t={t},v1={_ts_sig(body, t)}", key=False).status_code == 401, t

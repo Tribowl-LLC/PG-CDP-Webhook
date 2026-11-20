@@ -1329,6 +1329,42 @@ def test_startup_logs_the_secret_shape_even_when_unset(monkeypatch, caplog):
     assert "TRIPLESEAT_WEBHOOK_SECRET: not set" in caplog.text
 
 
+def test_json_candidate_with_an_unencodable_string_is_skipped_not_a_crash():
+    body, t = b'{"lead": {"note": "\\ud800"}}', "1763600000"
+    assert main.tripleseat_signature_scheme(body, f"t={t},v1={'ab' * 32}", FAKE_TS_SECRET, url=_TS_URL) is None
+    assert main.tripleseat_signature_scheme(body, f"t={t},v1={_ts_sig(body, t)}", FAKE_TS_SECRET) == "t.body:hex"
+
+
+def test_padded_base64url_secret_is_decoded():
+    raw = bytes([251] * 31)                                   # encodes with '-'/'_' and '=' padding
+    secret = _b64.urlsafe_b64encode(raw).decode()
+    assert secret.endswith("=") and ("-" in secret or "_" in secret)
+    t = "1763600000"
+    d = _hmac.new(raw, _ts_expected_message("t.body", t, _TS_BODY, _TS_URL), _hashlib.sha256).digest()
+    assert main.tripleseat_signature_scheme(_TS_BODY, f"t={t},v1={d.hex()}", secret) == "t.body:hex@b64urlkey"
+
+
+def test_ambiguous_encoding_is_reported_not_presented_as_unique(monkeypatch, caplog):
+    monkeypatch.setattr(main, "TRIPLESEAT_WEBHOOK_SECRET", FAKE_TS_SECRET)
+    monkeypatch.setattr(main, "TRIPLESEAT_SIGNATURE_ENFORCE", False)
+    monkeypatch.setattr(main, "TRIPLESEAT_SIGNATURE_SCHEME", "")
+    t0 = int(__import__("time").time())
+    for i in range(500):                                      # find a fresh timestamp whose padded encoding has no + / - _
+        t = str(t0 - i)
+        d = _hmac.new(FAKE_TS_SECRET.encode(), t.encode() + b"." + _TS_BODY, _hashlib.sha256).digest()
+        sig = _b64.urlsafe_b64encode(d).decode()
+        if not set(sig) & set("+/-_"):
+            break
+    else:
+        raise AssertionError("no unambiguous fixture found")
+    assert list(main.tripleseat_signature_matches(_TS_BODY, f"t={t},v1={sig}", FAKE_TS_SECRET)) == \
+        ["t.body:base64", "t.body:base64url"]
+    with caplog.at_level("INFO", logger="pg_cdp"):
+        main.check_tripleseat_signature(_ts_request({"x-signature": f"t={t},v1={sig}"}), _TS_BODY)
+    assert "verified (scheme t.body:base64" in caplog.text
+    assert "AMBIGUOUS, also matches t.body:base64url" in caplog.text and sig not in caplog.text
+
+
 def test_check_uses_the_public_url_tripleseat_posted_to(monkeypatch, caplog):
     monkeypatch.setattr(main, "TRIPLESEAT_WEBHOOK_SECRET", FAKE_TS_SECRET)
     monkeypatch.setattr(main, "TRIPLESEAT_SIGNATURE_ENFORCE", False)

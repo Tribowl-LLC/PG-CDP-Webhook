@@ -3551,7 +3551,10 @@ def _ts_json(ctx, rails=False):
         return None
     if rails:  # ActiveSupport's to_json escapes these three for HTML safety
         out = out.replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
-    return out.encode("utf-8")
+    try:
+        return out.encode("utf-8")
+    except UnicodeEncodeError:  # e.g. an escaped unpaired surrogate: not a candidate, never a 500
+        return None
 
 
 def _ts_join(*parts):
@@ -3621,10 +3624,10 @@ def _ts_key_forms(secret: str) -> dict:
     are guesses, included only when the secret decodes that way."""
     forms = {"": secret.encode("utf-8")}
     for name, decode in (("b64key", lambda v: base64.b64decode(v, validate=True)),
-                         ("b64urlkey", lambda v: base64.urlsafe_b64decode(v + "=" * (-len(v) % 4))),
+                         ("b64urlkey", lambda v: base64.urlsafe_b64decode(v.rstrip("=") + "=" * (-len(v.rstrip("=")) % 4))),
                          ("hexkey", bytes.fromhex)):
         try:
-            if name == "b64urlkey" and not re.fullmatch(r"[A-Za-z0-9_-]+", secret):
+            if name == "b64urlkey" and not re.fullmatch(r"[A-Za-z0-9_-]+={0,2}", secret):
                 continue
             key = decode(secret)
         except ValueError:
@@ -3693,13 +3696,20 @@ def tripleseat_candidates_tried(secret: str, url: Optional[str], only: str = Non
 
 def tripleseat_signature_scheme(body: bytes, header: str, secret: str, only: str = None,
                                 url: Optional[str] = None) -> Optional[str]:
-    """The name ('t.body:hex', ...) of the candidate this delivery's signature verifies with, or None.
+    """The name ('t.body:hex', ...) of the first candidate this delivery's signature verifies with, or None.
     url is the URL Tripleseat posted to (query included); the URL candidates are skipped without it."""
+    return next(tripleseat_signature_matches(body, header, secret, only, url), None)
+
+
+def tripleseat_signature_matches(body: bytes, header: str, secret: str, only: str = None,
+                                 url: Optional[str] = None):
+    """Every candidate name this delivery's signature verifies with, in candidate order. More than one means the
+    delivery can't tell them apart (e.g. a base64 signature with none of + / - _ is valid base64 and base64url)."""
     t, sigs = parse_tripleseat_signature(header)
     if not t or not sigs:
-        return None
+        return
     if only and not _ts_scheme_parts(only):
-        return None
+        return
     ctx = _ts_context(t, body, url)
     for key_form, key in _ts_key_forms(secret).items():
         for name, (build, _signs_t, _why) in TRIPLESEAT_SIGNATURE_PAYLOADS.items():
@@ -3713,8 +3723,7 @@ def tripleseat_signature_scheme(body: bytes, header: str, secret: str, only: str
                     continue
                 expected = _ts_encode(digest, enc)
                 if any(_ts_matches(sig, expected, enc) for sig in sigs):
-                    return scheme
-    return None
+                    yield scheme
 
 
 def tripleseat_v1_shape(sig: str) -> str:
@@ -3794,14 +3803,17 @@ def check_tripleseat_signature(request: Request, body: bytes) -> bool:
     skew = _signature_skew(t)
     url = _tripleseat_public_url(request)
     only = TRIPLESEAT_SIGNATURE_SCHEME if enforce else None
-    scheme = tripleseat_signature_scheme(body, header, TRIPLESEAT_WEBHOOK_SECRET, only=only, url=url)
+    matches = list(tripleseat_signature_matches(body, header, TRIPLESEAT_WEBHOOK_SECRET, only=only, url=url))
+    scheme = matches[0] if matches else None
+    ambiguous = ("; AMBIGUOUS, also matches %s: don't pin until a delivery matches only one" % ", ".join(matches[1:])
+                 if len(matches) > 1 else "")
     fresh = skew is not None and abs(skew) <= TRIPLESEAT_SIGNATURE_MAX_SKEW_SECONDS
     if scheme and not tripleseat_scheme_signs_timestamp(scheme):
         log.info("Tripleseat signature verified (scheme %s: the timestamp is not signed, so it can't replace the "
-                 "shared key); not enforced", scheme)
+                 "shared key%s); not enforced", scheme, ambiguous)
         return False
     if scheme and fresh:
-        log.info("Tripleseat signature verified (scheme %s, timestamp skew %ss)%s", scheme, skew,
+        log.info("Tripleseat signature verified (scheme %s, timestamp skew %ss%s)%s", scheme, skew, ambiguous,
                  "" if enforce else "; not enforced yet")
         return enforce
     if not header:

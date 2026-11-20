@@ -414,7 +414,7 @@ def test_unaskable_census_address_is_not_marked_checked(monkeypatch):
 
 def test_temporary_tripleseat_field_logging_is_gone():
     assert not hasattr(main, "log_tripleseat_fields") and not hasattr(main, "TRIPLESEAT_LOG_FIELDS")
-    assert not hasattr(main, "field_paths")
+    assert not hasattr(main, "field_paths") and not hasattr(main, "_TS_MONEY_HINTS")
 
 
 def _tripleseat_on(monkeypatch):

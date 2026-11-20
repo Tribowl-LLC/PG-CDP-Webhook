@@ -2,23 +2,22 @@
   Meta browser identifiers for the Tripleseat lead form (fix #8).
 
   WHERE IT LIVES: myperfectgame.com (Square Online) -> page "Groups and Parties" (/groups-and-parties) -> the
-  Embed Code block that holds the Tripleseat Dynamic lead form's embed code (it replaces the old classic form,
-  lead_form_id=32890). Paste this whole file AFTER the Dynamic form's embed code, in the same block.
+  Embed Code block that holds the Tripleseat Dynamic lead form, dynamic_lead_form_id=7252:
+    <script src="https://api.tripleseat.com/ts/dynamic_leads/ts_script.js?dynamic_lead_form_id=7252&public_key=..."></script>
+  (it replaced the classic form 32890). Paste this whole file AFTER that script tag, in the same block.
 
-  TRIPLESEAT SETUP: done. The Dynamic lead form already has three short-text custom fields named exactly  fbp,
+  TRIPLESEAT SETUP: done. Dynamic lead form 7252 has three short-text custom fields named exactly  fbp,
   fbc  and  user_agent  (not required). This script fills and hides them; they arrive on the lead webhook as
   custom_fields, and the CDP reads them (main.ts_browser_ids). Staff never need to look at them.
-  If the Dynamic form renders inside a Tripleseat-hosted iframe, a script on our page can't reach its fields;
-  the test lead below shows whether it works.
+  VERIFIED (2026-11-20): a test lead through form 7252 on the live page arrived with the fields filled, so the
+  form renders where this script can reach it and the site's cookies are readable.
 
   WHAT IT SENDS: the visitor's own _fbp / _fbc cookies (set by the Meta Pixel already on the site). With no _fbc
   cookie but an fbclid in the page URL (a click from a Meta ad), fbc is built the way Meta documents:
   fb.1.<milliseconds>.<fbclid>. Plus navigator.userAgent. Nothing else; empty values are left empty.
 
-  VERIFY AFTER PASTING (Square Online may render embed code inside an iframe): open the page from a Meta ad link
-  (or add ?fbclid=test1234567890 to the URL), submit a test lead, and check in Tripleseat that the lead's fbp /
-  fbc / user_agent fields are filled. If they're empty, the embed runs in an isolated frame that can't read the
-  site's cookies; then this needs Square Online's site-wide header code instead (Settings -> Tracking tools).
+  RE-CHECK AFTER CHANGING THE PAGE OR FORM: open the page with ?fbclid=test1234567890, submit a test lead, and
+  check in Tripleseat that its fbp / fbc / user_agent fields are filled.
 -->
 <script>
 (function () {

@@ -62,7 +62,11 @@ Variable	Purpose
 `AUDIENCE_ALL_NONDETROIT`	Meta Custom Audience ID (`120246555027130358`) - All Qualified Non-Excluded Customers
 `SQUARE_WEBHOOK_SIGNATURE_KEY`	Signature key of the Square webhook subscription. When set, `/webhooks/square` rejects requests without a valid `x-square-hmacsha256-signature`.
 `SQUARE_WEBHOOK_URL`	The exact notification URL registered with Square (default `https://pg-cdp-webhook.onrender.com/webhooks/square`). Square signs this URL + the body.
-`WEBHOOK_SECRET`	Shared key for `/webhooks/webres`, `/webhooks/tripleseat`, `/webhooks/partywirks`. Senders pass it as header `X-CDP-Key` or query `?key=`.
+`WEBHOOK_SECRET`	Shared key for `/webhooks/webres`, `/webhooks/tripleseat`, `/webhooks/partywirks`. Senders pass it as header `X-CDP-Key` or query `?key=`. Unset = every webhook is refused (401). The app's access log redacts any `key=` value, but the header form keeps it out of URLs entirely.
+`WEBHOOK_SECRET_PREVIOUS`	Only during a rotation: the old shared key, still accepted (logged as `Accepted … with WEBHOOK_SECRET_PREVIOUS`) until every sender is on the new one. Remove it afterwards.
+`TRIPLESEAT_WEBHOOK_SECRET`	The signing secret of the Tripleseat webhook endpoint (Settings > API/Webhooks). When set, every Tripleseat delivery's `X-Signature` (`t=<timestamp>,v1=<HMAC-SHA256>`) is checked and the result logged (`Tripleseat signature verified (scheme …)` / `MISMATCH` / `MISSING`); the shared key is still required.
+`TRIPLESEAT_SIGNATURE_SCHEME`	The signed-payload construction real deliveries verified with, copied from the `verified (scheme …)` log line (e.g. `t.body:hex`). Tripleseat doesn't document it, so the check tries each candidate until this is set.
+`TRIPLESEAT_SIGNATURE_ENFORCE`	`true` (with the scheme set) = a valid, fresh (±300 s) signature is required and replaces the shared key, so `?key=` can be removed from the Tripleseat URL. Without the scheme it stays check-only.
 `CRON_SECRET`	Separate key for every `/cron/*` endpoint (header `X-CDP-Key` or query `?key=`).
 `PARTYWIRKS_WEBHOOK_SECRET`	Partywirks webhook signature key (HMAC-SHA256 in `X-Partywirks-Signature`). When set, every delivery is checked and the result logged.
 `PARTYWIRKS_SIGNATURE_ENFORCE`	Set to `true` to reject (401) deliveries whose signature doesn't match. Only turn on after the logs show `Partywirks signature verified` for a real booking.
@@ -224,6 +228,15 @@ Webhook routes read the body asynchronously and run all blocking work in a worke
 3. `DATABASE_URL=... python scripts/repair_after_deploy.py` (dry run), then again with `--apply`.
 4. Set `SQUARE_WEBHOOK_SIGNATURE_KEY` in Render.
 5. Set `WEBHOOK_SECRET` and `CRON_SECRET` in Render at the same time as adding the key to the WebRes/Tripleseat/Partywirks webhook URLs and the cron-job.org jobs.
+
+**Rotating `WEBHOOK_SECRET` (no 401s).** `CRON_SECRET` is separate and not part of this.
+1. In Render set `WEBHOOK_SECRET_PREVIOUS` = the current key and `WEBHOOK_SECRET` = a new random key (one save = one deploy).
+2. Move each sender to the new key: the WebRes Gmail Apps Script (not in this repo: change its URL `?key=`, or better send header `X-CDP-Key` with `UrlFetchApp`'s `headers`), the Partywirks webhook URL (Partywirks settings), and the Tripleseat URL unless its signature is already enforced (then the URL has no key at all).
+3. Watch the logs for a day: `Accepted … with WEBHOOK_SECRET_PREVIOUS` names any path still on the old key; `Rejected … wrong key` means a sender has neither.
+4. When no `PREVIOUS` lines appear, delete `WEBHOOK_SECRET_PREVIOUS` in Render.
+Rotation doesn't erase history: the old key stays readable in Render's log history until the 30-day retention expires; it just no longer authenticates anything.
+
+**Moving Tripleseat off `?key=`.** Tripleseat can't send custom headers, so its own signature replaces the key: set `TRIPLESEAT_WEBHOOK_SECRET`; wait for `Tripleseat signature verified (scheme X)` on real deliveries; set `TRIPLESEAT_SIGNATURE_SCHEME=X` and `TRIPLESEAT_SIGNATURE_ENFORCE=true`; then remove `?key=…` from the webhook URL in Tripleseat.
 
 7.2 Tests
 `pip install -r requirements-dev.txt`, then `pytest tests/test_unit.py`. Integration tests also need `TEST_DATABASE_URL` set to a disposable Neon branch with migration 001 applied (they write test customers into it); all outside services are faked.

@@ -2356,6 +2356,7 @@ def test_customer_with_no_usable_inputs_is_not_requeued_forever(client, db, fake
 
 import time as _time
 from test_unit import _ts_sig, FAKE_TS_SECRET
+import hmac as _hmac, hashlib as _hashlib
 
 
 def _ts_lead_body(uid):
@@ -2485,3 +2486,24 @@ def test_non_finite_signature_timestamps_do_not_crash(client, db, fake, uid, ts_
     monkeypatch.setattr(main, "TRIPLESEAT_SIGNATURE_SCHEME", "t.body:hex", raising=False)
     for t in ("nan", "1e999"):
         assert _post_ts(client, body, f"t={t},v1={_ts_sig(body, t)}", key=False).status_code == 401, t
+
+
+# --- Tripleseat signature format determination: widened candidates, still check-only -------------------------
+
+def test_widened_candidates_stay_check_only_and_a_pinned_new_scheme_enforces(client, db, fake, uid, ts_signing,
+                                                                           monkeypatch, caplog, everyone_qualifies):
+    body, t = _ts_lead_body(uid), str(int(_time.time()))
+    # A URL-signed construction (one of the new candidates), over the URL the test client posts to, no query:
+    url_sig = _hmac.new(FAKE_TS_SECRET.encode(), t.encode() + b".http://testserver/webhooks/tripleseat." + body,
+                        _hashlib.sha256).hexdigest()
+    with caplog.at_level("INFO", logger="pg_cdp"):
+        assert _post_ts(client, body, f"t={t},v1=deadbeef").status_code == 200           # mismatch: accepted
+        assert _post_ts(client, body, f"t={t},v1=deadbeef", key=False).status_code == 401  # key still required
+    assert "none matched" in caplog.text and "t.url.body" in caplog.text and "deadbeef" not in caplog.text
+    assert FAKE_TS_SECRET not in caplog.text and f"SIG{uid}" not in caplog.text            # no secret, no body
+    assert _post_ts(client, body, f"t={t},v1={url_sig}", key=False).status_code == 401       # verified, not enforced
+    monkeypatch.setattr(main, "TRIPLESEAT_SIGNATURE_ENFORCE", True, raising=False)
+    monkeypatch.setattr(main, "TRIPLESEAT_SIGNATURE_SCHEME", "t.url.body:hex", raising=False)
+    r = _post_ts(client, body, f"t={t},v1={url_sig}", key=False)
+    assert r.status_code == 200 and r.json()["status"] == "tripleseat_synced"
+    assert _post_ts(client, body, f"t={t},v1={_ts_sig(body, t)}", key=False).status_code == 401  # only the pinned one

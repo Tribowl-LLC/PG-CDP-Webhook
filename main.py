@@ -57,6 +57,10 @@ async def _enrichment_worker():
 @asynccontextmanager
 async def lifespan(_app):
     await run_in_threadpool(sync_cluster_sequence)
+    if TRIPLESEAT_WEBHOOK_SECRET or _TS_SECRET_AS_SET:
+        # Secret-blind check that Render holds the value from Tripleseat: compare length and character class with
+        # the secret shown in Tripleseat (Settings > API/Webhooks). Never the value itself.
+        log.info("TRIPLESEAT_WEBHOOK_SECRET: %s", tripleseat_secret_shape(TRIPLESEAT_WEBHOOK_SECRET, _TS_SECRET_AS_SET))
     # Always on: with ENRICH_DELAY_MINUTES=0 it just drains customers still waiting from before the switch.
     worker = asyncio.create_task(_enrichment_worker()) if DATABASE_URL else None
     yield
@@ -100,7 +104,9 @@ PARTYWIRKS_SIGNATURE_ENFORCE = os.getenv("PARTYWIRKS_SIGNATURE_ENFORCE", "").str
 # the shared key leaves its URL. Checked and logged when TRIPLESEAT_WEBHOOK_SECRET is set (the shared key is still
 # required); once TRIPLESEAT_SIGNATURE_ENFORCE=true AND TRIPLESEAT_SIGNATURE_SCHEME names the construction real
 # deliveries were seen to verify with, a valid signature is required and replaces the shared key.
-TRIPLESEAT_WEBHOOK_SECRET = os.getenv("TRIPLESEAT_WEBHOOK_SECRET")
+# Stripped like the settings below: a newline or space pasted into Render with the secret breaks every HMAC.
+_TS_SECRET_AS_SET = os.getenv("TRIPLESEAT_WEBHOOK_SECRET") or ""
+TRIPLESEAT_WEBHOOK_SECRET = _TS_SECRET_AS_SET.strip() or None
 TRIPLESEAT_SIGNATURE_ENFORCE = os.getenv("TRIPLESEAT_SIGNATURE_ENFORCE", "").strip().lower() in ("1", "true", "yes")
 TRIPLESEAT_SIGNATURE_SCHEME = os.getenv("TRIPLESEAT_SIGNATURE_SCHEME", "").strip()
 TRIPLESEAT_SIGNATURE_MAX_SKEW_SECONDS = 300  # a signed timestamp more than 5 minutes off our clock is rejected
@@ -3523,17 +3529,80 @@ def retry_dead_letters(limit: int = 50) -> dict:
     return {"checked": len(rows), "resolved": resolved, "failed": failed, "superseded": superseded}
 
 
-# --- Tripleseat webhook signature (X-Signature: t=<timestamp>,v1=<hex HMAC-SHA256>) ------------------------
-# Tripleseat documents the header, the algorithm, that the timestamp is part of the signed payload and that the
-# raw body is signed, but not the exact signed string. Until a real delivery has verified, every plausible
-# construction is tried and the one that matched is logged by name; enforcement then accepts only the named one
-# (TRIPLESEAT_SIGNATURE_SCHEME), never a guess.
-TRIPLESEAT_SIGNATURE_SCHEMES = {
-    "t.body": lambda t, body: t.encode() + b"." + body,     # Stripe-style: "<timestamp>.<raw body>"
-    "tbody": lambda t, body: t.encode() + body,              # "<timestamp><raw body>"
-    "body": lambda t, body: body,                            # the raw body alone (timestamp not signed)
+# --- Tripleseat webhook signature (X-Signature: t=<timestamp>,v1=<HMAC-SHA256>) ------------------------------
+# Tripleseat documents the header shape (t=timestamp,v1=hash), HMAC-SHA256, the endpoint's signing secret, that
+# "timestamps are part of the signed payload" and that the raw request body is signed, but NOT the exact signed
+# string (which bytes, in what order, with what separators). Until a real delivery has verified, every candidate
+# below is tried (check-only) and the one that matched is logged by name; enforcement then accepts only the named
+# one (TRIPLESEAT_SIGNATURE_SCHEME), never a guess, and only if it signs the timestamp.
+#
+# A candidate name is "<payload>:<encoding>", plus "@<key form>" when the secret is used decoded rather than as
+# its UTF-8 text: e.g. "t.body:hex", "t.url.body:base64@b64key". The six names checked before (t.body / tbody /
+# body x hex / base64, raw key) are unchanged.
+#
+# Payloads: name -> (builder, signs the timestamp, provenance). A builder gets the delivery context and returns
+# the signed bytes, or None when the candidate doesn't apply (no URL given, body isn't JSON).
+_TS_URL_CANDIDATES = ("t.url.body", "t.urlnoq.body", "t.path.body", "t.pathq.body", "url.body", "urlnoq.body")
+
+
+def _ts_json(ctx, rails=False):
+    try:
+        out = json.dumps(json.loads(ctx["body"]), separators=(",", ":"), ensure_ascii=False)
+    except (ValueError, UnicodeDecodeError):
+        return None
+    if rails:  # ActiveSupport's to_json escapes these three for HTML safety
+        out = out.replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
+    return out.encode("utf-8")
+
+
+def _ts_join(*parts):
+    return None if any(p is None for p in parts) else b"".join(parts)
+
+
+TRIPLESEAT_SIGNATURE_PAYLOADS = {
+    # --- checked since PR #35 ---
+    "t.body": (lambda c: _ts_join(c["t"], b".", c["body"]), True,
+               "convention (Stripe: '<t>.<raw body>'); matches the docs' 'timestamp is part of the signed payload'"),
+    "tbody": (lambda c: _ts_join(c["t"], c["body"]), True, "guess: timestamp and raw body, no separator"),
+    "body": (lambda c: c["body"], False, "convention (GitHub: raw body only); timestamp unsigned"),
+    # --- separators / order ---
+    "t:body": (lambda c: _ts_join(c["t"], b":", c["body"]), True, "guess: ':' separator"),
+    "t-nl-body": (lambda c: _ts_join(c["t"], b"\n", c["body"]), True, "guess: newline separator"),
+    "t-sp-body": (lambda c: _ts_join(c["t"], b" ", c["body"]), True, "guess: space separator"),
+    "body.t": (lambda c: _ts_join(c["body"], b".", c["t"]), True, "guess: reversed order"),
+    # --- trailing newline ---
+    "t.body-rstrip": (lambda c: _ts_join(c["t"], b".", c["body"].rstrip(b"\r\n")), True,
+                      "guess: raw body with a trailing newline stripped"),
+    "t.body+nl": (lambda c: _ts_join(c["t"], b".", c["body"], b"\n"), True,
+                  "guess: raw body with a trailing newline added"),
+    "body-rstrip": (lambda c: c["body"].rstrip(b"\r\n"), False, "guess: raw body, trailing newline stripped"),
+    # --- the URL in the signed string (Tripleseat's URL today carries ?key=) ---
+    "t.url.body": (lambda c: _ts_join(c["t"], b".", c["url"], b".", c["body"]), True,
+                   "guess: timestamp, full URL with query (?key=), body"),
+    "t.urlnoq.body": (lambda c: _ts_join(c["t"], b".", c["urlnoq"], b".", c["body"]), True,
+                      "guess: timestamp, URL without query, body"),
+    "t.path.body": (lambda c: _ts_join(c["t"], b".", c["path"], b".", c["body"]), True,
+                    "guess: timestamp, path, body"),
+    "t.pathq.body": (lambda c: _ts_join(c["t"], b".", c["pathq"], b".", c["body"]), True,
+                     "guess: timestamp, path with query, body"),
+    "url.body": (lambda c: _ts_join(c["url"], c["body"]), False,
+                 "convention (Square: notification URL + raw body); timestamp unsigned"),
+    "urlnoq.body": (lambda c: _ts_join(c["urlnoq"], c["body"]), False,
+                    "convention (Square-style) without the query; timestamp unsigned"),
+    # --- re-serialised JSON instead of the raw bytes (the docs say raw; tried in case the sender signs its own
+    #     serialisation and the transport differs) ---
+    "t.json": (lambda c: _ts_join(c["t"], b".", _ts_json(c)), True, "guess: compact re-serialised JSON body"),
+    "t.json-rails": (lambda c: _ts_join(c["t"], b".", _ts_json(c, rails=True)), True,
+                     "guess: compact JSON as Rails to_json escapes it (< > & as \\u003c ...)"),
+    # --- double hash: HMAC over the body's SHA-256 hex digest ---
+    "t.bodyhash": (lambda c: _ts_join(c["t"], b".", hashlib.sha256(c["body"]).hexdigest().encode()), True,
+                   "guess: timestamp + '.' + hex SHA-256 of the body"),
+    "bodyhash": (lambda c: hashlib.sha256(c["body"]).hexdigest().encode(), False,
+                 "guess: hex SHA-256 of the body; timestamp unsigned"),
 }
-TRIPLESEAT_SIGNATURE_ENCODINGS = ("hex", "base64")
+# Not tried: a timestamp in another form than the header's (a verifier only ever has the header's t), other hash
+# algorithms (the docs say HMAC SHA256).
+TRIPLESEAT_SIGNATURE_ENCODINGS = ("hex", "base64", "base64url")  # base64url compared with or without '=' padding
 
 
 def parse_tripleseat_signature(header: str) -> tuple:
@@ -3548,22 +3617,132 @@ def parse_tripleseat_signature(header: str) -> tuple:
     return t, sigs
 
 
-def tripleseat_signature_scheme(body: bytes, header: str, secret: str, only: str = None) -> Optional[str]:
-    """The name ('t.body:hex', ...) of the construction this delivery's signature verifies with, or None."""
+def _ts_key_forms(secret: str) -> dict:
+    """Key form -> key bytes. "" is the secret's UTF-8 text (the default everywhere, convention). The decoded forms
+    are guesses, included only when the secret decodes that way."""
+    forms = {"": secret.encode("utf-8")}
+    for name, decode in (("b64key", lambda v: base64.b64decode(v, validate=True)),
+                         ("b64urlkey", lambda v: base64.urlsafe_b64decode(v + "=" * (-len(v) % 4))),
+                         ("hexkey", bytes.fromhex)):
+        try:
+            if name == "b64urlkey" and not re.fullmatch(r"[A-Za-z0-9_-]+", secret):
+                continue
+            key = decode(secret)
+        except ValueError:
+            continue
+        if key and key not in forms.values():
+            forms[name] = key
+    if secret.startswith("whsec_"):  # convention (Svix / Standard Webhooks): base64 after the whsec_ prefix
+        try:
+            forms["whsec"] = base64.b64decode(secret[len("whsec_"):], validate=True)
+        except ValueError:
+            pass
+    return forms
+
+
+def _ts_scheme_parts(scheme: str):
+    """(payload, encoding, key form) for a valid candidate name, else None."""
+    head, _, key_form = (scheme or "").partition("@")
+    payload, _, enc = head.rpartition(":")
+    if payload in TRIPLESEAT_SIGNATURE_PAYLOADS and enc in TRIPLESEAT_SIGNATURE_ENCODINGS and \
+            key_form in ("", "b64key", "b64urlkey", "hexkey", "whsec"):
+        return payload, enc, key_form
+    return None
+
+
+def tripleseat_scheme_signs_timestamp(scheme: str) -> bool:
+    parts = _ts_scheme_parts(scheme)
+    return bool(parts) and TRIPLESEAT_SIGNATURE_PAYLOADS[parts[0]][1]
+
+
+def _ts_context(t: str, body: bytes, url: Optional[str]) -> dict:
+    ctx = {"t": t.encode(), "body": body, "url": None, "urlnoq": None, "path": None, "pathq": None}
+    if url:
+        noq, _, query = url.partition("?")
+        path = "/" + noq.split("://", 1)[-1].partition("/")[2]
+        ctx.update(url=url.encode(), urlnoq=noq.encode(), path=path.encode(),
+                   pathq=(path + ("?" + query if query else "")).encode())
+    return ctx
+
+
+def _ts_encode(digest: bytes, enc: str) -> str:
+    if enc == "hex":
+        return digest.hex()
+    if enc == "base64":
+        return base64.b64encode(digest).decode()
+    return base64.urlsafe_b64encode(digest).decode().rstrip("=")
+
+
+def _ts_matches(sig: str, expected: str, enc: str) -> bool:
+    if enc == "hex":
+        sig = sig.lower()
+    elif enc == "base64url":
+        sig = sig.rstrip("=")
+    return hmac.compare_digest(sig.encode(), expected.encode())
+
+
+def tripleseat_candidates_tried(secret: str, url: Optional[str], only: str = None) -> str:
+    """A description of the candidate set, for the log: names only, never values."""
+    if only:
+        return only
+    payloads = [p for p in TRIPLESEAT_SIGNATURE_PAYLOADS if url or p not in _TS_URL_CANDIDATES]
+    keys = ["raw"] + [k for k in _ts_key_forms(secret) if k]
+    return (f"{len(payloads) * len(TRIPLESEAT_SIGNATURE_ENCODINGS) * len(keys)} candidates = payloads "
+            f"[{', '.join(payloads)}] x encodings [{', '.join(TRIPLESEAT_SIGNATURE_ENCODINGS)}] x keys "
+            f"[{', '.join(keys)}]")
+
+
+def tripleseat_signature_scheme(body: bytes, header: str, secret: str, only: str = None,
+                                url: Optional[str] = None) -> Optional[str]:
+    """The name ('t.body:hex', ...) of the candidate this delivery's signature verifies with, or None.
+    url is the URL Tripleseat posted to (query included); the URL candidates are skipped without it."""
     t, sigs = parse_tripleseat_signature(header)
     if not t or not sigs:
         return None
-    for name, build in TRIPLESEAT_SIGNATURE_SCHEMES.items():
-        digest = hmac.new(secret.encode("utf-8"), build(t, body), hashlib.sha256).digest()
-        for enc in TRIPLESEAT_SIGNATURE_ENCODINGS:
-            scheme = f"{name}:{enc}"
-            if only and scheme != only:
+    if only and not _ts_scheme_parts(only):
+        return None
+    ctx = _ts_context(t, body, url)
+    for key_form, key in _ts_key_forms(secret).items():
+        for name, (build, _signs_t, _why) in TRIPLESEAT_SIGNATURE_PAYLOADS.items():
+            msg = build(ctx)
+            if msg is None:
                 continue
-            expected = digest.hex() if enc == "hex" else base64.b64encode(digest).decode()
-            if any(hmac.compare_digest(sig.lower().encode() if enc == "hex" else sig.encode(), expected.encode())
-                   for sig in sigs):
-                return scheme
+            digest = hmac.new(key, msg, hashlib.sha256).digest()
+            for enc in TRIPLESEAT_SIGNATURE_ENCODINGS:
+                scheme = f"{name}:{enc}" + (f"@{key_form}" if key_form else "")
+                if only and scheme != only:
+                    continue
+                expected = _ts_encode(digest, enc)
+                if any(_ts_matches(sig, expected, enc) for sig in sigs):
+                    return scheme
     return None
+
+
+def tripleseat_secret_shape(secret: Optional[str], as_set: str) -> str:
+    """Length and character class of the signing secret, and whether whitespace was trimmed from what was set in
+    Render. Never the value, any part of it, or a hash of it."""
+    if not secret:
+        return "not set"
+    if re.fullmatch(r"[0-9a-fA-F]+", secret):
+        cls = "hex"
+    elif re.fullmatch(r"[A-Za-z0-9]+", secret):
+        cls = "alphanumeric"
+    elif re.fullmatch(r"[A-Za-z0-9_-]+", secret):
+        cls = "URL-safe (letters, digits, - _)"
+    elif re.fullmatch(r"[A-Za-z0-9+/]+=*", secret):
+        cls = "base64"
+    else:
+        cls = "other (contains characters outside letters, digits, - _ + / =)"
+    trimmed = "yes" if as_set != secret else "no"
+    return f"{len(secret)} characters, {cls}, whitespace trimmed from the Render value: {trimmed}"
+
+
+def _tripleseat_public_url(request: Request) -> str:
+    """The URL Tripleseat posted to, query included (Render terminates TLS, so the scheme comes from the proxy)."""
+    proto = request.headers.get("x-forwarded-proto", request.url.scheme).split(",")[0].strip() or "https"
+    host = request.headers.get("host") or request.url.netloc
+    query = request.url.query
+    return f"{proto}://{host}{request.url.path}" + (f"?{query}" if query else "")
 
 
 def _signature_skew(t: Optional[str]) -> Optional[int]:
@@ -3591,7 +3770,7 @@ def check_tripleseat_signature(request: Request, body: bytes) -> bool:
         return False
     # Only a construction that signs the timestamp can replace the shared key: with a body-only signature a captured
     # delivery could be replayed forever. Body-only candidates stay available for diagnostics (check-only).
-    pinned_ok = bool(TRIPLESEAT_SIGNATURE_SCHEME) and TRIPLESEAT_SIGNATURE_SCHEME.split(":")[0] in ("t.body", "tbody")
+    pinned_ok = tripleseat_scheme_signs_timestamp(TRIPLESEAT_SIGNATURE_SCHEME)
     enforce = TRIPLESEAT_SIGNATURE_ENFORCE and pinned_ok
     if TRIPLESEAT_SIGNATURE_ENFORCE and not pinned_ok:
         log.error("TRIPLESEAT_SIGNATURE_ENFORCE is on but TRIPLESEAT_SIGNATURE_SCHEME is %s: still check-only",
@@ -3599,10 +3778,11 @@ def check_tripleseat_signature(request: Request, body: bytes) -> bool:
     header = request.headers.get("x-signature", "")
     t, sigs = parse_tripleseat_signature(header)
     skew = _signature_skew(t)
-    scheme = tripleseat_signature_scheme(body, header, TRIPLESEAT_WEBHOOK_SECRET,
-                                         only=TRIPLESEAT_SIGNATURE_SCHEME if enforce else None)
+    url = _tripleseat_public_url(request)
+    only = TRIPLESEAT_SIGNATURE_SCHEME if enforce else None
+    scheme = tripleseat_signature_scheme(body, header, TRIPLESEAT_WEBHOOK_SECRET, only=only, url=url)
     fresh = skew is not None and abs(skew) <= TRIPLESEAT_SIGNATURE_MAX_SKEW_SECONDS
-    if scheme and scheme.startswith("body:"):
+    if scheme and not tripleseat_scheme_signs_timestamp(scheme):
         log.info("Tripleseat signature verified (scheme %s: the timestamp is not signed, so it can't replace the "
                  "shared key); not enforced", scheme)
         return False
@@ -3618,9 +3798,8 @@ def check_tripleseat_signature(request: Request, body: bytes) -> bool:
     elif scheme:
         why = f"STALE (scheme {scheme} matched but timestamp skew {skew}s exceeds {TRIPLESEAT_SIGNATURE_MAX_SKEW_SECONDS}s)"
     else:
-        why = (f"MISMATCH (t present, {len(sigs)} v1 value(s), skew {skew}s, body {len(body)} bytes; tried "
-               + ", ".join(f"{n}:{e}" for n in TRIPLESEAT_SIGNATURE_SCHEMES for e in TRIPLESEAT_SIGNATURE_ENCODINGS
-                           if not enforce or f"{n}:{e}" == TRIPLESEAT_SIGNATURE_SCHEME) + ")")
+        why = (f"MISMATCH (t present, {len(sigs)} v1 value(s), skew {skew}s, body {len(body)} bytes; none matched; "
+               f"tried {tripleseat_candidates_tried(TRIPLESEAT_WEBHOOK_SECRET, url, only)})")
     log.warning("Tripleseat signature %s; %s", why, "rejected" if enforce else "not enforced yet")
     if enforce:
         raise HTTPException(status_code=401, detail="Invalid Tripleseat signature")

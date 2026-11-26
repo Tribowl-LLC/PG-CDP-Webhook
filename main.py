@@ -3073,7 +3073,9 @@ def tripleseat_status(request: Request, check: bool = False, key: Optional[str] 
 # (migrations/007). Never changes lifetime spend and never sends Meta events: Tripleseat money mostly
 # settles through Square, and history isn't a live signal.
 # ---------------------------------------------------------------------------
-TRIPLESEAT_DATE_FORMAT = os.getenv("TRIPLESEAT_DATE_FORMAT", "%m/%d/%Y")  # search filter dates
+# Search filter dates are sent as YYYY-MM-DD. Checked against the live API on Nov 26 2026: leads/search ignores a
+# MM/DD/YYYY created_after and returns no leads at all, while bookings/search accepts either form.
+TRIPLESEAT_DATE_FORMAT = "%Y-%m-%d"
 TRIPLESEAT_PAGE_PAUSE = 0.15  # seconds between API pages (limit is 10 requests/second)
 
 
@@ -3097,8 +3099,31 @@ def ts_date(val) -> Optional[str]:
     return f"{m.group(3)}-{int(m.group(1)):02d}-{int(m.group(2)):02d}" if m else None
 
 
+_TS_US_TIME = re.compile(r"^(\d{1,2})/(\d{1,2})/(\d{4})(?:\s+(\d{1,2}):(\d{2})(?::(\d{2}))?\s*([AaPp][Mm])?)?$")
+
+
 def ts_timestamp(val) -> Optional[str]:
-    return val if isinstance(val, str) and re.match(r"^\d{4}-\d{2}-\d{2}", val.strip()) else None
+    """A Tripleseat time as ISO 8601. Bookings send ISO with an offset (kept as is); leads and events send
+    "MM/DD/YYYY hh:mm AM/PM" (per the API spec, not zero-padded in practice) with no zone, which is the venue's
+    local time. Anything else is None."""
+    if not isinstance(val, str):
+        return None
+    v = val.strip()
+    if re.match(r"^\d{4}-\d{2}-\d{2}", v):
+        return v
+    m = _TS_US_TIME.match(v)
+    if not m:
+        return None
+    mo, d, y, hh, mm, ss, ampm = m.groups()
+    hour = int(hh or 0)
+    if ampm:
+        if not 1 <= hour <= 12:
+            return None
+        hour = hour % 12 + (12 if ampm.upper() == "PM" else 0)
+    try:
+        return datetime(int(y), int(mo), int(d), hour, int(mm or 0), int(ss or 0), tzinfo=VENUE_TZ).isoformat()
+    except ValueError:
+        return None
 
 
 def ts_contact_identity(contact: dict, account: dict, fallback: dict = None) -> dict:
@@ -3332,14 +3357,21 @@ def run_tripleseat_sync(days_back: Optional[int] = 3, count_created_since: Optio
     that window, and stores them. A booking created before `count_created_since` (YYYY-MM-DD) is recorded
     without adding to ts_events; the history import passes today so old bookings aren't counted as new.
     apply=False only looks customers up and reports what it would do."""
-    stats = collections.Counter()
+    stats = collections.Counter(bookings_read=0, leads_read=0)  # a zero shows in the result line too
     booking_params = {"show_financial": "true", "order": "updated_at", "sort_direction": "asc"}
     lead_params = {"order": "created_at", "sort_direction": "asc"}
     since = None
     if days_back is not None:
-        since = date.fromordinal(date.today().toordinal() - max(0, int(days_back)))
+        today = date.today()
+        since = today - timedelta(days=max(0, int(days_back)))
         booking_params["booking_updated_start_date"] = since.strftime(TRIPLESEAT_DATE_FORMAT)
-        lead_params["created_after"] = since.strftime(TRIPLESEAT_DATE_FORMAT)
+        # bookings/search ignores the start date unless an end date is sent too (it then returned every booking,
+        # 23 pages, each night). With both, it matched a full read exactly for 0/1/3/7/30-day windows (Nov 26 2026).
+        # Tomorrow, so today's updates are inside the range whichever way the end date is read.
+        booking_params["booking_updated_end_date"] = (today + timedelta(days=1)).strftime(TRIPLESEAT_DATE_FORMAT)
+        # "after": a day earlier, so a lead created on the first day (or late the evening before, in UTC terms)
+        # is never cut off. Reading a lead twice is harmless: it's upserted and leads never count.
+        lead_params["created_after"] = (since - timedelta(days=1)).strftime(TRIPLESEAT_DATE_FORMAT)
     conn = get_conn()
     try:
         for kind, path, params in (("booking", "/bookings/search.json", booking_params),

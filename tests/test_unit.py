@@ -546,7 +546,8 @@ def test_tripleseat_money_and_dates():
     assert main.ts_date("2026-12-05T18:00:00-05:00") == "2026-12-05"
     assert main.ts_date("3/7/2025") == "2025-03-07"
     assert main.ts_date("soon") is None and main.ts_date(None) is None
-    assert main.ts_timestamp("2026-01-02T03:04:05Z") and main.ts_timestamp("01/02/2026") is None
+    assert main.ts_timestamp("2026-01-02T03:04:05Z") == "2026-01-02T03:04:05Z"
+    assert main.ts_timestamp("not a date") is None and main.ts_timestamp(None) is None
 
 
 def test_tripleseat_payment_summary_separates_card_from_check_and_refunds():
@@ -604,15 +605,88 @@ def test_tripleseat_sync_filters_by_window_and_never_counts_history(monkeypatch)
     monkeypatch.setattr(main, "ingest_tripleseat_lead",
                         lambda cur, l, apply=True: ingested.append(("l", None, apply)) or {"status": "created"})
     out = main.run_tripleseat_sync(days_back=3)
-    since = (dt.date.today() - dt.timedelta(days=3)).strftime("%m/%d/%Y")
+    today = dt.date.today()
+    since = (today - dt.timedelta(days=3)).isoformat()
     assert asked[0][1]["booking_updated_start_date"] == since and asked[0][1]["show_financial"] == "true"
-    assert asked[1][1]["created_after"] == since
+    # Without an end date Tripleseat ignores the start date and returns every booking.
+    assert asked[0][1]["booking_updated_end_date"] == (today + dt.timedelta(days=1)).isoformat()
+    assert asked[1][1]["created_after"] == (today - dt.timedelta(days=4)).isoformat()   # a day before the window
+    assert out["bookings_read"] == 1 and out["leads_read"] == 1
     assert ingested == [("b", True, True), ("l", None, True)]
     assert out["booking_matched"] == 1 and out["lead_created"] == 1 and out["bookings_without_payment_data"] == 1
     asked.clear(); ingested.clear()
     out = main.run_tripleseat_sync(days_back=None, count_created_since=dt.date.today().isoformat(), apply=False)
-    assert "booking_updated_start_date" not in asked[0][1] and "created_after" not in asked[1][1]
+    assert "booking_updated_start_date" not in asked[0][1] and "booking_updated_end_date" not in asked[0][1]
+    assert "created_after" not in asked[1][1]
     assert ingested[0] == ("b", False, False) and out["status"] == "tripleseat_sync_dry_run"
+
+
+class _FakeTripleseatSearch:
+    """Answers leads/search and bookings/search the way the live API did on Nov 26 2026 (counts and filter
+    behaviour only; every record here is fake): created_after in MM/DD/YYYY form matches no lead at all, and
+    booking_updated_start_date is ignored unless booking_updated_end_date is sent too."""
+    LEADS = [{"id": 900 + i, "created_at": f"11/{23 + i}/2026 {1 + i}:15 PM", "updated_at": f"11/{23 + i}/2026 {1 + i}:20 PM",
+              "converted_at": "11/24/2026 9:05 AM" if i == 1 else None, "first_name": "Fake", "last_name": f"Lead{i}"}
+             for i in range(3)]
+    OLD_LEAD = {"id": 100, "created_at": "01/05/2025 10:00 AM"}
+    BOOKINGS = [{"id": 1, "updated_at": "2026-11-24T10:00:00-05:00"}, {"id": 2, "updated_at": "2025-06-01T10:00:00-04:00"}]
+
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, path, params=None):
+        params = params or {}
+        self.calls.append((path, dict(params)))
+        if path.startswith("/leads/search"):
+            after = params.get("created_after")
+            if after is None:
+                rows = [self.OLD_LEAD] + self.LEADS
+            elif re.fullmatch(r"\d{4}-\d{2}-\d{2}", after):
+                rows = [r for r in self.LEADS if main.ts_timestamp(r["created_at"])[:10] > after]
+            else:
+                rows = []                                   # what MM/DD/YYYY got from the live API
+        else:
+            start = params.get("booking_updated_start_date")
+            rows = self.BOOKINGS if not (start and params.get("booking_updated_end_date")) else \
+                [b for b in self.BOOKINGS if b["updated_at"][:10] >= start]
+        return {"total_pages": 1 if rows else 0, "results": rows}
+
+
+def test_tripleseat_sync_reads_leads_and_only_recently_updated_bookings(monkeypatch):
+    fake = _FakeTripleseatSearch()
+    monkeypatch.setattr(main, "tripleseat_get", fake)
+    monkeypatch.setattr(main, "TRIPLESEAT_PAGE_PAUSE", 0)
+    monkeypatch.setattr(main, "get_conn", lambda: _FakeTokenDB(None))
+    seen = {"b": [], "l": []}
+    monkeypatch.setattr(main, "ingest_tripleseat_booking",
+                        lambda cur, b, count_it, apply=True: seen["b"].append(b["id"]) or {"status": "matched"})
+    monkeypatch.setattr(main, "ingest_tripleseat_lead",
+                        lambda cur, l, apply=True: seen["l"].append(l["id"]) or {"status": "matched"})
+
+    class _Today(main.date):
+        @classmethod
+        def today(cls):
+            return cls(2026, 11, 26)
+    monkeypatch.setattr(main, "date", _Today)
+    out = main.run_tripleseat_sync(days_back=3)
+    assert out["leads_read"] == 3 and seen["l"] == [900, 901, 902]        # the window's leads, not zero
+    assert out["bookings_read"] == 1 and seen["b"] == [1]                 # only the recently updated booking
+    assert out["since"] == "2026-11-23"
+    lead_call = next(p for path, p in fake.calls if path.startswith("/leads/search"))
+    assert lead_call["created_after"] == "2026-11-22"
+    # The old MM/DD/YYYY form is exactly what read zero leads:
+    assert fake("/leads/search.json", {"created_after": "11/22/2026"})["results"] == []
+
+
+def test_tripleseat_us_times_are_stored_as_venue_local_iso():
+    assert main.ts_timestamp("11/20/2026 01:15 PM") == "2026-11-20T13:15:00-05:00"
+    assert main.ts_timestamp("11/5/2026 9:41 PM") == "2026-11-05T21:41:00-05:00"     # not zero-padded (events)
+    assert main.ts_timestamp("7/4/2026 12:05 AM") == "2026-07-04T00:05:00-04:00"     # midnight hour, summer time
+    assert main.ts_timestamp("7/4/2026 12:05 PM") == "2026-07-04T12:05:00-04:00"     # noon
+    assert main.ts_timestamp("01/02/2026") == "2026-01-02T00:00:00-05:00"            # date only
+    assert main.ts_timestamp("2026-11-25T15:56:16-05:00") == "2026-11-25T15:56:16-05:00"  # bookings: as sent
+    for bad in ("13/40/2026 1:00 PM", "11/20/2026 13:00 PM", "11/20/26 1:00 PM", "", "  ", 20261120):
+        assert main.ts_timestamp(bad) is None, bad
 
 
 def test_tripleseat_sync_endpoint_off_without_secret(monkeypatch):

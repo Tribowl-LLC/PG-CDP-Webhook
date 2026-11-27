@@ -2507,3 +2507,187 @@ def test_widened_candidates_stay_check_only_and_a_pinned_new_scheme_enforces(cli
     r = _post_ts(client, body, f"t={t},v1={url_sig}", key=False)
     assert r.status_code == 200 and r.json()["status"] == "tripleseat_synced"
     assert _post_ts(client, body, f"t={t},v1={_ts_sig(body, t)}", key=False).status_code == 401  # only the pinned one
+
+
+# --- Website party bookings (POST /webhooks/website-party) ------------------------------------------------------
+
+def web_party(uid, **changes):
+    """A booking as the website booking tool sends it, for the same test parent the Partywirks/Tripleseat helpers
+    use (so the three systems resolve to one customer)."""
+    body = {"booking_id": f"wb-{uid}", "first_name": "Party", "last_name": f"Parent{uid}",
+            "email": f"party-{uid}@example.test", "phone": "248" + str(int(uid[:8], 16) % 10_000_000).zfill(7),
+            "order_total": 759.86, "currency": "USD", "square_payment_id": f"sqpay-{uid}",
+            "fbp": "fb.1.1764200000000.987654321", "fbc": "fb.1.1764200000000.AbCdEfGhIjKlMnOp",
+            "user_agent": "Mozilla/5.0 (iPhone) TestBrowser/1.0", "party_date": "2026-12-05", "party_time": "15:00",
+            "package": "Extravaganza", "guest_count": 15, "source": "website"}
+    body.update(changes)
+    return body
+
+
+def web_rows(db, uid):
+    db.execute("SELECT * FROM website_bookings WHERE booking_id = %s", (f"wb-{uid}",))
+    return db.fetchall()
+
+
+def test_website_party_needs_the_webhook_key(client, db, uid):
+    assert client.post("/webhooks/website-party", json=web_party(uid)).status_code == 401
+    assert client.post("/webhooks/website-party", headers={"X-CDP-Key": "wrong"}, json=web_party(uid)).status_code == 401
+    assert web_rows(db, uid) == []
+
+
+def test_website_party_bad_payload_is_refused_and_nothing_is_saved(client, db, fake, uid):
+    for changes in ({"order_total": 0}, {"package": "Mega"}, {"source": "partywirks"}, {"party_date": "next week"},
+                    {"email": "", "phone": ""}):
+        r = client.post("/webhooks/website-party", headers=WH, json=web_party(uid, **changes))
+        assert r.status_code == 422, changes
+    db.execute("SELECT 1 FROM master_customers WHERE email = %s", (f"party-{uid}@example.test",))
+    assert db.fetchone() is None and web_rows(db, uid) == [] and fake.meta_events() == []
+
+
+def test_website_party_is_recorded_like_a_partywirks_booking_and_sends_one_qualified_bowler(client, db, fake, uid, everyone_qualifies):
+    before = main.datetime.now(main.timezone.utc)
+    resp = client.post("/webhooks/website-party", headers=WH, json=web_party(uid))
+    assert resp.status_code == 200
+    r = resp.json()
+    assert r["status"] == "website_party_synced" and r["booking_id"] == f"wb-{uid}"
+    c = customer_row(db, r["cluster_id"])
+    # The customer carries what a Partywirks booking would have set, so scoring and audiences treat it the same.
+    assert (c["in_partywirks"], c["pw_bookings"], c["pw_last_package"], str(c["pw_last_party_date"])) == (1, 1, "BIRTHDAY EXTRAVAGANZA", "2026-12-05")
+    assert float(c["pw_spend"]) == 759.86 and float(c["true_lifetime_spend"]) == 759.86
+    assert c["md_presence_of_children"] == "Children Present" and c["md_address1"] == "100 Test St"   # enriched
+    assert (c["meta_fbp"], c["meta_fbc"], c["meta_client_user_agent"]) == ("fb.1.1764200000000.987654321", "fb.1.1764200000000.AbCdEfGhIjKlMnOp", "Mozilla/5.0 (iPhone) TestBrowser/1.0")
+    # The booking itself: one ledger row and one website_bookings row, with every field the tool sent.
+    db.execute("SELECT * FROM unified_transactions WHERE transaction_id = %s", (f"web_wb-{uid}",))
+    t = db.fetchone()
+    assert (t["source_system"], t["cluster_id"], str(t["party_date"]), float(t["total_amount"])) == ("website", r["cluster_id"], "2026-12-05", 759.86)
+    w = web_rows(db, uid)
+    assert len(w) == 1
+    assert (w[0]["cluster_id"], w[0]["square_payment_id"], float(w[0]["order_total"]), w[0]["currency"], str(w[0]["party_date"]),
+            w[0]["party_time"], w[0]["package"], w[0]["guest_count"], w[0]["source"]) == \
+           (r["cluster_id"], f"sqpay-{uid}", 759.86, "USD", "2026-12-05", "15:00", "Extravaganza", 15, "website")
+    assert (w[0]["fbp"], w[0]["fbc"], w[0]["user_agent"]) == (c["meta_fbp"], c["meta_fbc"], c["meta_client_user_agent"])
+    # Exactly one Meta event: Qualified_Bowler, qb_web_<booking_id>, worth the order total, timed at receipt.
+    events = fake.meta_events()
+    assert [(e["event_name"], e["event_id"]) for e in events] == [("Qualified_Bowler", f"qb_web_wb-{uid}")]
+    e = events[0]
+    assert e["custom_data"]["value"] == 759.86 and e["custom_data"]["currency"] == "USD"
+    assert before.timestamp() - 2 <= e["event_time"] <= main.datetime.now(main.timezone.utc).timestamp() + 2
+    assert (e["user_data"]["fbp"], e["user_data"]["fbc"], e["user_data"]["client_user_agent"]) == (c["meta_fbp"], c["meta_fbc"], c["meta_client_user_agent"])
+    assert e["action_source"] == "system_generated"
+    log_row = capi_rows(db, f"qb_web_wb-{uid}")
+    assert len(log_row) == 1 and log_row[0]["sent_to_meta"] is True and float(log_row[0]["event_value"]) == 759.86
+    assert not [x for x in events if x["event_name"] == "Purchase"]   # the Purchase comes from the register
+
+
+def test_website_party_retry_with_the_same_booking_id_changes_nothing(client, db, fake, uid, everyone_qualifies):
+    first = client.post("/webhooks/website-party", headers=WH, json=web_party(uid)).json()
+    for _ in range(3):   # the tool retries, or sends again: still one of everything, and still a 200
+        again = client.post("/webhooks/website-party", headers=WH, json=web_party(uid, order_total=999.0, guest_count=12))
+        assert again.status_code == 200 and again.json()["status"] == "website_party_already_recorded"
+        assert again.json()["cluster_id"] == first["cluster_id"]
+    c = customer_row(db, first["cluster_id"])
+    assert c["pw_bookings"] == 1 and float(c["pw_spend"]) == 759.86          # counted and added once
+    assert qbs_sent(fake) == [f"qb_web_wb-{uid}"] and len(capi_rows(db, f"qb_web_wb-{uid}")) == 1
+    w = web_rows(db, uid)
+    assert len(w) == 1 and float(w[0]["order_total"]) == 759.86 and w[0]["guest_count"] == 15   # the first copy stands
+    db.execute("SELECT COUNT(*) AS n FROM master_customers WHERE email = %s", (f"party-{uid}@example.test",))
+    assert db.fetchone()["n"] == 1                                            # never a second customer record
+
+
+def test_website_party_below_the_threshold_is_accepted_but_sends_no_event(client, db, fake, uid, monkeypatch):
+    monkeypatch.setattr(main, "get_threshold", lambda cur: 100)
+    resp = client.post("/webhooks/website-party", headers=WH, json=web_party(uid))
+    assert resp.status_code == 200 and resp.json()["status"] == "website_party_synced"
+    assert capi_rows(db, f"qb_web_wb-{uid}") == [] and qbs_sent(fake) == []   # the event gate applies, as for Partywirks
+    assert customer_row(db, resp.json()["cluster_id"])["pw_bookings"] == 1 and len(web_rows(db, uid)) == 1
+    assert fake.count("/users") >= 1                                          # the seed audiences don't need the score
+    # A retry later, even with a lower threshold, is a duplicate: it never creates the event after the fact.
+    monkeypatch.setattr(main, "get_threshold", lambda cur: 0)
+    assert client.post("/webhooks/website-party", headers=WH, json=web_party(uid)).json()["status"] == "website_party_already_recorded"
+    assert qbs_sent(fake) == []
+
+
+def test_website_party_in_an_excluded_area_sends_nothing(client, db, fake, uid, everyone_qualifies):
+    resp = client.post("/webhooks/website-party", headers=WH, json=web_party(uid, email=f"detroit-{uid}@example.test"))
+    assert resp.status_code == 200 and customer_row(db, resp.json()["cluster_id"])["md_city"] == "Detroit"
+    assert fake.meta_events() == [] and capi_rows(db, f"qb_web_wb-{uid}") == [] and fake.count("/users") == 0
+
+
+def test_website_party_event_is_held_for_enrichment_then_sent_once(client, db, fake, uid, everyone_qualifies, deferred):
+    r = client.post("/webhooks/website-party", headers=WH, json=web_party(uid)).json()
+    held = capi_rows(db, f"qb_web_wb-{uid}")
+    assert len(held) == 1 and held[0]["meta_response_status"] == "DEFERRED_ENRICHMENT" and qbs_sent(fake) == []
+    client.post("/webhooks/website-party", headers=WH, json=web_party(uid))   # a retry while it waits changes nothing
+    assert len(capi_rows(db, f"qb_web_wb-{uid}")) == 1 and qbs_sent(fake) == []
+    run_worker_now(db, r["cluster_id"])   # the worker also releases whatever other tests left waiting: count only ours
+    assert qbs_sent(fake).count(f"qb_web_wb-{uid}") == 1 and capi_rows(db, f"qb_web_wb-{uid}")[0]["sent_to_meta"] is True
+
+
+def test_website_party_meta_failure_is_retried_by_a_resend_without_recounting(client, db, fake, uid, everyone_qualifies):
+    fake.meta_mode = "500"
+    r = client.post("/webhooks/website-party", headers=WH, json=web_party(uid))
+    assert r.status_code == 200                                # the booking is recorded; Meta being down is not the tool's problem
+    assert capi_rows(db, f"qb_web_wb-{uid}")[0]["sent_to_meta"] is False
+    fake.meta_mode = "ok"
+    client.post("/webhooks/website-party", headers=WH, json=web_party(uid))
+    assert capi_rows(db, f"qb_web_wb-{uid}")[0]["sent_to_meta"] is True and customer_row(db, r.json()["cluster_id"])["pw_bookings"] == 1
+
+
+def test_website_party_processing_failure_is_a_500_saves_nothing_and_the_retry_succeeds(client, db, fake, uid, everyone_qualifies, monkeypatch):
+    real = main._set_partywirks_spend
+
+    def boom(cur, cluster_id, delta):
+        raise RuntimeError("simulated failure half way through")
+    monkeypatch.setattr(main, "_set_partywirks_spend", boom)
+    r = client.post("/webhooks/website-party", headers=WH, json=web_party(uid))
+    assert r.status_code == 500 and "simulated" not in r.text
+    db.execute("SELECT 1 FROM unified_transactions WHERE transaction_id = %s", (f"web_wb-{uid}",))
+    assert db.fetchone() is None and web_rows(db, uid) == [] and fake.meta_events() == []   # rolled back as a whole
+    db.execute("SELECT 1 FROM master_customers WHERE email = %s", (f"party-{uid}@example.test",))
+    assert db.fetchone() is None
+    monkeypatch.setattr(main, "_set_partywirks_spend", real)
+    ok = client.post("/webhooks/website-party", headers=WH, json=web_party(uid))
+    assert ok.status_code == 200 and ok.json()["status"] == "website_party_synced" and qbs_sent(fake) == [f"qb_web_wb-{uid}"]
+
+
+def test_website_party_then_tripleseat_reentry_fires_one_qb(client, db, fake, uid, everyone_qualifies):
+    """Staff re-enter website parties into Tripleseat by hand, as they did Partywirks ones: one QB per party."""
+    r = client.post("/webhooks/website-party", headers=WH, json=web_party(uid)).json()
+    t = client.post("/webhooks/tripleseat", headers=WH, json=ts_event(uid)).json()
+    assert t["cluster_id"] == r["cluster_id"]
+    assert qbs_sent(fake) == [f"qb_web_wb-{uid}"]
+    dup = capi_rows(db, f"qb_ts_{r['cluster_id']}_%")
+    assert len(dup) == 1 and dup[0]["sent_to_meta"] is False
+    assert dup[0]["meta_response_status"] == "DUPLICATE_QUALIFIED_BOWLER" and dup[0]["meta_response_body"] == f"qb_web_wb-{uid}"
+    client.post("/webhooks/tripleseat", headers=WH, json=ts_event(uid))
+    client.post("/webhooks/website-party", headers=WH, json=web_party(uid))
+    with main.get_conn() as conn, conn.cursor() as cur:
+        main.retry_unsent_events(cur)
+    assert qbs_sent(fake) == [f"qb_web_wb-{uid}"]
+
+
+def test_tripleseat_then_website_party_fires_one_qb(client, db, fake, uid, everyone_qualifies):
+    t = client.post("/webhooks/tripleseat", headers=WH, json=ts_event(uid, event_date="2026-12-05")).json()
+    r = client.post("/webhooks/website-party", headers=WH, json=web_party(uid)).json()
+    assert r["cluster_id"] == t["cluster_id"] and qbs_sent(fake) == [f"qb_ts_{t['cluster_id']}_2026-12-05"]
+    dup = capi_rows(db, f"qb_web_wb-{uid}")[0]
+    assert dup["meta_response_status"] == "DUPLICATE_QUALIFIED_BOWLER" and dup["meta_response_body"] == f"qb_ts_{t['cluster_id']}_2026-12-05"
+    with main.get_conn() as conn, conn.cursor() as cur:
+        main.retry_unsent_events(cur)
+    assert len(qbs_sent(fake)) == 1
+
+
+def test_website_party_on_another_date_is_not_a_twin_of_a_tripleseat_event(client, db, fake, uid, everyone_qualifies):
+    t = client.post("/webhooks/tripleseat", headers=WH, json=ts_event(uid, event_date="2026-12-05")).json()
+    client.post("/webhooks/website-party", headers=WH, json=web_party(uid, party_date="2027-01-17"))
+    assert sorted(qbs_sent(fake)) == sorted([f"qb_ts_{t['cluster_id']}_2026-12-05", f"qb_web_wb-{uid}"])   # two parties, two events
+
+
+def test_website_party_for_an_existing_partywirks_parent_is_the_same_customer(client, db, fake, uid, everyone_qualifies):
+    oid = f"52{int(uid, 16)}"
+    p = client.post("/webhooks/partywirks", headers=WH, json=fake.add_partywirks(uid, oid, event_date="2026-06-06")).json()
+    w = client.post("/webhooks/website-party", headers=WH, json=web_party(uid)).json()
+    assert w["cluster_id"] == p["cluster_id"]
+    c = customer_row(db, p["cluster_id"])
+    assert c["pw_bookings"] == 2 and float(c["pw_spend"]) == round(728.7 + 759.86, 2)   # two parties, each counted once
+    assert sorted(qbs_sent(fake)) == sorted([f"qb_pw_{oid}", f"qb_web_wb-{uid}"])

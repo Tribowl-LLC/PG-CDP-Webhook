@@ -1529,9 +1529,10 @@ def save_browser_ids(cur, cluster_id, ids: dict, captured_at: Optional[datetime]
 
 
 def browser_user_data(cust: dict, event_id: str) -> dict:
-    """The fbp / fbc / client_user_agent to add to this event's user_data: only Tripleseat events, only a
-    capture younger than BROWSER_IDS_MAX_AGE, and only fields that are known (never empty strings)."""
-    if not (event_id.startswith("qb_ts_") or event_id.startswith("lead_ts_")):
+    """The fbp / fbc / client_user_agent to add to this event's user_data: only events whose source captured
+    them in the customer's own browser (the Tripleseat lead form, and a party booked in the website booking
+    tool), only a capture younger than BROWSER_IDS_MAX_AGE, and only fields that are known (never empty strings)."""
+    if not event_id.startswith(("qb_ts_", "lead_ts_", "qb_web_")):
         return {}
     oldest = datetime.now(timezone.utc) - BROWSER_IDS_MAX_AGE
     out = {}
@@ -1714,6 +1715,23 @@ def _pw_party_date(cur, event_id: str) -> Optional[str]:
     return row["d"] if row else None
 
 
+def _web_party_date(cur, event_id: str) -> Optional[str]:
+    """A website booking's party date, from its ledger row (web_<booking_id>)."""
+    cur.execute("SELECT to_char(party_date, 'YYYY-MM-DD') AS d FROM unified_transactions "
+                "WHERE transaction_id = %s AND source_system = 'website';", ("web_" + event_id[len("qb_web_"):],))
+    row = cur.fetchone()
+    return row["d"] if row else None
+
+
+def _qb_party_date(cur, event_id: str) -> Optional[str]:
+    """The party date behind a Qualified_Bowler event ID, whichever system it came from."""
+    if event_id.startswith("qb_pw_"):
+        return _pw_party_date(cur, event_id)
+    if event_id.startswith("qb_web_"):
+        return _web_party_date(cur, event_id)
+    return _ts_qb_date(event_id)
+
+
 def _ts_qb_date(event_id: str) -> Optional[str]:
     parts = event_id.split("_", 3)  # qb, ts, <cluster>, <date or record key>
     return ts_date(parts[3]) if len(parts) == 4 else None
@@ -1728,25 +1746,28 @@ def party_qb_twin(cur, cluster_id, event_name: str, event_id: str) -> Optional[s
     the hourly retry (RETRY_MAX_AGE_DAYS). An expired failure never blocks a newer event."""
     if event_name != "Qualified_Bowler" or not cluster_id:
         return None
-    if event_id.startswith("qb_pw_"):
-        day, other = _pw_party_date(cur, event_id), "qb\\_ts\\_%"
+    # A party booked in Partywirks or in the website booking tool is re-entered into Tripleseat by staff, so its
+    # twin is the Tripleseat event; a Tripleseat event's twin is the booking in either of those two.
+    if event_id.startswith(("qb_pw_", "qb_web_")):
+        others = ["qb\\_ts\\_%"]
     elif event_id.startswith("qb_ts_"):
-        day, other = _ts_qb_date(event_id), "qb\\_pw\\_%"
+        others = ["qb\\_pw\\_%", "qb\\_web\\_%"]
     else:
         return None
+    day = _qb_party_date(cur, event_id)
     if not day:
         return None
     cur.execute("SELECT sent_at FROM capi_events_log WHERE event_id = %s;", (event_id,))
     me = cur.fetchone()
     cur.execute(f"""SELECT l.event_id, l.sent_to_meta, l.sent_at FROM capi_events_log l
-                    WHERE l.cluster_id = %s AND l.event_name = 'Qualified_Bowler' AND l.event_id LIKE %s
+                    WHERE l.cluster_id = %s AND l.event_name = 'Qualified_Bowler' AND l.event_id LIKE ANY(%s)
                       AND l.event_id <> %s AND {_QB_TWIN_SKIP}
                       AND (l.sent_to_meta OR l.meta_response_status = 'DEFERRED_ENRICHMENT'
                            OR COALESCE(l.event_time, l.sent_at) > NOW() - make_interval(days => %s))
                     ORDER BY l.sent_to_meta DESC, l.sent_at, l.event_id;""",
-                (cluster_id, other, event_id, RETRY_MAX_AGE_DAYS))
+                (cluster_id, others, event_id, RETRY_MAX_AGE_DAYS))
     for r in cur.fetchall():
-        theirs = _pw_party_date(cur, r["event_id"]) if r["event_id"].startswith("qb_pw_") else _ts_qb_date(r["event_id"])
+        theirs = _qb_party_date(cur, r["event_id"])
         if theirs != day:
             continue
         if r["sent_to_meta"] or not me or (r["sent_at"], r["event_id"]) < (me["sent_at"], event_id):
@@ -4143,6 +4164,180 @@ async def partywirks_webhook(request: Request, background_tasks: BackgroundTasks
     body, raw = await read_json(request)
     check_partywirks_signature(request, body)
     return await run_in_threadpool(handle_partywirks, raw, background_tasks)
+
+
+# ---------------------------------------------------------------------------
+# Website party bookings. The venue's own birthday booking tool (parties.myperfectgame.com) replaces Partywirks.
+# It saves a booking, takes the $100 deposit through Square, and then POSTs the booking here once: 16 fields,
+# authenticated by the shared webhook key. The booking flows exactly as a Partywirks one does (same customer
+# fields, same scoring, same held-event and audience handling) and ends as one Qualified_Bowler,
+# qb_web_<booking_id>, worth the order total. No Purchase from here: that fires from the register, through Square,
+# when the balance is paid.
+#
+# The customer columns are the Partywirks ones (in_partywirks, pw_bookings, pw_last_package, pw_last_party_date,
+# pw_spend): they mean "booked a birthday party", which is what scoring and the birthday seed audience read, so a
+# website booking counts exactly as a Partywirks booking did and no scoring rule changes. What tells the two
+# apart is the ledger row (web_<booking_id>, source_system 'website') and the website_bookings table.
+# The tool retries on any failure, so a 200 is only ever an accepted booking or a recognised duplicate.
+# ---------------------------------------------------------------------------
+WEBSITE_PARTY_PACKAGES = {"Bowling": "BOWLING PARTY", "Extravaganza": "BIRTHDAY EXTRAVAGANZA", "Teen": "TEEN PARTY"}
+WEBSITE_PARTY_FIELDS = ("booking_id", "first_name", "last_name", "email", "phone", "order_total", "currency",
+                        "square_payment_id", "fbp", "fbc", "user_agent", "party_date", "party_time", "package",
+                        "guest_count", "source")
+_WEB_BOOKING_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_\-]{5,99}$")
+_WEB_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+_WEB_TIME_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
+
+
+def website_party_record(raw) -> dict:
+    """Checks a booking against the contract and normalises it. Raises ValueError naming the fields that are
+    wrong (names only, never values). Browser identifiers are best-effort: one that isn't in Meta's format is
+    left out, it never rejects the booking."""
+    if not isinstance(raw, dict):
+        raise ValueError("body must be a JSON object")
+    bad = [f for f in WEBSITE_PARTY_FIELDS if f not in raw]
+    if bad:
+        raise ValueError("missing: " + ", ".join(bad))
+
+    def text(field, limit=200):
+        v = raw.get(field)
+        return v.strip()[:limit] if isinstance(v, str) else ""
+
+    booking_id, email, phone = text("booking_id", 100), text("email").lower(), clean_phone(text("phone"))
+    if not _WEB_BOOKING_ID_RE.match(booking_id):
+        bad.append("booking_id")
+    if raw.get("source") != "website":
+        bad.append("source")
+    if raw.get("currency") != "USD":
+        bad.append("currency")
+    total = raw.get("order_total")
+    if isinstance(total, bool) or not isinstance(total, (int, float)) or not (0 < float(total) < 100000):
+        bad.append("order_total")
+    if not text("square_payment_id"):
+        bad.append("square_payment_id")
+    try:
+        party_date = date.fromisoformat(text("party_date")).isoformat()
+    except ValueError:
+        party_date = None
+        bad.append("party_date")
+    if not _WEB_TIME_RE.match(text("party_time")):
+        bad.append("party_time")
+    if raw.get("package") not in WEBSITE_PARTY_PACKAGES:
+        bad.append("package")
+    guests = raw.get("guest_count")
+    if isinstance(guests, bool) or not isinstance(guests, int) or not (1 <= guests <= 500):
+        bad.append("guest_count")
+    if email and not _WEB_EMAIL_RE.match(email):
+        bad.append("email")
+    if not email and not phone:
+        bad.append("email or phone")   # nobody to resolve the booking to
+    if not text("first_name") and not text("last_name"):
+        bad.append("first_name")
+    if bad:
+        raise ValueError("invalid: " + ", ".join(bad))
+
+    browser = {}
+    for key, pattern in (("fbp", _FBP_RE), ("fbc", _FBC_RE)):
+        if text(key, 600) and pattern.match(text(key, 600)):
+            browser[key] = text(key, 600)
+    if 10 <= len(text("user_agent", 1000)) <= 1000:
+        browser["ua"] = text("user_agent", 1000)
+    return {"booking_id": booking_id, "first_name": text("first_name", 100), "last_name": text("last_name", 100),
+            "email": email, "phone": phone, "total": round(float(total), 2), "currency": "USD",
+            "square_payment_id": text("square_payment_id"), "party_date": party_date,
+            "party_time": text("party_time"), "package": raw["package"], "guest_count": guests,
+            "browser": browser}
+
+
+def ingest_website_party(cur, rec: dict, background_tasks: BackgroundTasks = None,
+                         received_at: Optional[datetime] = None) -> dict:
+    """Saves one website party booking, the way ingest_partywirks saves a Partywirks one. Counted, and its
+    Qualified_Bowler sent, once per booking_id: a repeat changes nothing and only retries an event Meta
+    didn't accept."""
+    received_at = received_at or datetime.now(timezone.utc)
+    cust, _ = upsert_and_enrich_customer(cur, {
+        "first_name": rec["first_name"],
+        "last_name": rec["last_name"],
+        "email": rec["email"],
+        "phone": rec["phone"],
+        "in_partywirks": 1,                                  # "booked a birthday party": see the note above
+        "pw_last_package": WEBSITE_PARTY_PACKAGES[rec["package"]],
+        "pw_last_party_date": rec["party_date"],
+        "source": "Website",
+    })
+    key = rec["booking_id"]
+    txn_id, event_id = f"web_{key}", f"qb_web_{key}"
+    cust, is_new = _count_record_once(cur, cust, txn_id, "website", "pw_bookings")
+    thresh = get_threshold(cur)
+    if not is_new:
+        retry_unsent_event(cur, event_id)   # a Meta failure last time gets another try; nothing is counted again
+        return {"status": "website_party_already_recorded", "cluster_id": cust["cluster_id"],
+                "booking_id": key, "score": cust["bowler_value_score"]}
+
+    # The ledger row carries the party date (for the one-Qualified_Bowler-per-party rule when staff re-enter the
+    # party into Tripleseat) and the order total, which is the booker's spend, added once.
+    cur.execute("UPDATE unified_transactions SET party_date = %s::date, total_amount = %s "
+                "WHERE transaction_id = %s AND source_system = 'website';", (rec["party_date"], rec["total"], txn_id))
+    cust = rescore_customer(cur, _set_partywirks_spend(cur, cust["cluster_id"], rec["total"]))
+    cur.execute("""INSERT INTO website_bookings (booking_id, cluster_id, square_payment_id, order_total, currency,
+                       party_date, party_time, package, guest_count, fbp, fbc, user_agent, source, received_at)
+                   VALUES (%s, %s, %s, %s, %s, %s::date, %s, %s, %s, %s, %s, %s, 'website', %s)
+                   ON CONFLICT (booking_id) DO NOTHING;""",
+                (key, cust["cluster_id"], rec["square_payment_id"], rec["total"], rec["currency"], rec["party_date"],
+                 rec["party_time"], rec["package"], rec["guest_count"], rec["browser"].get("fbp"),
+                 rec["browser"].get("fbc"), rec["browser"].get("ua"), received_at))
+    if rec["browser"]:
+        # Captured in the parent's browser as they booked: kept on the customer and sent with this booking's event.
+        save_browser_ids(cur, cust["cluster_id"], rec["browser"], received_at)
+        cur.execute("SELECT * FROM master_customers WHERE cluster_id = %s;", (cust["cluster_id"],))
+        cust = cur.fetchone()
+
+    if not is_detroit_excluded(cust.get("md_city"), cust.get("zip5")):
+        if cust["bowler_value_score"] >= thresh or cust.get("enrich_after"):
+            # The deposit has just succeeded, so the event time is when this arrived. Worth the order total.
+            fire_meta_capi_event(cur, cust, "Qualified_Bowler", rec["total"], thresh,
+                                 event_id=event_id, event_time=received_at)
+        if background_tasks is not None:
+            background_tasks.add_task(sync_customer_to_meta_custom_audiences, dict(cust))
+        else:
+            sync_customer_to_meta_custom_audiences(dict(cust))
+    return {"status": "website_party_synced", "cluster_id": cust["cluster_id"], "booking_id": key,
+            "score": cust["bowler_value_score"]}
+
+
+def handle_website_party(rec: dict, background_tasks: BackgroundTasks, received_at: datetime) -> dict:
+    conn = get_conn()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                return ingest_website_party(cur, rec, background_tasks, received_at)
+    finally:
+        conn.close()
+
+
+@app.post("/webhooks/website-party")
+async def website_party_webhook(request: Request, background_tasks: BackgroundTasks):
+    """A birthday party booked in the website booking tool, sent once Square has confirmed its deposit.
+    200 = accepted, or recognised as one already recorded. 401 = bad key. 400/422 = bad body (the response names
+    the fields, never their values). Anything else that goes wrong is a 500, so the tool tries again."""
+    require_webhook_key(request)
+    received_at = datetime.now(timezone.utc)
+    _, raw = await read_json(request)
+    try:
+        rec = website_party_record(raw)
+    except ValueError as e:
+        log.warning("Website party booking refused: %s", e)   # field names only
+        raise HTTPException(status_code=422, detail={"error": "invalid_payload", "problem": str(e)})
+    try:
+        return await run_in_threadpool(handle_website_party, rec, background_tasks, received_at)
+    except HTTPException:
+        raise
+    except Exception as e:
+        # Rolled back as a whole. Never a 200: the tool keeps the booking and retries, and booking_id makes the
+        # retry safe.
+        log.error("Website party booking %s failed (%s): answering 500 so the tool retries",
+                  rec["booking_id"][:8], type(e).__name__)
+        raise HTTPException(status_code=500, detail="Could not record the booking")
 
 
 def partywirks_signature_matches(body: bytes, provided: str, secret: str) -> bool:

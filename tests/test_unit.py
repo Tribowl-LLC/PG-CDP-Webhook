@@ -1652,3 +1652,136 @@ def test_health_still_reports_cron_key_check_without_the_value(cron_client, monk
     monkeypatch.setattr(main, "CRON_SECRET", None)
     body = cron_client.get("/health").text
     assert '"cron_key_check":false' in body and FAKE_CRON_KEY not in body
+
+
+# --- Website party bookings (POST /webhooks/website-party) ------------------------------------------------------
+
+def _web_party(**changes):
+    """A booking exactly as the website booking tool sends it: the 16 fields of the contract."""
+    body = {"booking_id": "3f2b8c1e-5a7d-4e9a-b1c2-0d9e8f7a6b5c", "first_name": "Pat", "last_name": "Parent",
+            "email": "Pat.Parent@Example.test", "phone": "(248) 555-0122", "order_total": 759.86, "currency": "USD",
+            "square_payment_id": "sqpay_TEST123", "fbp": "fb.1.1764200000000.987654321",
+            "fbc": "fb.1.1764200000000.AbCdEfGhIjKlMnOp", "user_agent": "Mozilla/5.0 (iPhone) TestBrowser/1.0",
+            "party_date": "2027-01-17", "party_time": "15:00", "package": "Extravaganza", "guest_count": 15,
+            "source": "website"}
+    body.update(changes)
+    return body
+
+
+@pytest.fixture
+def webhook_client(monkeypatch):
+    """A client for the webhook's own checks (key, body). Anything that would reach the database fails the test."""
+    from fastapi.testclient import TestClient
+    monkeypatch.setattr(main, "WEBHOOK_SECRET", "fake-webhook-key")
+    monkeypatch.setattr(main, "WEBHOOK_SECRET_PREVIOUS", None)
+
+    def no_database(*a, **k):
+        raise AssertionError("this request must be refused before the database is touched")
+    monkeypatch.setattr(main, "get_conn", no_database)
+    return TestClient(main.app, raise_server_exceptions=False)
+
+
+def test_website_party_record_accepts_the_contract_and_normalises_it():
+    rec = main.website_party_record(_web_party())
+    assert rec == {"booking_id": "3f2b8c1e-5a7d-4e9a-b1c2-0d9e8f7a6b5c", "first_name": "Pat", "last_name": "Parent",
+                   "email": "pat.parent@example.test", "phone": main.clean_phone("(248) 555-0122"), "total": 759.86,
+                   "currency": "USD", "square_payment_id": "sqpay_TEST123", "party_date": "2027-01-17",
+                   "party_time": "15:00", "package": "Extravaganza", "guest_count": 15,
+                   "browser": {"fbp": "fb.1.1764200000000.987654321", "fbc": "fb.1.1764200000000.AbCdEfGhIjKlMnOp",
+                               "ua": "Mozilla/5.0 (iPhone) TestBrowser/1.0"}}
+    assert set(_web_party()) == set(main.WEBSITE_PARTY_FIELDS) and len(main.WEBSITE_PARTY_FIELDS) == 16
+    for name in ("Bowling", "Extravaganza", "Teen"):
+        assert main.website_party_record(_web_party(package=name))["package"] == name
+
+
+def test_website_party_record_refuses_anything_off_contract_and_names_only_the_field():
+    cases = {"booking_id": ["", "x", "has spaces in it", "a/b/c/d/e/f"], "source": ["partywirks", "", None],
+             "currency": ["CAD", "usd", None], "order_total": [0, -5, "759.86", None, True, 250000],
+             "square_payment_id": ["", None], "party_date": ["01/17/2027", "2027-02-30", "", None],
+             "party_time": ["3:00 PM", "25:00", "", None], "package": ["Birthday", "bowling", None],
+             "guest_count": [0, -1, 15.5, "15", True, 9999, None], "email": ["not-an-email", "a@b"]}
+    for field, values in cases.items():
+        for v in values:
+            with pytest.raises(ValueError) as e:
+                main.website_party_record(_web_party(**{field: v}))
+            assert field in str(e.value), (field, v)
+            assert not isinstance(v, str) or len(v) < 4 or v not in str(e.value), "an error never repeats a value"
+    for missing in main.WEBSITE_PARTY_FIELDS:
+        body = _web_party()
+        del body[missing]
+        with pytest.raises(ValueError, match=missing):
+            main.website_party_record(body)
+    for not_an_object in ([], "text", 7, None):
+        with pytest.raises(ValueError):
+            main.website_party_record(not_an_object)
+    with pytest.raises(ValueError, match="email or phone"):
+        main.website_party_record(_web_party(email="", phone=""))
+    with pytest.raises(ValueError, match="first_name"):
+        main.website_party_record(_web_party(first_name="", last_name=""))
+    # Either an email or a phone is enough to resolve the customer.
+    assert main.website_party_record(_web_party(email=""))["email"] == ""
+    assert main.website_party_record(_web_party(phone=""))["phone"] == ""
+
+
+def test_website_party_browser_ids_are_best_effort_and_only_in_metas_formats():
+    rec = main.website_party_record(_web_party(fbp=None, fbc=None, user_agent=None))
+    assert rec["browser"] == {}                                  # a parent with no pixel cookie still books
+    rec = main.website_party_record(_web_party(fbp="<script>", fbc="fb.1.123.x", user_agent="short"))
+    assert rec["browser"] == {}                                  # malformed ones are dropped, the booking is kept
+    rec = main.website_party_record(_web_party(fbc=None))
+    assert set(rec["browser"]) == {"fbp", "ua"}                  # no ad click = no fbc
+
+
+def test_website_booking_events_carry_the_stored_browser_ids_like_tripleseat_ones():
+    now = _dt.now(_tz.utc)
+    cust = {"meta_fbp": "fb.1.1764200000000.1", "meta_fbp_at": now, "meta_fbc": "fb.1.1764200000000.AbCdEfGhIjKl",
+            "meta_fbc_at": now - _td(days=120), "meta_client_user_agent": "Mozilla/5.0 Test", "meta_client_user_agent_at": now}
+    assert main.browser_user_data(cust, "qb_web_abc123") == {"fbp": "fb.1.1764200000000.1", "client_user_agent": "Mozilla/5.0 Test"}
+    assert main.browser_user_data(cust, "qb_ts_1_2027-01-17") == main.browser_user_data(cust, "qb_web_abc123")
+    for other in ("qb_pw_123", "qb_wr_123", "sq_pay_123", "wr_123"):
+        assert main.browser_user_data(cust, other) == {}          # every other source is unchanged
+
+
+def test_website_party_webhook_fails_closed_on_the_key(webhook_client, monkeypatch, caplog):
+    path, body = "/webhooks/website-party", _web_party()
+    for headers in ({}, {"X-CDP-Key": ""}, {"X-CDP-Key": "wrong-key"}, {"X-CDP-Key": "fake-cron-key"}):
+        r = webhook_client.post(path, json=body, headers=headers)
+        assert r.status_code == 401 and "fake-webhook-key" not in r.text
+    assert webhook_client.post(path + "?key=wrong-key", json=body).status_code == 401
+    monkeypatch.setattr(main, "WEBHOOK_SECRET", None)             # unset = every request refused, even "the right" key
+    assert webhook_client.post(path, json=body, headers={"X-CDP-Key": "fake-webhook-key"}).status_code == 401
+    ours = " ".join(r.getMessage() for r in caplog.records if r.name == "pg_cdp")   # the service's own log lines
+    assert "Rejected POST /webhooks/website-party" in ours
+    assert "fake-webhook-key" not in ours and "wrong-key" not in ours and "fake-cron-key" not in ours
+    assert webhook_client.get(path).status_code == 405            # POST only
+
+
+def test_website_party_webhook_refuses_a_bad_body_without_touching_the_database(webhook_client, caplog):
+    path, ok = "/webhooks/website-party", {"X-CDP-Key": "fake-webhook-key"}
+    assert webhook_client.post(path, content=b"{not json", headers={**ok, "content-type": "application/json"}).status_code == 400
+    r = webhook_client.post(path, json=_web_party(order_total="lots", email="private.person@example.test"), headers=ok)
+    assert r.status_code == 422 and r.json()["detail"]["error"] == "invalid_payload" and "order_total" in r.json()["detail"]["problem"]
+    assert "private.person" not in r.text and "private.person" not in caplog.text and "fake-webhook-key" not in r.text
+    assert webhook_client.post(path, json=[_web_party()], headers=ok).status_code == 422
+    assert webhook_client.post(path, json={}, headers=ok).status_code == 422
+
+
+def test_website_party_webhook_never_answers_200_when_processing_fails(webhook_client, monkeypatch):
+    def boom(rec, background_tasks, received_at):
+        raise RuntimeError("database is down: secret-detail")
+    monkeypatch.setattr(main, "handle_website_party", boom)
+    r = webhook_client.post("/webhooks/website-party", json=_web_party(), headers={"X-CDP-Key": "fake-webhook-key"})
+    assert r.status_code == 500 and "secret-detail" not in r.text and "pat.parent" not in r.text.lower()
+
+
+def test_website_party_webhook_passes_the_received_time_to_the_handler(webhook_client, monkeypatch):
+    seen = {}
+
+    def keep(rec, background_tasks, received_at):
+        seen.update(rec=rec, at=received_at)
+        return {"status": "website_party_synced", "cluster_id": 1, "booking_id": rec["booking_id"], "score": 0}
+    monkeypatch.setattr(main, "handle_website_party", keep)
+    before = _dt.now(_tz.utc)
+    r = webhook_client.post("/webhooks/website-party", json=_web_party(), headers={"X-CDP-Key": "fake-webhook-key"})
+    assert r.status_code == 200 and r.json()["status"] == "website_party_synced"
+    assert before <= seen["at"] <= _dt.now(_tz.utc) and seen["rec"]["total"] == 759.86
